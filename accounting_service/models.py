@@ -1,16 +1,41 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Iterator, Optional, Self
 from uuid import UUID, uuid4
 
 import eodhp_utils.pulsar.messages
-from sqlalchemy import CheckConstraint, ForeignKey, Index, Uuid, insert, select
+from sqlalchemy import (
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    PrimaryKeyConstraint,
+    Uuid,
+    and_,
+    insert,
+    or_,
+    select,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlmodel import Session
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class WorkspaceAccount(Base):
+    """
+    This records which account contains each workspace.
+
+    This is not the authoritative data, which is held by the workspace service and sent via Pulsar.
+    """
+
+    __tablename__ = "workspace_account"
+
+    workspace: Mapped[str] = mapped_column(index=True)
+    account: Mapped[UUID]
+
+    __table_args__ = (PrimaryKeyConstraint("account", "workspace"),)
 
 
 class BillingItem(Base):
@@ -80,6 +105,10 @@ class BillingEvent(Base):
     the user, workspace and item are the same and if they occur within the same day. The UUID
     of the first event is kept. They can also be split if the event time period includes
     midnight.
+
+    Note that the 'workspace' field should always refer to a workspace in the WorkspaceAccount
+    entity. However, to avoid data loss in the event that messages from the workspace service
+    are received too late or not at all, we don't impose a foreign key constraint.
     """
 
     __tablename__ = "billing_event"
@@ -90,7 +119,7 @@ class BillingEvent(Base):
     item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
     item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
     user: Mapped[Optional[UUID]]  # This is None for, for example, workspace storage.
-    workspace: Mapped[str] = mapped_column(index=True)
+    workspace: Mapped[str]
     quantity: Mapped[float]  # The units involved are defined in the BillingItem
 
     __table_args__ = (
@@ -103,18 +132,69 @@ class BillingEvent(Base):
 
     @staticmethod
     def find_billing_events(
+        session: Session,
         workspace: str = None,
         account: UUID = None,
         start: datetime = None,
         end: datetime = None,
         after: UUID = None,
         limit: int = 5_000,
-    ):
+    ) -> Iterator[Self]:
         """
         Find and return BillingEvents matching some criteria.
 
         For paging, `after` should be the UUID of the last billing event on the previous page.
         """
+        query = select(BillingEvent).limit(limit)
+
+        # We need a complete and certain order so that the 'after' parameter works.
+        query = query.order_by(
+            BillingEvent.event_start,
+            BillingEvent.event_end,
+            BillingEvent.workspace,
+            BillingEvent.uuid,
+        )
+
+        if workspace is not None:
+            query = query.where(BillingEvent.workspace == workspace)
+
+        if account is not None:
+            query = query.join(
+                WorkspaceAccount, WorkspaceAccount.workspace == BillingEvent.workspace
+            ).where(WorkspaceAccount.account == account)
+
+        if start is not None:
+            query = query.where(BillingEvent.event_start >= start)
+
+        if end is not None:
+            query = query.where(BillingEvent.event_end < end)
+
+        if after is not None:
+            after_be = session.get(BillingEvent, after)
+
+            if after_be is not None:
+                query = query.where(
+                    or_(
+                        (BillingEvent.event_start > after_be.event_start),
+                        and_(
+                            BillingEvent.event_start == after_be.event_start,
+                            BillingEvent.event_end > after_be.event_end,
+                        ),
+                        and_(
+                            BillingEvent.event_start == after_be.event_start,
+                            BillingEvent.event_end == after_be.event_end,
+                            BillingEvent.workspace > after_be.workspace,
+                        ),
+                        and_(
+                            BillingEvent.event_start == after_be.event_start,
+                            BillingEvent.event_end == after_be.event_end,
+                            BillingEvent.workspace == after_be.workspace,
+                            BillingEvent.uuid > after_be.uuid,
+                        ),
+                    )
+                )
+
+        return map(lambda r: r[0], session.execute(query))
 
     @classmethod
     def insert_from_message(
