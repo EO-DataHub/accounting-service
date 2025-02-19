@@ -8,15 +8,17 @@ from sqlalchemy import (
     CheckConstraint,
     ForeignKey,
     Index,
-    PrimaryKeyConstraint,
     Uuid,
     and_,
     insert,
     or_,
     select,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlmodel import Session
+
+from accounting_service import db
 
 
 class Base(DeclarativeBase):
@@ -32,10 +34,32 @@ class WorkspaceAccount(Base):
 
     __tablename__ = "workspace_account"
 
-    workspace: Mapped[str] = mapped_column(index=True)
-    account: Mapped[UUID]
+    workspace: Mapped[str] = mapped_column(index=True, primary_key=True)
+    account: Mapped[UUID] = mapped_column(index=True)
 
-    __table_args__ = (PrimaryKeyConstraint("account", "workspace"),)
+    @staticmethod
+    def record_mapping(session: Session, account: UUID, workspace: str) -> bool:
+        # We don't allow workspaces to move between accounts, so we only insert a record if
+        # there isn't one already.
+        result = session.execute(
+            text(
+                "INSERT INTO workspace_account (workspace, account) "
+                + "SELECT cast(:workspace as text), :account "
+                + "WHERE NOT EXISTS ("
+                + "SELECT 1 FROM workspace_account "
+                + "WHERE workspace=:workspace)"
+            ),
+            [
+                {
+                    "workspace": workspace,
+                    "account": (
+                        account.hex if db.settings.SQL_DRIVER.startswith("sqlite") else account
+                    ),
+                }
+            ],
+        )
+
+        return not not result
 
 
 class BillingItem(Base):

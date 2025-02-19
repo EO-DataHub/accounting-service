@@ -6,8 +6,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm.session import Session
 
 from accounting_service import models
-from accounting_service.ingester.messager import AccountingIngesterMessager
-from tests.conftest import bemsg_to_pulsar_msg, fake_event_known_times
+from accounting_service.ingester.messager import (
+    AccountingIngesterMessager,
+    WorkspaceSettingsIngesterMessager,
+)
+from tests.conftest import (
+    bemsg_to_pulsar_msg,
+    fake_event_known_times,
+    wsmsg_to_pulsar_msg,
+)
 
 
 def test_message_results_in_billingevent_in_db(db_session: Session):
@@ -100,3 +107,39 @@ def test_db_operational_error_produces_temporary_failure():
         ############# Behaviour check
         assert not failures.any_permanent()
         assert failures.any_temporary()
+
+
+def test_message_with_new_workspace_settings_results_in_workspace_account_relationship_recorded(
+    db_session,
+):
+    ############# Setup
+    msg = messages.WorkspaceSettings.get_fake()
+
+    ############# Test
+    messager = WorkspaceSettingsIngesterMessager()
+    failures = messager.consume(wsmsg_to_pulsar_msg(msg))
+
+    ############# Behaviour check
+    assert not failures.any_permanent()
+    assert not failures.any_temporary()
+
+    assert db_session.get(models.WorkspaceAccount, msg.name).account == UUID(msg.account)
+
+
+def test_message_with_existing_workspace_changes_nothing(db_session):
+    ############# Setup
+    msg = messages.WorkspaceSettings.get_fake()
+
+    ############# Test
+    messager = WorkspaceSettingsIngesterMessager()
+    failures1 = messager.consume(wsmsg_to_pulsar_msg(msg))
+    failures2 = messager.consume(wsmsg_to_pulsar_msg(msg))
+
+    ############# Behaviour check
+    assert not failures1.any_permanent()
+    assert not failures1.any_temporary()
+
+    assert not failures2.any_permanent()
+    assert not failures2.any_temporary()
+
+    assert db_session.get(models.WorkspaceAccount, msg.name).account == UUID(msg.account)

@@ -10,17 +10,19 @@ from sqlalchemy.orm import Session
 from accounting_service import db, models
 
 
-class AccountingIngesterMessager(PulsarJSONMessager[messages.BillingEvent]):
-    """
-    This Messager receives Pulsar messages containing billing events and updates the
-    accounting DB.
-    """
-
+class DBIngester:
     def is_temporary_error(self, e: Exception):
         if isinstance(e, OperationalError):
             return True
 
         return False
+
+
+class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.BillingEvent]):
+    """
+    This Messager receives Pulsar messages containing billing events and updates the
+    accounting DB.
+    """
 
     def process_payload(self, bemsg: messages.BillingEvent) -> Sequence[Messager.Action]:
         try:
@@ -53,3 +55,19 @@ class AccountingIngesterMessager(PulsarJSONMessager[messages.BillingEvent]):
         with Session(db.engine) as session:
             session.add(models.BillingItem(sku=bemsg.sku, name="", unit=""))
             session.commit()
+
+
+class WorkspaceSettingsIngesterMessager(DBIngester, PulsarJSONMessager[messages.WorkspaceSettings]):
+    def process_payload(self, wsmsg: messages.WorkspaceSettings) -> Sequence[Messager.Action]:
+        with Session(db.engine) as session:
+            recorded = models.WorkspaceAccount.record_mapping(
+                session, UUID(wsmsg.account), wsmsg.name
+            )
+            session.commit()
+
+        if recorded:
+            logging.info("Associated workspace %s with account %s", wsmsg.name, wsmsg.account)
+        else:
+            logging.debug("Ignoring WorkspaceSettings for %s, already known", wsmsg.name)
+
+        return []

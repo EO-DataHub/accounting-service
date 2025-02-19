@@ -1,3 +1,4 @@
+from typing import Type
 from unittest.mock import Mock
 
 import pytest
@@ -7,7 +8,10 @@ from pulsar import Message
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from accounting_service import db
-from accounting_service.ingester.messager import AccountingIngesterMessager
+from accounting_service.ingester.messager import (
+    AccountingIngesterMessager,
+    WorkspaceSettingsIngesterMessager,
+)
 
 
 @pytest.fixture(scope="session")
@@ -43,12 +47,20 @@ def fake_event_known_times():
     return bemsg, start, end
 
 
-def bemsg_to_pulsar_msg(bemsg):
-    schema = AccountingIngesterMessager.get_schema()
+def msg_to_pulsar_msg(klass: Type, inmsg):
+    schema = klass.get_schema()
 
     testmsg = Mock()
-    testmsg.data = Mock(return_value=schema.encode(bemsg))
+    testmsg.data = Mock(return_value=schema.encode(inmsg))
     msg = Message._wrap(testmsg)
     msg._schema = schema
 
     return msg
+
+
+def bemsg_to_pulsar_msg(bemsg):
+    return msg_to_pulsar_msg(AccountingIngesterMessager, bemsg)
+
+
+def wsmsg_to_pulsar_msg(bemsg):
+    return msg_to_pulsar_msg(WorkspaceSettingsIngesterMessager, bemsg)

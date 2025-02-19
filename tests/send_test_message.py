@@ -41,11 +41,20 @@ import pulsar
 from eodhp_utils.pulsar import messages
 
 client = pulsar.Client("pulsar://localhost:6650")
-producer = client.create_producer("billing-events", schema=messages.generate_billingevent_schema())
 
-# testmsg = messages.BillingEvent.get_fake()
+billing_producer = client.create_producer(
+    "billing-events", schema=messages.generate_billingevent_schema()
+)
+workspace_producer = client.create_producer(
+    "workspace-settings", schema=messages.generate_workspacesettings_schema()
+)
 
-testmsg2 = messages.BillingEvent(
+wsmsg = messages.WorkspaceSettings.get_fake()
+wsmsg.name = "testworkspace"
+
+workspace_producer.send(wsmsg)
+
+bemsg = messages.BillingEvent(
     correlation_id="",
     uuid=str(uuid.uuid4()),
     event_start="2025-01-16T06:42:34.987619",
@@ -55,6 +64,6 @@ testmsg2 = messages.BillingEvent(
     quantity=3.14,
 )
 
-producer.send(testmsg2)
+billing_producer.send(bemsg)
 
 client.close()
