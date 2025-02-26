@@ -15,8 +15,7 @@ from sqlalchemy import (
     select,
     text,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlmodel import Session
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
 from accounting_service import db
 

@@ -6,15 +6,21 @@ DOCKERREPO ?= public.ecr.aws/eodh
 dockerbuild:
 	DOCKER_BUILDKIT=1 docker build -t ${IMAGENAME}:${VERSION} .
 
-dockerpush: dockerbuild testdocker
+dockerpush: dockerbuild
 	docker tag ${IMAGENAME}:${VERSION} ${DOCKERREPO}/${IMAGENAME}:${VERSION}
 	docker push ${DOCKERREPO}/${IMAGENAME}:${VERSION}
 
 dockerrun:
-	TODO
+	# Once this is working, use 'PYTHONPATH=. python ./tests/send_test_message' to send
+	# a test billing event. Use 'PGHOST=localhost PGPORT=5432 psql accounting accountg'
+	# with password 'changeme' (or whatever you set in docker-compose.yaml) to view the
+	# recorded events.
+	docker compose up
 
-run:
-	TODO
+run-ingester:
+	# You will need to run Pulsar and PostgreSQL before this will work.
+	# See tests/send_test_message
+	PYTHONPATH=. python -m accounting_service.ingester --pulsar-url pulsar://localhost
 
 test:
 	./venv/bin/ptw tests

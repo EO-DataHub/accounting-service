@@ -1,6 +1,8 @@
 """This file is for manual testing
 
-Setup:
+Setup with Docker: docker compose up
+
+Setup without Docker:
 
 Run `sudo -u postgres psql` and then use SQL:
   create user accounting;
@@ -15,7 +17,7 @@ Edit .env:
     SQL_USER="accounting"
     SQL_PASSWORD="changeme"
     SQL_HOST="localhost"
-    SQL_PORT="5432"
+    SQL_PORT=5432
     SQL_SCHEMA="public"
 
 Run Pulsar:
@@ -30,7 +32,9 @@ Run Pulsar:
 Run the ingester:
   PYTHONPATH=. python -m accounting_service.ingester --pulsar-url pulsar://localhost
 
-Send a message:
+
+
+Finally, whichever setup you use, send a message:
   PYTHONPATH=. python ./tests/send_test_message.py
 
 """

@@ -12,15 +12,17 @@ attrs==25.1.0
     # via
     #   jsonschema
     #   referencing
-boto3==1.36.23
+boto3==1.37.1
     # via eodhp-utils
-botocore==1.36.23
+botocore==1.37.1
     # via
     #   boto3
     #   eodhp-utils
     #   s3transfer
 certifi==2025.1.31
     # via pulsar-client
+click==8.1.8
+    # via accounting-service (pyproject.toml)
 eodhp-utils @ git+https://github.com/UKEODHP/eodhp-utils@EODHP-755-accounting-service
     # via accounting-service (pyproject.toml)
 faker==36.1.1
@@ -39,11 +41,11 @@ jsonschema==4.23.0
     # via eodhp-utils
 jsonschema-specifications==2024.10.1
     # via jsonschema
-psycopg[binary,pool]==3.2.4
+psycopg[binary,pool]==3.2.5
     # via accounting-service (pyproject.toml)
-psycopg-binary==3.2.4
+psycopg-binary==3.2.5
     # via psycopg
-psycopg-pool==3.2.4
+psycopg-pool==3.2.6
     # via psycopg
 pulsar-client==3.6.0
     # via
@@ -56,7 +58,7 @@ pydantic==2.10.6
     #   pydantic-settings
 pydantic-core==2.27.2
     # via pydantic
-pydantic-settings==2.7.1
+pydantic-settings==2.8.0
     # via accounting-service (pyproject.toml)
 python-dateutil==2.9.0.post0
     # via botocore
@@ -66,7 +68,7 @@ referencing==0.36.2
     # via
     #   jsonschema
     #   jsonschema-specifications
-rpds-py==0.22.3
+rpds-py==0.23.1
     # via
     #   jsonschema
     #   referencing
