@@ -104,3 +104,47 @@ def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestC
     assert datetime.fromisoformat(page1[1]["event_start"]) < datetime.fromisoformat(
         page2[0]["event_start"]
     )
+
+
+def test_account_usage_data_returns_correct_items_from_db(db_session: Session, client: TestClient):
+    ############# Setup
+    db_session.execute(delete(models.BillingEvent))
+
+    account_uuid = uuid.uuid4()
+    db_session.add(models.WorkspaceAccount(workspace="workspace1", account=account_uuid))
+
+    uid = uuid.uuid4()
+    event_uuids, account_uuids, item_uuids = gen_billingitem_data(
+        db_session,
+        [
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2024, 1, 16, 6, 10, 0),
+                "sku": "sku1",
+                "user": uid,
+            },
+            {
+                "workspace": "workspace2",
+                "event_start": datetime(2024, 1, 16, 7, 5, 0),
+                "sku": "sku2",
+                "quantity": "1.23",
+            },
+        ],
+    )
+
+    ############# Test
+    response = client.get(f"/accounts/{account_uuid}/accounting/usage-data")
+
+    ############# Behaviour check
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "uuid": str(event_uuids[0]),
+            "event_start": "2024-01-16T06:10:00Z",
+            "event_end": "2024-01-16T06:15:00Z",
+            "item": "sku1",
+            "user": str(uid),
+            "workspace": "workspace1",
+            "quantity": 1.1,
+        }
+    ]
