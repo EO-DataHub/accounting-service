@@ -4,10 +4,12 @@ from unittest.mock import Mock
 import pytest
 from eodhp_utils.pulsar import messages
 from faker import Faker
+from fastapi.testclient import TestClient
 from pulsar import Message
 from sqlalchemy.orm import scoped_session, sessionmaker
 
 from accounting_service import db
+from accounting_service.app import app
 from accounting_service.ingester.messager import (
     AccountingIngesterMessager,
     WorkspaceSettingsIngesterMessager,
@@ -64,3 +66,18 @@ def bemsg_to_pulsar_msg(bemsg):
 
 def wsmsg_to_pulsar_msg(bemsg):
     return msg_to_pulsar_msg(WorkspaceSettingsIngesterMessager, bemsg)
+
+
+@pytest.fixture()
+def client(db_session):
+    """This supplies a FastAPI test HTTP client"""
+
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            db_session.close()
+
+    app.app.dependency_overrides[db.get_session] = override_get_db
+
+    yield TestClient(app.app)

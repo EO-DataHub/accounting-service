@@ -7,7 +7,10 @@
 annotated-types==0.7.0
     # via pydantic
 anyio==4.8.0
-    # via starlette
+    # via
+    #   httpx
+    #   starlette
+    #   watchfiles
 attrs==25.1.0
     # via
     #   jsonschema
@@ -24,7 +27,10 @@ botocore==1.37.1
 build==1.2.2.post1
     # via pip-tools
 certifi==2025.1.31
-    # via pulsar-client
+    # via
+    #   httpcore
+    #   httpx
+    #   pulsar-client
 cfgv==3.4.0
     # via pre-commit
 click==8.1.8
@@ -32,8 +38,15 @@ click==8.1.8
     #   accounting-service (pyproject.toml)
     #   black
     #   pip-tools
+    #   rich-toolkit
+    #   typer
+    #   uvicorn
 distlib==0.3.9
     # via virtualenv
+dnspython==2.7.0
+    # via email-validator
+email-validator==2.2.0
+    # via fastapi
 eodhp-utils @ git+https://github.com/UKEODHP/eodhp-utils@EODHP-755-accounting-service
     # via accounting-service (pyproject.toml)
 execnet==2.1.1
@@ -42,22 +55,41 @@ faker==36.1.1
     # via
     #   accounting-service (pyproject.toml)
     #   eodhp-utils
-fastapi==0.115.8
+fastapi[standard]==0.115.8
     # via accounting-service (pyproject.toml)
+fastapi-cli[standard]==0.0.7
+    # via fastapi
 fastjsonschema==2.21.1
     # via validate-pyproject
 filelock==3.17.0
     # via virtualenv
 greenlet==3.1.1
     # via sqlalchemy
+h11==0.14.0
+    # via
+    #   httpcore
+    #   uvicorn
+httpcore==1.0.7
+    # via httpx
+httptools==0.6.4
+    # via uvicorn
+httpx==0.28.1
+    # via
+    #   accounting-service (pyproject.toml)
+    #   fastapi
 identify==2.6.8
     # via pre-commit
 idna==3.10
-    # via anyio
+    # via
+    #   anyio
+    #   email-validator
+    #   httpx
 iniconfig==2.0.0
     # via pytest
 isort==6.0.0
     # via accounting-service (pyproject.toml)
+jinja2==3.1.5
+    # via fastapi
 jmespath==1.0.1
     # via
     #   boto3
@@ -66,6 +98,12 @@ jsonschema==4.23.0
     # via eodhp-utils
 jsonschema-specifications==2024.10.1
     # via jsonschema
+markdown-it-py==3.0.0
+    # via rich
+markupsafe==3.0.2
+    # via jinja2
+mdurl==0.1.2
+    # via markdown-it-py
 mypy-extensions==1.0.0
     # via black
 nodeenv==1.9.1
@@ -107,6 +145,8 @@ pydantic-core==2.27.2
     # via pydantic
 pydantic-settings==2.8.0
     # via accounting-service (pyproject.toml)
+pygments==2.19.1
+    # via rich
 pyproject-hooks==1.2.0
     # via
     #   build
@@ -125,13 +165,25 @@ pytest-xdist==3.6.1
 python-dateutil==2.9.0.post0
     # via botocore
 python-dotenv==1.0.1
-    # via pydantic-settings
+    # via
+    #   pydantic-settings
+    #   uvicorn
+python-multipart==0.0.20
+    # via fastapi
 pyyaml==6.0.2
-    # via pre-commit
+    # via
+    #   pre-commit
+    #   uvicorn
 referencing==0.36.2
     # via
     #   jsonschema
     #   jsonschema-specifications
+rich==13.9.4
+    # via
+    #   rich-toolkit
+    #   typer
+rich-toolkit==0.13.2
+    # via fastapi-cli
 rpds-py==0.23.1
     # via
     #   jsonschema
@@ -140,6 +192,8 @@ ruff==0.9.7
     # via accounting-service (pyproject.toml)
 s3transfer==0.11.2
     # via boto3
+shellingham==1.5.4
+    # via typer
 six==1.17.0
     # via python-dateutil
 sniffio==1.3.1
@@ -150,23 +204,37 @@ starlette==0.45.3
     # via fastapi
 trove-classifiers==2025.2.18.16
     # via validate-pyproject
+typer==0.15.1
+    # via fastapi-cli
 typing-extensions==4.12.2
     # via
     #   fastapi
     #   psycopg-pool
     #   pydantic
     #   pydantic-core
+    #   rich-toolkit
     #   sqlalchemy
+    #   typer
 tzdata==2025.1
     # via faker
 urllib3==2.3.0
     # via botocore
+uvicorn[standard]==0.34.0
+    # via
+    #   fastapi
+    #   fastapi-cli
+uvloop==0.21.0
+    # via uvicorn
 validate-pyproject[all]==0.23
     # via accounting-service (pyproject.toml)
 virtualenv==20.29.2
     # via pre-commit
 watchdog==6.0.0
     # via pytest-watcher
+watchfiles==1.0.4
+    # via uvicorn
+websockets==15.0
+    # via uvicorn
 wheel==0.45.1
     # via pip-tools
 
