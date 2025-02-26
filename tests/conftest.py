@@ -76,7 +76,8 @@ def client(db_session):
         try:
             yield db_session
         finally:
-            db_session.close()
+            # db_session.close()
+            pass
 
     app.app.dependency_overrides[db.get_session] = override_get_db
 
