@@ -55,7 +55,7 @@ jobs:
     needs: get-tag-name
     uses: EO-DataHub/github-actions/.github/workflows/docker-image-to-aws-ecr.yaml@main
     with:
-      image_name: CHANGE-ME
+      image_name: accounting-service
       image_tag: ${{ needs.get-tag-name.outputs.image_tag }}
     permissions:
       id-token: write
