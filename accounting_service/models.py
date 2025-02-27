@@ -78,6 +78,21 @@ class BillingItem(Base):
     name: Mapped[str]  # User-visible name like 'CPU time in notebooks and workflows'
     unit: Mapped[str]  # Units, like seconds or GB-hours
 
+    def find_billing_items(session: Session) -> Iterator[Self]:
+        """Returns all user-visible BillingItems in order of SKU."""
+        # This is currently all BillingItems but this could change if we add a 'deleted' flag
+        # or some visibility rules.
+        query = select(BillingItem).order_by(BillingItem.sku)
+        return map(lambda r: r[0], session.execute(query))
+
+    def find_billing_item(session: Session, sku: str) -> Optional[Self]:
+        """Returns a specified BillingItem, assuming it's visible."""
+        # This is currently any BillingItem but this could change if we add a 'deleted' flag
+        # or some visibility rules.
+        query = select(BillingItem).where(BillingItem.sku == sku)
+        result = session.execute(query).first()
+        return result[0] if result else None
+
 
 class BillingItemPrice(Base):
     """
