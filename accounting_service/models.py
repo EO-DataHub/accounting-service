@@ -119,7 +119,8 @@ class BillingItemPrice(Base):
     __tablename__ = "billing_item_price"
 
     uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    # item: Mapped["BillingItem"] = relationship(foreign_keys="billing_item.uuid")
+    item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
+    item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
     price: Mapped[Decimal]  # This is in pounds.
     valid_from: Mapped[datetime]
     valid_until: Mapped[Optional[datetime]]  # None for current price, a time in the past otherwise.
@@ -132,6 +133,24 @@ class BillingItemPrice(Base):
         ),
         CheckConstraint("valid_from <= valid_until"),
     )
+
+    def find_prices(session: Session, at: datetime) -> Iterator[tuple[Self, str]]:  # type: ignore
+        """Returns all prices valid at the specified time. Each result is a tuple containing a
+        BillingItemPrice first and the associated SKU second."""
+        query = (
+            select(BillingItemPrice, BillingItem.sku)
+            .join(BillingItemPrice.item)
+            .where(BillingItemPrice.valid_from < at)
+            .where(
+                or_(
+                    BillingItemPrice.valid_until == None,  # noqa: E711
+                    BillingItemPrice.valid_until > at,
+                )
+            )
+            .order_by(BillingItem.sku, BillingItemPrice.valid_from)
+        )
+        print(query)
+        return session.execute(query)
 
 
 class BillingEvent(Base):

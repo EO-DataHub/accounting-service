@@ -221,3 +221,69 @@ def test_skus_api_returns_404_for_unknown_item(db_session: Session, client: Test
     ############# Behaviour check
     assert response.status_code == 404
     assert response.json() == {"detail": "SKU not known"}
+
+
+def test_prices_api_returns_current_prices_correctly(db_session: Session, client: TestClient):
+    ############# Setup
+    db_session.execute(delete(models.BillingItemPrice))
+
+    uuid_item_a = uuid.uuid4()
+    uuid_item_b = uuid.uuid4()
+    db_session.add(models.BillingItem(uuid=uuid_item_a, sku="sku1", name="Item a", unit="GBh"))
+    db_session.add(models.BillingItem(uuid=uuid_item_b, sku="sku2", name="Item b", unit="GBh"))
+
+    uuid_price1 = uuid.uuid4()
+    uuid_price2 = uuid.uuid4()
+    uuid_price3 = uuid.uuid4()
+
+    db_session.add(
+        models.BillingItemPrice(
+            uuid=uuid_price1,
+            price=2.34,
+            valid_from=datetime(2024, 1, 16, 0, 0, 0),
+            configured_at=datetime(2024, 1, 16, 0, 0, 0),
+            item_id=uuid_item_a,
+        )
+    )
+
+    db_session.add(
+        models.BillingItemPrice(
+            uuid=uuid_price2,
+            price=2.30,
+            valid_from=datetime(2023, 1, 16, 0, 0, 0),
+            valid_until=datetime(2024, 1, 16, 0, 0, 0),
+            configured_at=datetime(2023, 1, 16, 0, 0, 0),
+            item_id=uuid_item_a,
+        )
+    )
+
+    db_session.add(
+        models.BillingItemPrice(
+            uuid=uuid_price3,
+            price=0.000000412,
+            valid_from=datetime(2023, 1, 16, 0, 0, 0),
+            configured_at=datetime(2023, 1, 17, 0, 0, 0),
+            item_id=uuid_item_b,
+        )
+    )
+
+    ############# Test
+    response = client.get("/accounting/prices")
+
+    ############# Behaviour check
+    # Should return current prices in SKU order.
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "uuid": str(uuid_price1),
+            "price": 2.34,
+            "valid_from": "2024-01-16T00:00:00Z",
+            "sku": "sku1",
+        },
+        {
+            "uuid": str(uuid_price3),
+            "price": 0.000000412,
+            "valid_from": "2023-01-16T00:00:00Z",
+            "sku": "sku2",
+        },
+    ]

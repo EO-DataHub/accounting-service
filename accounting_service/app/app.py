@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
 
 from accounting_service.db import get_session
-from accounting_service.models import BillingEvent, BillingItem
+from accounting_service.models import BillingEvent, BillingItem, BillingItemPrice
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,20 @@ def billingitem_to_api_object(item: BillingItem):
         "name": item.name,
         "unit": item.unit,
     }
+
+
+def billingitemprice_to_api_object(price: tuple[BillingItemPrice, str]):
+    result = {
+        "uuid": str(price[0].uuid),
+        "sku": price[1],
+        "valid_from": price[0].valid_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "price": price[0].price,
+    }
+
+    if price[0].valid_until:
+        result["valid_until"] = price.valid_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return result
 
 
 @app.get("/workspaces/{workspace}/accounting/usage-data")
@@ -98,3 +112,12 @@ def get_item(session: SessionDep, sku: str):
         raise HTTPException(status_code=404, detail="SKU not known")
 
     return billingitem_to_api_object(item)
+
+
+@app.get("/accounting/prices")
+def get_prices(session: SessionDep):
+    """This returns all current prices in SKU order."""
+    prices: Iterator[tuple[BillingItemPrice, str]] = BillingItemPrice.find_prices(
+        session, datetime.now()
+    )
+    return list(map(billingitemprice_to_api_object, prices))
