@@ -246,7 +246,7 @@ class BillingEvent(Base):
                             BillingEvent.event_start == after_be.event_start,
                             BillingEvent.event_end == after_be.event_end,
                             BillingEvent.workspace == after_be.workspace,
-                            BillingEvent.uuid > after_be.uuid,
+                            BillingEvent.uuid > after,
                         ),
                     )
                 )

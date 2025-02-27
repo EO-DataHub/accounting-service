@@ -1,7 +1,7 @@
 import logging
 import os
 from datetime import datetime
-from typing import Annotated, Iterator
+from typing import Annotated, Iterator, Optional
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -66,10 +66,10 @@ def billingitemprice_to_api_object(price: tuple[BillingItemPrice, str]):
 def get_workspace_usage_data(
     session: SessionDep,
     workspace: str,
-    start: datetime = None,
-    end: datetime = None,
-    limit=100,
-    after=None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    limit: Optional[int] = 100,
+    after: Optional[UUID] = None,
 ):
     """This returns usage data for a workspace or account within some given time range (or all)."""
     events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
@@ -83,10 +83,10 @@ def get_workspace_usage_data(
 def get_account_usage_data(
     session: SessionDep,
     account_id: UUID,
-    start: datetime = None,
-    end: datetime = None,
-    limit=100,
-    after=None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    limit: Optional[int] = 100,
+    after: Optional[UUID] = None,
 ):
     """This returns usage data for a workspace or account within some given time range (or all)."""
     events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
