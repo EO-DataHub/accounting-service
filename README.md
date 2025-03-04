@@ -111,3 +111,36 @@ manually in the following way:
 - Run `make dockerbuild` (for images tagged `latest`) or `make dockerbuild VERSION=1.2.3` for a release tagged `1.2.3`.
   The image will be available locally within Docker after this step.
 - Run `make dockerpush` or `make dockerpush VERSION=1.2.3`. This will send the image to the ECR repository.
+
+# Management of this Component
+
+## Adding BillingItems (SKUs) and Prices
+
+The service will automatically add any new BillingItems it sees from Pulsar (note that it will first log an SQL exception and this does not represent a service failure). However, it cannot set the `name` or `unit` fields which are necessary for proper display in UIs.
+
+Prices cannot be added automatically.
+
+To update items, connect to the database and `begin; UPDATE BillingItem SET name=..., unit=... WHERE sku=...`, check that one row was affected and then commit.
+
+To add prices, insert into BillingItemPrice instead. Do not update prices. Instead, set valid_until in the old price and create a new price with a matching valid_from.
+
+## Incompatible Schema
+
+If you get an incompatible schema error and are sure it's safe to upgrade then you can delete the schema in a cluster.
+
+- Install pulsar admin tools:
+  - wget https://archive.apache.org/dist/pulsar/pulsar-4.0.1/apache-pulsar-4.0.1-bin.tar.gz
+  - tar xf apache-pulsar-4.0.1-bin.tar.gz
+  - sudo apt install openjdk-17-jre
+- Forward Pulsar ports:
+  - kubectl port-forward service/pulsar-proxy -n pulsar 8080:8080 # Admin port
+  - kubectl port-forward service/pulsar-proxy -n pulsar 6650:6650
+- Delete schema:
+  - ./apache-pulsar-4.0.1/bin/pulsar-admin schemas delete persistent://public/default/billing-events
+
+## Adding a Test Entry
+
+- Forward Pulsar ports:
+  - kubectl port-forward service/pulsar-proxy -n pulsar 6650:6650
+- Run test message sender - edit it first if you need a particular message:
+  - PYTHONPATH=. python ./tests/send_test_message.py
