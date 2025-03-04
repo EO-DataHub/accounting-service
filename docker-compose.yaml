@@ -46,11 +46,23 @@ services:
     networks:
       - eodhp-net
 
-  test:
-    image: debian
-    command: sleep 60000
+  api:
+    image: accounting-service:latest
+    command: fastapi run accounting_service/app/app.py
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - SQL_DRIVER=postgresql+psycopg
+      - SQL_USER=accounting
+      - SQL_PASSWORD=changeme
+      - SQL_HOST=db
+      - SQL_PORT=5432
+      - SQL_SCHEMA=public
     networks:
       - eodhp-net
+    ports:
+      - 8000:8000
 
 networks:
   eodhp-net:
