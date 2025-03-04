@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Annotated, Iterator, Optional
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from sqlalchemy.orm import Session
 
 from accounting_service.db import get_session
@@ -62,9 +62,20 @@ def billingitemprice_to_api_object(price: tuple[BillingItemPrice, str]):
     return result
 
 
+def add_usage_data_headers(response: Response):
+    response.headers["Vary"] = "Cookie,Authorization,Accept-Encoding"
+    response.headers["Cache-Control"] = "private,max-age=5"
+
+
+def add_global_data_headers(response: Response):
+    response.headers["Vary"] = "Accept-Encoding"
+    response.headers["Cache-Control"] = "private,max-age=300"
+
+
 @app.get("/workspaces/{workspace}/accounting/usage-data")
 def get_workspace_usage_data(
     session: SessionDep,
+    response: Response,
     workspace: str,
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
@@ -76,12 +87,14 @@ def get_workspace_usage_data(
         session, workspace=workspace, start=start, end=end, limit=limit, after=after
     )
 
+    add_usage_data_headers(response)
     return list(map(billingevent_to_api_object, events))
 
 
 @app.get("/accounts/{account_id}/accounting/usage-data")
 def get_account_usage_data(
     session: SessionDep,
+    response: Response,
     account_id: UUID,
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
@@ -93,31 +106,38 @@ def get_account_usage_data(
         session, account=account_id, start=start, end=end, limit=limit, after=after
     )
 
+    add_usage_data_headers(response)
     return list(map(billingevent_to_api_object, events))
 
 
 @app.get("/accounting/skus")
-def get_item_list(session: SessionDep):
+def get_item_list(session: SessionDep, response: Response):
     """This returns all BillingItems in SKU order."""
     items: Iterator[BillingItem] = BillingItem.find_billing_items(session)
+    add_global_data_headers(response)
     return list(map(billingitem_to_api_object, items))
 
 
 @app.get("/accounting/skus/{sku}")
-def get_item(session: SessionDep, sku: str):
+def get_item(session: SessionDep, response: Response, sku: str):
     """This returns a specific BillingItem based on its SKU."""
     item: Iterator[BillingItem] = BillingItem.find_billing_item(session, sku)
 
     if item is None:
-        raise HTTPException(status_code=404, detail="SKU not known")
+        raise HTTPException(
+            status_code=404, detail="SKU not known", headers={"Cache-Control": "max-age=60"}
+        )
 
+    add_global_data_headers(response)
     return billingitem_to_api_object(item)
 
 
 @app.get("/accounting/prices")
-def get_prices(session: SessionDep):
+def get_prices(session: SessionDep, response: Response):
     """This returns all current prices in SKU order."""
     prices: Iterator[tuple[BillingItemPrice, str]] = BillingItemPrice.find_prices(
         session, datetime.now()
     )
+
+    add_global_data_headers(response)
     return list(map(billingitemprice_to_api_object, prices))
