@@ -54,18 +54,17 @@ workspace_producer = client.create_producer(
 )
 
 wsmsg = messages.WorkspaceSettings.get_fake()
-wsmsg.name = "testworkspace"
+wsmsg.name = "test-workspace"
 
 workspace_producer.send(wsmsg)
 
 bemsg = messages.BillingEvent(
-    correlation_id="",
     uuid=str(uuid.uuid4()),
-    event_start="2025-01-16T06:42:34.987619",
-    event_end="2025-01-16T06:48:34.987619",
+    event_start="2025-01-17T06:42:34.987619",
+    event_end="2025-01-17T06:48:34.987619",
     sku="testsku",
-    workspace="testworkspace",
-    quantity=3.14,
+    workspace="test-workspace",
+    quantity=0.0004,
 )
 
 billing_producer.send(bemsg)
