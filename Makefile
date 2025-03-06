@@ -70,4 +70,5 @@ venv:
 setup: venv requirements .make-venv-installed .git/hooks/pre-commit
 
 krestart:
-	kubectl rollout restart deployment.apps/accounting-service -n accounting
+	kubectl rollout restart deployment.apps/accounting-api -n accounting
+	kubectl rollout restart deployment.apps/accounting-ingester -n accounting
