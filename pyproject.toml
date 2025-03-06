@@ -69,7 +69,7 @@ dependencies = [
   "pydantic",
   "pydantic-settings",
   "click",
-  "eodhp-utils @ git+https://github.com/UKEODHP/eodhp-utils@EODHP-755-accounting-service",
+  "eodhp-utils @ git+https://github.com/UKEODHP/eodhp-utils@v0.1.6",
 ]
 
 # List additional groups of dependencies here (e.g. development
