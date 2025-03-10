@@ -3,14 +3,14 @@ on:
   workflow_call:
   push:
     tags:
-      - 'v[0-9]+'
-      - 'v[0-9]+-*'
-      - 'v[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+-*'
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+      - "v[0-9]+"
+      - "v[0-9]+-*"
+      - "v[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+-*"
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
     branches:
-      - '**'
+      - "**"
 
 jobs:
   pre-commit-preparation:
@@ -18,13 +18,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-python@v3
 
       - name: Copy config
         run: |
           if [ ! -f .pre-commit-config.yaml ]; then
             curl -o .pre-commit-config.yaml https://raw.githubusercontent.com/EO-DataHub/github-actions/main/.pre-commit-config-python.yaml
-          fi          
+          fi
 
       - uses: pre-commit/action@v3.0.1
 
@@ -35,6 +34,8 @@ jobs:
   unit-tests:
     name: Run unit tests
     uses: EO-DataHub/github-actions/.github/workflows/unit-tests-python.yaml@main
+    with:
+      PYTHON_VERSION: "3.12"
 
   get-tag-name:
     runs-on: ubuntu-latest
@@ -48,18 +49,15 @@ jobs:
           echo $IMAGE_TAG
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
-  aws-ecr-build:
-    name: Build ECR image
-    needs: get-tag-name
-    uses: EO-DataHub/github-actions/.github/workflows/docker-image-to-aws-ecr.yaml@main
+  publish:
+    name: Build and push Docker image
+    needs: [get-tag-name]
+    uses: EO-DataHub/github-actions/.github/workflows/ecr-publish.yaml@main
     with:
-      image_name: CHANGE-ME
+      image_name: ${{ vars.IMAGE_NAME }}
       image_tag: ${{ needs.get-tag-name.outputs.image_tag }}
+      aws_role_arn: ${{ vars.AWS_ROLE_ARN }}
+      aws_ecr_alias: ${{ vars.AWS_ECR_ALIAS }}
     permissions:
       id-token: write
       contents: read
-    secrets:
-      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-      AWS_ECR: ${{ secrets.AWS_ECR }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-

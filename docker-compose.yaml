@@ -1,0 +1,73 @@
+services:
+  db:
+    image: postgres:17
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_PASSWORD=changeme
+      - POSTGRES_USER=accounting
+      - POSTGRES_DB=accounting
+    command: -c "listen_addresses=*"
+    networks:
+      - eodhp-net
+    ports:
+      - 5433:5432
+    healthcheck:
+      test: ["CMD", "su", "postgres", "-c", "psql template1 accounting -c 'SELECT 1;'"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+  
+  pulsar:
+    image: apachepulsar/pulsar:4.0.2
+    command: bin/pulsar standalone
+    volumes:
+      - pulsarconf:/pulsar/conf
+      - pulsardata:/pulsar/data
+    networks:
+      - eodhp-net
+    ports:
+      - 6650:6650
+      - 8080:8080
+
+  ingester:
+    image: accounting-service:latest
+    command: python -m accounting_service.ingester --pulsar-url pulsar://pulsar
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - SQL_DRIVER=postgresql+psycopg
+      - SQL_USER=accounting
+      - SQL_PASSWORD=changeme
+      - SQL_HOST=db
+      - SQL_PORT=5432
+      - SQL_SCHEMA=public
+    networks:
+      - eodhp-net
+
+  api:
+    image: accounting-service:latest
+    command: fastapi run accounting_service/app/app.py
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - SQL_DRIVER=postgresql+psycopg
+      - SQL_USER=accounting
+      - SQL_PASSWORD=changeme
+      - SQL_HOST=db
+      - SQL_PORT=5432
+      - SQL_SCHEMA=public
+    networks:
+      - eodhp-net
+    ports:
+      - 8000:8000
+
+networks:
+  eodhp-net:
+
+volumes:
+  pulsarconf:
+  pulsardata:
+  db-data:
