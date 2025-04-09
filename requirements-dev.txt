@@ -6,20 +6,20 @@
 #
 annotated-types==0.7.0
     # via pydantic
-anyio==4.8.0
+anyio==4.9.0
     # via
     #   httpx
     #   starlette
     #   watchfiles
-attrs==25.1.0
+attrs==25.3.0
     # via
     #   jsonschema
     #   referencing
 black==25.1.0
     # via accounting-service (pyproject.toml)
-boto3==1.37.7
+boto3==1.37.30
     # via eodhp-utils
-botocore==1.37.7
+botocore==1.37.30
     # via
     #   boto3
     #   eodhp-utils
@@ -41,27 +41,31 @@ click==8.1.8
     #   rich-toolkit
     #   typer
     #   uvicorn
+deprecated==1.2.18
+    # via
+    #   opentelemetry-api
+    #   opentelemetry-semantic-conventions
 distlib==0.3.9
     # via virtualenv
 dnspython==2.7.0
     # via email-validator
 email-validator==2.2.0
     # via fastapi
-eodhp-utils @ git+https://github.com/UKEODHP/eodhp-utils@v0.1.6
+eodhp-utils @ git+https://github.com/UKEODHP/eodhp-utils@v0.1.7
     # via accounting-service (pyproject.toml)
 execnet==2.1.1
     # via pytest-xdist
-faker==36.2.2
+faker==37.1.0
     # via
     #   accounting-service (pyproject.toml)
     #   eodhp-utils
-fastapi[standard]==0.115.11
+fastapi[standard]==0.115.12
     # via accounting-service (pyproject.toml)
 fastapi-cli[standard]==0.0.7
     # via fastapi
 fastjsonschema==2.21.1
     # via validate-pyproject
-filelock==3.17.0
+filelock==3.18.0
     # via virtualenv
 greenlet==3.1.1
     # via sqlalchemy
@@ -77,14 +81,16 @@ httpx==0.28.1
     # via
     #   accounting-service (pyproject.toml)
     #   fastapi
-identify==2.6.8
+identify==2.6.9
     # via pre-commit
 idna==3.10
     # via
     #   anyio
     #   email-validator
     #   httpx
-iniconfig==2.0.0
+importlib-metadata==8.6.1
+    # via opentelemetry-api
+iniconfig==2.1.0
     # via pytest
 isort==6.0.1
     # via accounting-service (pyproject.toml)
@@ -108,27 +114,50 @@ mypy-extensions==1.0.0
     # via black
 nodeenv==1.9.1
     # via pre-commit
+opentelemetry-api==1.31.1
+    # via
+    #   eodhp-utils
+    #   opentelemetry-instrumentation
+    #   opentelemetry-instrumentation-logging
+    #   opentelemetry-processor-baggage
+    #   opentelemetry-sdk
+    #   opentelemetry-semantic-conventions
+opentelemetry-instrumentation==0.52b1
+    # via opentelemetry-instrumentation-logging
+opentelemetry-instrumentation-logging==0.52b1
+    # via eodhp-utils
+opentelemetry-processor-baggage==0.52b1
+    # via eodhp-utils
+opentelemetry-sdk==1.31.1
+    # via
+    #   eodhp-utils
+    #   opentelemetry-processor-baggage
+opentelemetry-semantic-conventions==0.52b1
+    # via
+    #   opentelemetry-instrumentation
+    #   opentelemetry-sdk
 packaging==24.2
     # via
     #   black
     #   build
+    #   opentelemetry-instrumentation
     #   pytest
     #   validate-pyproject
 pathspec==0.12.1
     # via black
 pip-tools==7.4.1
     # via accounting-service (pyproject.toml)
-platformdirs==4.3.6
+platformdirs==4.3.7
     # via
     #   black
     #   virtualenv
 pluggy==1.5.0
     # via pytest
-pre-commit==4.1.0
+pre-commit==4.2.0
     # via accounting-service (pyproject.toml)
-psycopg[binary,pool]==3.2.5
+psycopg[binary,pool]==3.2.6
     # via accounting-service (pyproject.toml)
-psycopg-binary==3.2.5
+psycopg-binary==3.2.6
     # via psycopg
 psycopg-pool==3.2.6
     # via psycopg
@@ -136,12 +165,12 @@ pulsar-client==3.6.1
     # via
     #   accounting-service (pyproject.toml)
     #   eodhp-utils
-pydantic==2.10.6
+pydantic==2.11.3
     # via
     #   accounting-service (pyproject.toml)
     #   fastapi
     #   pydantic-settings
-pydantic-core==2.27.2
+pydantic-core==2.33.1
     # via pydantic
 pydantic-settings==2.8.1
     # via accounting-service (pyproject.toml)
@@ -164,10 +193,12 @@ pytest-xdist==3.6.1
     # via accounting-service (pyproject.toml)
 python-dateutil==2.9.0.post0
     # via botocore
-python-dotenv==1.0.1
+python-dotenv==1.1.0
     # via
     #   pydantic-settings
     #   uvicorn
+python-json-logger==3.3.0
+    # via eodhp-utils
 python-multipart==0.0.20
     # via fastapi
 pyyaml==6.0.2
@@ -178,17 +209,17 @@ referencing==0.36.2
     # via
     #   jsonschema
     #   jsonschema-specifications
-rich==13.9.4
+rich==14.0.0
     # via
     #   rich-toolkit
     #   typer
-rich-toolkit==0.13.2
+rich-toolkit==0.14.1
     # via fastapi-cli
-rpds-py==0.23.1
+rpds-py==0.24.0
     # via
     #   jsonschema
     #   referencing
-ruff==0.9.9
+ruff==0.11.4
     # via accounting-service (pyproject.toml)
 s3transfer==0.11.4
     # via boto3
@@ -198,24 +229,28 @@ six==1.17.0
     # via python-dateutil
 sniffio==1.3.1
     # via anyio
-sqlalchemy==2.0.38
+sqlalchemy==2.0.40
     # via accounting-service (pyproject.toml)
-starlette==0.46.0
+starlette==0.46.1
     # via fastapi
-trove-classifiers==2025.3.3.18
+trove-classifiers==2025.3.19.19
     # via validate-pyproject
 typer==0.15.2
     # via fastapi-cli
-typing-extensions==4.12.2
+typing-extensions==4.13.1
     # via
     #   fastapi
+    #   opentelemetry-sdk
     #   psycopg-pool
     #   pydantic
     #   pydantic-core
     #   rich-toolkit
     #   sqlalchemy
     #   typer
-tzdata==2025.1
+    #   typing-inspection
+typing-inspection==0.4.0
+    # via pydantic
+tzdata==2025.2
     # via faker
 urllib3==2.3.0
     # via botocore
@@ -225,18 +260,25 @@ uvicorn[standard]==0.34.0
     #   fastapi-cli
 uvloop==0.21.0
     # via uvicorn
-validate-pyproject[all]==0.23
+validate-pyproject[all]==0.24.1
     # via accounting-service (pyproject.toml)
-virtualenv==20.29.2
+virtualenv==20.30.0
     # via pre-commit
 watchdog==6.0.0
     # via pytest-watcher
-watchfiles==1.0.4
+watchfiles==1.0.5
     # via uvicorn
 websockets==15.0.1
     # via uvicorn
 wheel==0.45.1
     # via pip-tools
+wrapt==1.17.2
+    # via
+    #   deprecated
+    #   opentelemetry-instrumentation
+    #   opentelemetry-processor-baggage
+zipp==3.21.0
+    # via importlib-metadata
 
 # The following packages are considered to be unsafe in a requirements file:
 # pip

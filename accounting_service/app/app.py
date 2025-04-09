@@ -4,14 +4,20 @@ from datetime import datetime
 from typing import Annotated, Iterator, List, Optional
 from uuid import UUID
 
+from eodhp_utils.runner import log_component_version, setup_logging
 from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Response
 from pydantic import BaseModel
+from sqlalchemy import Result, Row
 from sqlalchemy.orm import Session
 
 from accounting_service.db import get_session
 from accounting_service.models import BillingEvent, BillingItem, BillingItemPrice
 
 logger = logging.getLogger(__name__)
+
+setup_logging(verbosity=1)
+log_component_version("annotations_api")
+
 
 root_path = os.environ.get("ROOT_PATH", "/api/")
 
@@ -124,7 +130,7 @@ class BillingItemPriceAPIResult(BaseModel):
     price: Annotated[float, Body(summary="Price-per-unit in Pounds", examples=["0.001"])]
 
 
-def billingitemprice_to_api_object(price: tuple[BillingItemPrice, str]):
+def billingitemprice_to_api_object(price: Row[tuple[BillingItemPrice, str]]) -> dict:
     result = {
         "uuid": str(price[0].uuid),
         "sku": price[1],
@@ -133,7 +139,7 @@ def billingitemprice_to_api_object(price: tuple[BillingItemPrice, str]):
     }
 
     if price[0].valid_until:
-        result["valid_until"] = price.valid_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+        result["valid_until"] = price[0].valid_until.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     return result
 
@@ -212,7 +218,7 @@ def get_workspace_usage_data(
     never be aggregated across day boundaries (midnight UTC).
     """
     events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
-        session, workspace=workspace, start=start, end=end, limit=limit, after=after
+        session, workspace=workspace, start=start, end=end, limit=limit or 100, after=after
     )
 
     add_usage_data_headers(response)
@@ -287,7 +293,7 @@ def get_account_usage_data(
     never be aggregated across day boundaries (midnight UTC).
     """
     events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
-        session, account=account_id, start=start, end=end, limit=limit, after=after
+        session, account=account_id, start=start, end=end, limit=limit or 100, after=after
     )
 
     add_usage_data_headers(response)
@@ -317,15 +323,15 @@ def get_item_list(session: SessionDep, response: Response):
 )
 def get_item(session: SessionDep, response: Response, sku: str):
     """This returns a specific billing item based on its SKU."""
-    item: Iterator[BillingItem] = BillingItem.find_billing_item(session, sku)
+    item: Optional[BillingItem] = BillingItem.find_billing_item(session, sku)
 
     if item is None:
         raise HTTPException(
             status_code=404, detail="SKU not known", headers={"Cache-Control": "max-age=60"}
         )
-
-    add_global_data_headers(response)
-    return billingitem_to_api_object(item)
+    else:
+        add_global_data_headers(response)
+        return billingitem_to_api_object(item)
 
 
 @app.get(
@@ -339,7 +345,7 @@ def get_prices(session: SessionDep, response: Response):
     be in the future are not returned. The cost is given in Pounds per unit, where the unit is
     defined in the billing item the price relates to.
     """
-    prices: Iterator[tuple[BillingItemPrice, str]] = BillingItemPrice.find_prices(
+    prices: Result[tuple[BillingItemPrice, str]] = BillingItemPrice.find_prices(
         session, datetime.now()
     )
 

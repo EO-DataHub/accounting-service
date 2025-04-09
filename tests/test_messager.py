@@ -42,6 +42,33 @@ def test_message_results_in_billingevent_in_db(db_session: Session):
     assert beobj.item.sku == bemsg.sku
 
 
+def test_two_messages_same_uuid_results_in_one_billingevent_in_db(db_session: Session):
+    ############# Setup
+    bemsg, start, end = fake_event_known_times()
+    db_session.add(models.BillingItem(sku=bemsg.sku, name="test", unit="GB-h"))
+    db_session.flush()
+    db_session.commit()
+
+    ############# Test
+    messager = AccountingIngesterMessager()
+
+    bemsg.quantity = 1
+    failures1 = messager.consume(bemsg_to_pulsar_msg(bemsg))
+
+    bemsg.quantity = 2
+    failures2 = messager.consume(bemsg_to_pulsar_msg(bemsg))
+
+    ############# Behaviour check
+    assert not failures1.any_permanent()
+    assert not failures1.any_temporary()
+
+    assert not failures2.any_permanent()
+    assert not failures2.any_temporary()
+
+    beobj = db_session.get(models.BillingEvent, UUID(bemsg.uuid))
+    assert beobj.quantity == 1
+
+
 def test_message_with_no_user_results_in_billingevent_in_db(db_session: Session):
     ############# Setup
     bemsg = messages.BillingEvent.get_fake()

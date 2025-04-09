@@ -29,6 +29,26 @@ def test_round_trip_billingevent_insertfrommessage_retrieve(db_session: Session)
     assert beobj.item.sku == bemsg.sku
 
 
+def test_dup_billingevent_uuid_only_added_once(db_session: Session):
+    ############# Setup
+    bemsg, start, end = fake_event_known_times()
+    db_session.add(models.BillingItem(sku=bemsg.sku, name="test", unit="GB-h"))
+
+    ############# Test
+    bemsg.quantity = 1
+    beuuid1 = models.BillingEvent.insert_from_message(db_session, bemsg)
+
+    bemsg.quantity = 2
+    beuuid2 = models.BillingEvent.insert_from_message(db_session, bemsg)
+
+    ############# Behaviour check
+    beobj = db_session.get(models.BillingEvent, beuuid1)
+    assert str(beobj.uuid) == bemsg.uuid
+    assert beobj.quantity == 1
+
+    assert beuuid2 is None
+
+
 def gen_billingitem_data(
     db_session: Session, events: Sequence[dict], ws_accounts: Optional[Dict[str, str]] = None
 ):
