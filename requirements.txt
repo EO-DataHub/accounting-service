@@ -11,6 +11,8 @@ anyio==4.9.0
     #   httpx
     #   starlette
     #   watchfiles
+asgiref==3.8.1
+    # via opentelemetry-instrumentation-asgi
 attrs==25.3.0
     # via
     #   jsonschema
@@ -88,12 +90,21 @@ opentelemetry-api==1.31.1
     # via
     #   eodhp-utils
     #   opentelemetry-instrumentation
+    #   opentelemetry-instrumentation-asgi
+    #   opentelemetry-instrumentation-fastapi
     #   opentelemetry-instrumentation-logging
     #   opentelemetry-processor-baggage
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions
 opentelemetry-instrumentation==0.52b1
-    # via opentelemetry-instrumentation-logging
+    # via
+    #   opentelemetry-instrumentation-asgi
+    #   opentelemetry-instrumentation-fastapi
+    #   opentelemetry-instrumentation-logging
+opentelemetry-instrumentation-asgi==0.52b1
+    # via opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-fastapi==0.52b1
+    # via accounting-service (pyproject.toml)
 opentelemetry-instrumentation-logging==0.52b1
     # via eodhp-utils
 opentelemetry-processor-baggage==0.52b1
@@ -105,7 +116,13 @@ opentelemetry-sdk==1.31.1
 opentelemetry-semantic-conventions==0.52b1
     # via
     #   opentelemetry-instrumentation
+    #   opentelemetry-instrumentation-asgi
+    #   opentelemetry-instrumentation-fastapi
     #   opentelemetry-sdk
+opentelemetry-util-http==0.52b1
+    # via
+    #   opentelemetry-instrumentation-asgi
+    #   opentelemetry-instrumentation-fastapi
 packaging==24.2
     # via opentelemetry-instrumentation
 psycopg[binary,pool]==3.2.6

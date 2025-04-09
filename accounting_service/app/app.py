@@ -6,6 +6,7 @@ from uuid import UUID
 
 from eodhp_utils.runner import log_component_version, setup_logging
 from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Response
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from pydantic import BaseModel
 from sqlalchemy import Result, Row
 from sqlalchemy.orm import Session
@@ -24,6 +25,8 @@ root_path = os.environ.get("ROOT_PATH", "/api/")
 SessionDep = Annotated[Session, Depends(get_session)]
 
 app = FastAPI(root_path=root_path)
+
+FastAPIInstrumentor.instrument_app(app)
 
 # This server serves three areas of the API:
 #
