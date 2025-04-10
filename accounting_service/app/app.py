@@ -5,9 +5,9 @@ from typing import Annotated, Iterator, List, Optional
 from uuid import UUID
 
 from eodhp_utils.runner import log_component_version, setup_logging
-from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Response
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Response
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import Result, Row
 from sqlalchemy.orm import Session
 
@@ -50,27 +50,27 @@ class BillingEventAPIResult(BaseModel):
     uuid: UUID
     event_start: Annotated[
         datetime,
-        Body(summary="Start time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
+        Field(description="Start time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
     ]
     event_end: Annotated[
         datetime,
-        Body(summary="End time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
+        Field(description="End time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
     ]
-    item: Annotated[str, Body(summary="Item (SKU) consumed", examples=["wfcpu"])]
+    item: Annotated[str, Field(description="Item (SKU) consumed", examples=["wfcpu"])]
     workspace: Annotated[
-        str, Body(summary="Workspace which consumed the resource", examples=["my-workspace"])
+        str, Field(description="Workspace which consumed the resource", examples=["my-workspace"])
     ]
     quantity: Annotated[
         float,
-        Body(
-            summary="Quantity consumed in the units defined in the item definition",
+        Field(
+            description="Quantity consumed in the units defined in the item definition",
             examples=["0.42"],
         ),
     ]
     user: Annotated[
         UUID | None,
-        Body(
-            summary=(
+        Field(
+            description=(
                 "User who triggered consumption. May be unset where there is no single user,"
                 + " such as for storage."
             )
@@ -98,15 +98,16 @@ class BillingItemAPIResult(BaseModel):
     uuid: UUID
     sku: Annotated[
         str,
-        Body(
-            summary="Human-readable codename (SKU/stock-keeping unit) for the item",
+        Field(
+            description="Human-readable codename (SKU/stock-keeping unit) for the item",
             examples=["wfcpu"],
         ),
     ]
     name: Annotated[
-        str, Body(summary="Human-readable name for the item", examples=["Workflow CPU seconds"])
+        str,
+        Field(description="Human-readable name for the item", examples=["Workflow CPU seconds"]),
     ]
-    unit: Annotated[str, Body(summary="Unit the item is priced in", examples=["GB-months"])]
+    unit: Annotated[str, Field(description="Unit the item is priced in", examples=["GB-months"])]
 
 
 def billingitem_to_api_object(item: BillingItem):
@@ -125,12 +126,12 @@ class BillingItemPriceAPIResult(BaseModel):
     """
 
     uuid: UUID
-    sku: Annotated[str, Body(summary="The product this applies to", examples=["wfcpu"])]
+    sku: Annotated[str, Field(description="The product this applies to", examples=["wfcpu"])]
     valid_from: datetime
     valid_until: Annotated[
-        Optional[datetime], Body(summary="Price was in-force until this time")
+        Optional[datetime], Field(description="Price was in-force until this time")
     ] = None
-    price: Annotated[float, Body(summary="Price-per-unit in Pounds", examples=["0.001"])]
+    price: Annotated[float, Field(description="Price-per-unit in Pounds", examples=["0.001"])]
 
 
 def billingitemprice_to_api_object(price: Row[tuple[BillingItemPrice, str]]) -> dict:
