@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 import eodhp_utils.pulsar.messages
 from sqlalchemy import (
     CheckConstraint,
+    CursorResult,
     ForeignKey,
     Index,
     Result,
@@ -59,6 +60,7 @@ class WorkspaceAccount(Base):
             ],
         )
 
+        assert isinstance(result, CursorResult)  # Makes mypy happy
         return result.rowcount > 0
 
 
