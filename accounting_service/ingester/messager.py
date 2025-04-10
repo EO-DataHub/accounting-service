@@ -1,5 +1,5 @@
 import logging
-from typing import Sequence
+from typing import Optional, Sequence
 from uuid import UUID
 
 from eodhp_utils.messagers import Messager, PulsarJSONMessager
@@ -40,11 +40,14 @@ class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.Billing
             self._add_observed_sku(bemsg)
             uuid = self._try_record_event(bemsg)
 
-        logging.debug("Recorded BillingEvent with uuid %s", str(uuid))
+        if uuid:
+            logging.debug("Recorded BillingEvent with uuid %s", str(uuid))
+        else:
+            logging.info("Received duplicate BillingEvent uuid %s", bemsg.uuid)
 
         return []
 
-    def _try_record_event(self, bemsg: messages.BillingEvent) -> UUID:
+    def _try_record_event(self, bemsg: messages.BillingEvent) -> Optional[UUID]:
         with Session(db.engine) as session:
             uuid = models.BillingEvent.insert_from_message(session, bemsg)
             session.commit()

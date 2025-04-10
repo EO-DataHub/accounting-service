@@ -6,15 +6,17 @@ from uuid import UUID, uuid4
 import eodhp_utils.pulsar.messages
 from sqlalchemy import (
     CheckConstraint,
+    CursorResult,
     ForeignKey,
     Index,
+    Result,
     Uuid,
     and_,
-    insert,
     or_,
     select,
     text,
 )
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
 from accounting_service import db
@@ -58,7 +60,8 @@ class WorkspaceAccount(Base):
             ],
         )
 
-        return not not result
+        assert isinstance(result, CursorResult)  # Makes mypy happy
+        return result.rowcount > 0
 
 
 class BillingItem(Base):
@@ -78,18 +81,20 @@ class BillingItem(Base):
     name: Mapped[str]  # User-visible name like 'CPU time in notebooks and workflows'
     unit: Mapped[str]  # Units, like seconds or GB-hours
 
-    def find_billing_items(session: Session) -> Iterator[Self]:
+    @classmethod
+    def find_billing_items(cls, session: Session) -> Iterator[Self]:
         """Returns all user-visible BillingItems in order of SKU."""
         # This is currently all BillingItems but this could change if we add a 'deleted' flag
         # or some visibility rules.
-        query = select(BillingItem).order_by(BillingItem.sku)
+        query = select(cls).order_by(cls.sku)
         return map(lambda r: r[0], session.execute(query))
 
-    def find_billing_item(session: Session, sku: str) -> Optional[Self]:
+    @classmethod
+    def find_billing_item(cls, session: Session, sku: str) -> Optional[Self]:
         """Returns a specified BillingItem, assuming it's visible."""
         # This is currently any BillingItem but this could change if we add a 'deleted' flag
         # or some visibility rules.
-        query = select(BillingItem).where(BillingItem.sku == sku)
+        query = select(cls).where(cls.sku == sku)
         result = session.execute(query).first()
         return result[0] if result else None
 
@@ -131,25 +136,26 @@ class BillingItemPrice(Base):
             "item",
             "valid_from",
         ),
-        CheckConstraint("valid_from <= valid_until"),
+        CheckConstraint("valid_until IS NULL OR valid_from <= valid_until"),
     )
 
-    def find_prices(session: Session, at: datetime) -> Iterator[tuple[Self, str]]:  # type: ignore
+    @classmethod
+    def find_prices(cls, session: Session, at: datetime) -> Result[tuple[Self, str]]:
         """Returns all prices valid at the specified time. Each result is a tuple containing a
         BillingItemPrice first and the associated SKU second."""
         query = (
-            select(BillingItemPrice, BillingItem.sku)
-            .join(BillingItemPrice.item)
-            .where(BillingItemPrice.valid_from < at)
+            select(cls, BillingItem.sku)
+            .join(cls.item)
+            .where(cls.valid_from <= at)
             .where(
                 or_(
-                    BillingItemPrice.valid_until == None,  # noqa: E711
-                    BillingItemPrice.valid_until > at,
+                    cls.valid_until == None,  # noqa: E711
+                    cls.valid_until > at,
                 )
             )
-            .order_by(BillingItem.sku, BillingItemPrice.valid_from)
+            .order_by(BillingItem.sku, cls.valid_from)
         )
-        print(query)
+
         return session.execute(query)
 
 
@@ -187,14 +193,15 @@ class BillingEvent(Base):
         CheckConstraint("event_start <= event_end"),
     )
 
-    @staticmethod
+    @classmethod
     def find_billing_events(
+        cls,
         session: Session,
-        workspace: str = None,
-        account: UUID = None,
-        start: datetime = None,
-        end: datetime = None,
-        after: UUID = None,
+        workspace: Optional[str] = None,
+        account: Optional[UUID] = None,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        after: Optional[UUID] = None,
         limit: int = 5_000,
     ) -> Iterator[Self]:
         """
@@ -202,51 +209,51 @@ class BillingEvent(Base):
 
         For paging, `after` should be the UUID of the last billing event on the previous page.
         """
-        query = select(BillingEvent).limit(limit)
+        query = select(cls).limit(limit)
 
         # We need a complete and certain order so that the 'after' parameter works.
         query = query.order_by(
-            BillingEvent.event_start,
-            BillingEvent.event_end,
-            BillingEvent.workspace,
-            BillingEvent.uuid,
+            cls.event_start,
+            cls.event_end,
+            cls.workspace,
+            cls.uuid,
         )
 
         if workspace is not None:
-            query = query.where(BillingEvent.workspace == workspace)
+            query = query.where(cls.workspace == workspace)
 
         if account is not None:
-            query = query.join(
-                WorkspaceAccount, WorkspaceAccount.workspace == BillingEvent.workspace
-            ).where(WorkspaceAccount.account == account)
+            query = query.join(WorkspaceAccount, WorkspaceAccount.workspace == cls.workspace).where(
+                WorkspaceAccount.account == account
+            )
 
         if start is not None:
-            query = query.where(BillingEvent.event_start >= start)
+            query = query.where(cls.event_start >= start)
 
         if end is not None:
-            query = query.where(BillingEvent.event_end < end)
+            query = query.where(cls.event_end < end)
 
         if after is not None:
-            after_be = session.get(BillingEvent, after)
+            after_be = session.get(cls, after)
 
             if after_be is not None:
                 query = query.where(
                     or_(
-                        (BillingEvent.event_start > after_be.event_start),
+                        (cls.event_start > after_be.event_start),
                         and_(
-                            BillingEvent.event_start == after_be.event_start,
-                            BillingEvent.event_end > after_be.event_end,
+                            cls.event_start == after_be.event_start,
+                            cls.event_end > after_be.event_end,
                         ),
                         and_(
-                            BillingEvent.event_start == after_be.event_start,
-                            BillingEvent.event_end == after_be.event_end,
-                            BillingEvent.workspace > after_be.workspace,
+                            cls.event_start == after_be.event_start,
+                            cls.event_end == after_be.event_end,
+                            cls.workspace > after_be.workspace,
                         ),
                         and_(
-                            BillingEvent.event_start == after_be.event_start,
-                            BillingEvent.event_end == after_be.event_end,
-                            BillingEvent.workspace == after_be.workspace,
-                            BillingEvent.uuid > after,
+                            cls.event_start == after_be.event_start,
+                            cls.event_end == after_be.event_end,
+                            cls.workspace == after_be.workspace,
+                            cls.uuid > after,
                         ),
                     )
                 )
@@ -256,7 +263,12 @@ class BillingEvent(Base):
     @classmethod
     def insert_from_message(
         cls, session: Session, msg: eodhp_utils.pulsar.messages.BillingEvent
-    ) -> UUID:
+    ) -> Optional[UUID]:
+        """
+        Adds a new BillingEvent to the DB based on a Pulsar message.
+
+        Deals with duplicated UUIDs by ignoring the second message and returning None.
+        """
         result = session.execute(
             insert(cls)
             .values(
@@ -270,10 +282,11 @@ class BillingEvent(Base):
                 workspace=msg.workspace,
                 quantity=msg.quantity,
             )
+            .on_conflict_do_nothing(index_elements=["uuid"])
             .returning(BillingEvent.uuid)
         )
 
-        return result.first()[0]
+        return result.scalar_one_or_none()
 
     def __repr__(self):
         return (

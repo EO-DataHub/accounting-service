@@ -1,11 +1,14 @@
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Iterator, List, Optional
 from uuid import UUID
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Response
-from pydantic import BaseModel
+from eodhp_utils.runner import log_component_version, setup_logging
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Response
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from pydantic import BaseModel, Field
+from sqlalchemy import Result, Row
 from sqlalchemy.orm import Session
 
 from accounting_service.db import get_session
@@ -13,11 +16,17 @@ from accounting_service.models import BillingEvent, BillingItem, BillingItemPric
 
 logger = logging.getLogger(__name__)
 
+setup_logging(verbosity=1)
+log_component_version("annotations_api")
+
+
 root_path = os.environ.get("ROOT_PATH", "/api/")
 
 SessionDep = Annotated[Session, Depends(get_session)]
 
 app = FastAPI(root_path=root_path)
+
+FastAPIInstrumentor.instrument_app(app)
 
 # This server serves three areas of the API:
 #
@@ -41,27 +50,27 @@ class BillingEventAPIResult(BaseModel):
     uuid: UUID
     event_start: Annotated[
         datetime,
-        Body(summary="Start time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
+        Field(description="Start time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
     ]
     event_end: Annotated[
         datetime,
-        Body(summary="End time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
+        Field(description="End time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
     ]
-    item: Annotated[str, Body(summary="Item (SKU) consumed", examples=["wfcpu"])]
+    item: Annotated[str, Field(description="Item (SKU) consumed", examples=["wfcpu"])]
     workspace: Annotated[
-        str, Body(summary="Workspace which consumed the resource", examples=["my-workspace"])
+        str, Field(description="Workspace which consumed the resource", examples=["my-workspace"])
     ]
     quantity: Annotated[
         float,
-        Body(
-            summary="Quantity consumed in the units defined in the item definition",
+        Field(
+            description="Quantity consumed in the units defined in the item definition",
             examples=["0.42"],
         ),
     ]
     user: Annotated[
         UUID | None,
-        Body(
-            summary=(
+        Field(
+            description=(
                 "User who triggered consumption. May be unset where there is no single user,"
                 + " such as for storage."
             )
@@ -89,15 +98,16 @@ class BillingItemAPIResult(BaseModel):
     uuid: UUID
     sku: Annotated[
         str,
-        Body(
-            summary="Human-readable codename (SKU/stock-keeping unit) for the item",
+        Field(
+            description="Human-readable codename (SKU/stock-keeping unit) for the item",
             examples=["wfcpu"],
         ),
     ]
     name: Annotated[
-        str, Body(summary="Human-readable name for the item", examples=["Workflow CPU seconds"])
+        str,
+        Field(description="Human-readable name for the item", examples=["Workflow CPU seconds"]),
     ]
-    unit: Annotated[str, Body(summary="Unit the item is priced in", examples=["GB-months"])]
+    unit: Annotated[str, Field(description="Unit the item is priced in", examples=["GB-months"])]
 
 
 def billingitem_to_api_object(item: BillingItem):
@@ -116,15 +126,15 @@ class BillingItemPriceAPIResult(BaseModel):
     """
 
     uuid: UUID
-    sku: Annotated[str, Body(summary="The product this applies to", examples=["wfcpu"])]
+    sku: Annotated[str, Field(description="The product this applies to", examples=["wfcpu"])]
     valid_from: datetime
     valid_until: Annotated[
-        Optional[datetime], Body(summary="Price was in-force until this time")
+        Optional[datetime], Field(description="Price was in-force until this time")
     ] = None
-    price: Annotated[float, Body(summary="Price-per-unit in Pounds", examples=["0.001"])]
+    price: Annotated[float, Field(description="Price-per-unit in Pounds", examples=["0.001"])]
 
 
-def billingitemprice_to_api_object(price: tuple[BillingItemPrice, str]):
+def billingitemprice_to_api_object(price: Row[tuple[BillingItemPrice, str]]) -> dict:
     result = {
         "uuid": str(price[0].uuid),
         "sku": price[1],
@@ -133,7 +143,7 @@ def billingitemprice_to_api_object(price: tuple[BillingItemPrice, str]):
     }
 
     if price[0].valid_until:
-        result["valid_until"] = price.valid_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+        result["valid_until"] = price[0].valid_until.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     return result
 
@@ -212,7 +222,7 @@ def get_workspace_usage_data(
     never be aggregated across day boundaries (midnight UTC).
     """
     events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
-        session, workspace=workspace, start=start, end=end, limit=limit, after=after
+        session, workspace=workspace, start=start, end=end, limit=limit or 100, after=after
     )
 
     add_usage_data_headers(response)
@@ -287,7 +297,7 @@ def get_account_usage_data(
     never be aggregated across day boundaries (midnight UTC).
     """
     events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
-        session, account=account_id, start=start, end=end, limit=limit, after=after
+        session, account=account_id, start=start, end=end, limit=limit or 100, after=after
     )
 
     add_usage_data_headers(response)
@@ -317,15 +327,15 @@ def get_item_list(session: SessionDep, response: Response):
 )
 def get_item(session: SessionDep, response: Response, sku: str):
     """This returns a specific billing item based on its SKU."""
-    item: Iterator[BillingItem] = BillingItem.find_billing_item(session, sku)
+    item: Optional[BillingItem] = BillingItem.find_billing_item(session, sku)
 
     if item is None:
         raise HTTPException(
             status_code=404, detail="SKU not known", headers={"Cache-Control": "max-age=60"}
         )
-
-    add_global_data_headers(response)
-    return billingitem_to_api_object(item)
+    else:
+        add_global_data_headers(response)
+        return billingitem_to_api_object(item)
 
 
 @app.get(
@@ -339,8 +349,8 @@ def get_prices(session: SessionDep, response: Response):
     be in the future are not returned. The cost is given in Pounds per unit, where the unit is
     defined in the billing item the price relates to.
     """
-    prices: Iterator[tuple[BillingItemPrice, str]] = BillingItemPrice.find_prices(
-        session, datetime.now()
+    prices: Result[tuple[BillingItemPrice, str]] = BillingItemPrice.find_prices(
+        session, datetime.now(timezone.utc)
     )
 
     add_global_data_headers(response)
