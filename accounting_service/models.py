@@ -59,7 +59,7 @@ class WorkspaceAccount(Base):
             ],
         )
 
-        return not not result
+        return result.rowcount > 0
 
 
 class BillingItem(Base):
@@ -134,7 +134,7 @@ class BillingItemPrice(Base):
             "item",
             "valid_from",
         ),
-        CheckConstraint("valid_from <= valid_until"),
+        CheckConstraint("valid_until IS NULL OR valid_from <= valid_until"),
     )
 
     @classmethod
@@ -144,7 +144,7 @@ class BillingItemPrice(Base):
         query = (
             select(cls, BillingItem.sku)
             .join(cls.item)
-            .where(cls.valid_from < at)
+            .where(cls.valid_from <= at)
             .where(
                 or_(
                     cls.valid_until == None,  # noqa: E711

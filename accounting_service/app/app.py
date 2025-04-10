@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Iterator, List, Optional
 from uuid import UUID
 
@@ -350,7 +350,7 @@ def get_prices(session: SessionDep, response: Response):
     defined in the billing item the price relates to.
     """
     prices: Result[tuple[BillingItemPrice, str]] = BillingItemPrice.find_prices(
-        session, datetime.now()
+        session, datetime.now(timezone.utc)
     )
 
     add_global_data_headers(response)
