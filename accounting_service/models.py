@@ -1,6 +1,7 @@
+from collections import namedtuple
 from datetime import datetime
 from decimal import Decimal
-from typing import Iterator, Optional, Self
+from typing import Iterator, Optional, Self, Sequence
 from uuid import UUID, uuid4
 
 import eodhp_utils.pulsar.messages
@@ -15,6 +16,7 @@ from sqlalchemy import (
     or_,
     select,
     text,
+    union,
 )
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
@@ -133,7 +135,8 @@ class BillingItemPrice(Base):
 
     __table_args__ = (
         Index(
-            "item",
+            "billingitemprice_item_validfrom_index",
+            "item_id",
             "valid_from",
         ),
         CheckConstraint("valid_until IS NULL OR valid_from <= valid_until"),
@@ -187,6 +190,7 @@ class BillingEvent(Base):
 
     __table_args__ = (
         Index(
+            "billingevent_workspace_eventstart_index",
             "workspace",
             "event_start",
         ),
@@ -298,4 +302,179 @@ class BillingEvent(Base):
             + f"{self.user=}, "
             + f"{self.workspace=}, "
             + f"{self.quantity=})"
+        )
+
+
+class BillableResourceConsumptionRateSample(Base):
+    """
+    A consumption rate sample is a point-in-time sample of the rate at which a user is consuming a
+    billed-for resources, typically storage but it could be any other resource where the time it's
+    held for is the basis for the charge.
+
+    For example, if we measure storage use at 8GB then the consumption rate sample would be
+    '8GB-seconds per second'. The billable resource is measured in GB-seconds, and every second 8
+    of them are consumed.
+
+    Samples are used to generate estimated BillingEvents periodically by, effectively, interpolating
+    between samples and integrating.
+    """
+
+    __tablename__ = "billing_resource_consumption_rate_sample"
+
+    uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+
+    # Typically this is the end of the sampling process, although we pretend here that it was
+    # instantaneous.
+    sample_time: Mapped[datetime] = mapped_column(index=True)
+
+    item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
+    item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
+
+    user: Mapped[Optional[UUID]]  # This is None for, for example, workspace storage.
+    workspace: Mapped[str]
+
+    # The units of this are defined in the BillingItem and divided by seconds.
+    # eg, storage consumption is measured in GB-seconds, so this is in GB.
+    rate: Mapped[float]
+
+    __table_args__ = (
+        Index(
+            "billableresourceconsumptionratesample_workspace_time_index",
+            "workspace",
+            "sample_time",
+        ),
+    )
+
+    @classmethod
+    def insert_from_message(
+        cls, session: Session, msg: eodhp_utils.pulsar.messages.BillingResourceConsumptionRateSample
+    ) -> Optional[UUID]:
+        result = session.execute(
+            insert(cls)
+            .values(
+                uuid=UUID(msg.uuid),
+                sample_time=datetime.fromisoformat(msg.sample_time),
+                item_id=(
+                    select(BillingItem.uuid).where(BillingItem.sku == msg.sku).scalar_subquery()
+                ),
+                user=UUID(msg.user) if msg.user else None,
+                workspace=msg.workspace,
+                rate=msg.rate,
+            )
+            .on_conflict_do_nothing(index_elements=["uuid"])
+            .returning(cls.uuid)
+        )
+
+        return result.scalar_one_or_none()
+
+    @classmethod
+    def find_data_for_interval(
+        cls, session: Session, workspace: str, sku: str, start: datetime, end: datetime
+    ) -> Sequence[Self]:
+        item_subquery = select(BillingItem.uuid).where(BillingItem.sku == sku).scalar_subquery()
+        last_before_start = (
+            select(cls)
+            .where(cls.item_id == item_subquery)
+            .where(cls.workspace == workspace)
+            .where(cls.sample_time <= start)
+            .order_by(cls.sample_time.desc())
+            .limit(1)
+        )
+        first_after_end = (
+            select(cls)
+            .where(cls.item_id == item_subquery)
+            .where(cls.workspace == workspace)
+            .where(cls.sample_time >= end)
+            .order_by(cls.sample_time)
+            .limit(1)
+        )
+        in_period = (
+            select(cls)
+            .where(cls.item_id == item_subquery)
+            .where(cls.workspace == workspace)
+            .where(cls.sample_time > start)
+            .where(cls.sample_time < end)
+        )
+
+        query = select(cls).from_statement(
+            union(last_before_start, first_after_end, in_period).order_by("sample_time")
+        )
+        return session.execute(query).scalars().all()
+
+    @classmethod
+    def calculate_consumption_for_interval(
+        cls, session: Session, workspace: str, sku: str, start: datetime, end: datetime
+    ) -> Optional[float]:
+        rate_samples = list(cls.find_data_for_interval(session, workspace, sku, start, end))
+
+        if not rate_samples:
+            # No record of any consumption at all.
+            return None
+
+        # We need an estimate of consumption rate at the start and end of the interval.
+        # We use interpolation.
+        def interpolate(at: datetime, s0, s1):
+            assert at >= s0.sample_time
+            assert at <= s1.sample_time
+
+            proportion: float = (at - s0.sample_time) / (s1.sample_time - s0.sample_time)
+
+            return s0.rate + proportion * (s1.rate - s0.rate)
+
+        RateTime = namedtuple("RateTime", ["at", "rate"])
+
+        starting_ratetime = (
+            # If no samples exist before the window then it may not have existed yet.
+            # To avoid awkward questions, we treat consumption as zero up until the first
+            # sample.
+            RateTime(at=rate_samples[0].seconds_after(start), rate=0)
+            if rate_samples[0].sample_time > start
+            else RateTime(at=0, rate=interpolate(start, rate_samples[0], rate_samples[1]))
+        )
+
+        ending_ratetime = (
+            # If there are no samples after the window we assume the resource was destroyed
+            # sometime after the last sample. Again, to avoid awkward questions we assume
+            # this happened exactly at the last sample.
+            RateTime(at=rate_samples[-1].seconds_after(start), rate=0)
+            if rate_samples[-1].sample_time < end
+            else RateTime(
+                at=(end - start).seconds, rate=interpolate(end, rate_samples[-2], rate_samples[-1])
+            )
+        )
+
+        mid_samples = filter(lambda s: s.after(start) and not s.after(end), rate_samples)
+        mid_ratetimes = map(lambda s: RateTime(at=s.seconds_after(start), rate=s.rate), mid_samples)
+
+        # Form a list of RateTimes tuples covering exactly the window, clipped to a shorter period
+        # only if we've assumed the resource was created/destroyed during the window.
+        ratelist: list[RateTime] = [starting_ratetime] + list(mid_ratetimes) + [ending_ratetime]
+
+        # Now imagine a linear interpolation between the points in ratelist being integrated to
+        # produce our answer.
+        total_consumption: float = 0.0
+        for s0, s1 in zip(ratelist, ratelist[1:], strict=False):
+            assert s1.at >= s0.at
+
+            duration = s1.at - s0.at
+            rate = (s0.rate + s1.rate) / 2.0
+            total_consumption += duration * rate
+
+        return total_consumption
+
+    def seconds_after(self, after: datetime) -> float:
+        return (self.sample_time - after).seconds
+
+    def after(self, t: datetime) -> bool:
+        return self.sample_time > t
+
+    def __repr__(self):
+        return (
+            "BillableResourceConsumptionRateSample("
+            + f"{self.uuid=}, "
+            + f"{self.sample_time=}, "
+            + f"{self.item_id=}, "
+            + f"{self.user=}, "
+            + f"{self.workspace=}, "
+            + f"{self.rate=})"
         )

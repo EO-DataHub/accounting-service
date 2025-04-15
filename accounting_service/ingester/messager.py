@@ -18,7 +18,7 @@ class DBIngester:
         return False
 
 
-class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.BillingEvent]):
+class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.BillingEvent, bytes]):
     """
     This Messager receives Pulsar messages containing billing events and updates the
     accounting DB.
@@ -60,7 +60,9 @@ class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.Billing
             session.commit()
 
 
-class WorkspaceSettingsIngesterMessager(DBIngester, PulsarJSONMessager[messages.WorkspaceSettings]):
+class WorkspaceSettingsIngesterMessager(
+    DBIngester, PulsarJSONMessager[messages.WorkspaceSettings, bytes]
+):
     def process_payload(self, wsmsg: messages.WorkspaceSettings) -> Sequence[Messager.Action]:
         with Session(db.engine) as session:
             recorded = models.WorkspaceAccount.record_mapping(
