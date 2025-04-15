@@ -14,7 +14,7 @@ from accounting_service.ingester.messager import (
 @click.option("--pulsar-url")
 def cli(takeover: bool, verbose: int, pulsar_url=None):
     setup_logging(verbosity=verbose)
-    log_component_version("annotations_ingester")
+    log_component_version("accounting-service")
 
     db.create_db_and_tables()
 

@@ -17,7 +17,7 @@ from accounting_service.models import BillingEvent, BillingItem, BillingItemPric
 logger = logging.getLogger(__name__)
 
 setup_logging(verbosity=1)
-log_component_version("annotations_api")
+log_component_version("accounting-service")
 
 
 root_path = os.environ.get("ROOT_PATH", "/api/")
