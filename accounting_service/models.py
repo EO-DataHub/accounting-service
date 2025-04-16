@@ -265,6 +265,26 @@ class BillingEvent(Base):
         return map(lambda r: r[0], session.execute(query))
 
     @classmethod
+    def find_latest_billing_event(
+        cls,
+        session: Session,
+        workspace: Optional[str],
+        sku: Optional[str],
+    ) -> Optional[Self]:
+        """
+        Returns the most recent BillingEvent, optionally constrained by workspace and item.
+        """
+        query = select(cls).order_by(cls.event_end.desc()).limit(1)
+
+        if workspace is not None:
+            query = query.where(cls.workspace == workspace)
+
+        if sku is not None:
+            query = query.join(BillingItem).where(BillingItem.sku == sku)
+
+        return session.execute(query).one_or_none()
+
+    @classmethod
     def insert_from_message(
         cls, session: Session, msg: eodhp_utils.pulsar.messages.BillingEvent
     ) -> Optional[UUID]:
@@ -405,6 +425,9 @@ class BillableResourceConsumptionRateSample(Base):
     def calculate_consumption_for_interval(
         cls, session: Session, workspace: str, sku: str, start: datetime, end: datetime
     ) -> Optional[float]:
+        start = start.replace(tzinfo=None)
+        end = end.replace(tzinfo=None)
+
         rate_samples = list(cls.find_data_for_interval(session, workspace, sku, start, end))
 
         if not rate_samples:
@@ -461,6 +484,26 @@ class BillableResourceConsumptionRateSample(Base):
             total_consumption += duration * rate
 
         return total_consumption
+
+    @classmethod
+    def find_earliest(
+        cls,
+        session: Session,
+        workspace: Optional[str],
+        item_id: Optional[UUID],
+    ) -> Optional[Self]:
+        """
+        Returns the first observed sample for the given constraints.
+        """
+        query = select(cls).order_by(cls.sample_time).limit(1)
+
+        if workspace is not None:
+            query = query.where(cls.workspace == workspace)
+
+        if item_id is not None:
+            query = query.where(cls.item_id == item_id)
+
+        return session.execute(query).scalar_one_or_none()
 
     def seconds_after(self, after: datetime) -> float:
         return (self.sample_time - after).seconds
