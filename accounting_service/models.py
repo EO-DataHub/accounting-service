@@ -295,7 +295,7 @@ class BillingEvent(Base):
         if sku is not None:
             query = query.join(BillingItem).where(BillingItem.sku == sku)
 
-        return session.execute(query).one_or_none()
+        return session.execute(query).scalar_one_or_none()
 
     @classmethod
     def insert_from_message(
