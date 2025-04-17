@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Sequence
 
 import pytest
@@ -82,7 +82,7 @@ def gen_billingitem_data(
     for event in events:
         event_uuid = uuid.uuid4()
 
-        start = event.get("event_start", fake.past_datetime("-30d"))
+        start = event.get("event_start", fake.past_datetime("-30d", tzinfo=timezone.utc))
         end = event.get("event_end", start + timedelta(minutes=5))
 
         item_sku = event.get("sku", "testsku")
@@ -144,12 +144,30 @@ def test_finding_billing_events_for_workspace(db_session: Session):
     event_uuids, account_uuids, item_uuids = gen_billingitem_data(
         db_session,
         [
-            {"workspace": "workspace1", "event_start": datetime(2024, 1, 16, 6, 10, 0)},
-            {"workspace": "workspace1", "event_start": datetime(2024, 1, 16, 7, 10, 0)},
-            {"workspace": "workspace1", "event_start": datetime(2024, 1, 16, 8, 10, 0)},
-            {"workspace": "workspace1", "event_start": datetime(2024, 1, 16, 9, 10, 0)},
-            {"workspace": "workspace2", "event_start": datetime(2024, 1, 16, 7, 5, 0)},
-            {"workspace": "workspace3", "event_start": datetime(2024, 1, 17, 7, 5, 0)},
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2024, 1, 16, 6, 10, 0, tzinfo=timezone.utc),
+            },
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2024, 1, 16, 7, 10, 0, tzinfo=timezone.utc),
+            },
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2024, 1, 16, 8, 10, 0, tzinfo=timezone.utc),
+            },
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2024, 1, 16, 9, 10, 0, tzinfo=timezone.utc),
+            },
+            {
+                "workspace": "workspace2",
+                "event_start": datetime(2024, 1, 16, 7, 5, 0, tzinfo=timezone.utc),
+            },
+            {
+                "workspace": "workspace3",
+                "event_start": datetime(2024, 1, 17, 7, 5, 0, tzinfo=timezone.utc),
+            },
         ],
     )
 
@@ -157,8 +175,8 @@ def test_finding_billing_events_for_workspace(db_session: Session):
     bes = models.BillingEvent.find_billing_events(
         db_session,
         workspace="workspace1",
-        start=datetime(2024, 1, 16, 7, 5, 0),
-        end=datetime(2024, 1, 16, 9, 5, 0),
+        start=datetime(2024, 1, 16, 7, 5, 0, tzinfo=timezone.utc),
+        end=datetime(2024, 1, 16, 9, 5, 0, tzinfo=timezone.utc),
     )
 
     ############# Behaviour check
@@ -177,11 +195,26 @@ def test_paging_billing_events_produces_all_events_once(db_session: Session):
     event_uuids, account_uuids, item_uuids = gen_billingitem_data(
         db_session,
         [
-            {"workspace": "workspace1", "event_start": datetime(2024, 1, 16, 6, 10, 0)},
-            {"workspace": "workspace2", "event_start": datetime(2024, 1, 16, 7, 5, 0)},
-            {"workspace": "workspace3", "event_start": datetime(2024, 1, 16, 7, 5, 0)},
-            {"workspace": "workspace1", "event_start": datetime(2024, 1, 16, 7, 10, 0)},
-            {"workspace": "workspace1", "event_start": datetime(2024, 1, 16, 8, 10, 0)},
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2024, 1, 16, 6, 10, 0, tzinfo=timezone.utc),
+            },
+            {
+                "workspace": "workspace2",
+                "event_start": datetime(2024, 1, 16, 7, 5, 0, tzinfo=timezone.utc),
+            },
+            {
+                "workspace": "workspace3",
+                "event_start": datetime(2024, 1, 16, 7, 5, 0, tzinfo=timezone.utc),
+            },
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2024, 1, 16, 7, 10, 0, tzinfo=timezone.utc),
+            },
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2024, 1, 16, 8, 10, 0, tzinfo=timezone.utc),
+            },
         ],
     )
 
@@ -210,55 +243,55 @@ def fake_rate_samples(db_session):
     db_session.add(models.BillingItem(sku="nottestsku", name="test", unit="GB-h"))
     return [
         messages.BillingResourceConsumptionRateSample.get_fake(
-            sample_time="2025-01-01T00:45:00",
+            sample_time="2025-01-01T00:45:00Z",
             workspace="workspace1",
             rate=1,
             sku="testsku",
         ),
         messages.BillingResourceConsumptionRateSample.get_fake(
-            sample_time="2025-01-01T00:55:00",
+            sample_time="2025-01-01T00:55:00Z",
             workspace="workspace1",
             rate=2,
             sku="testsku",
         ),
         messages.BillingResourceConsumptionRateSample.get_fake(
-            sample_time="2025-01-01T01:15:00",
+            sample_time="2025-01-01T01:15:00Z",
             workspace="workspace1",
             rate=3,
             sku="testsku",
         ),
         messages.BillingResourceConsumptionRateSample.get_fake(
-            sample_time="2025-01-01T01:25:00",
+            sample_time="2025-01-01T01:25:00Z",
             workspace="workspace1",
             rate=4,
             sku="testsku",
         ),
         messages.BillingResourceConsumptionRateSample.get_fake(
-            sample_time="2025-01-01T01:50:00",
+            sample_time="2025-01-01T01:50:00Z",
             workspace="workspace1",
             rate=2,
             sku="testsku",
         ),
         messages.BillingResourceConsumptionRateSample.get_fake(
-            sample_time="2025-01-01T02:05:00",
+            sample_time="2025-01-01T02:05:00Z",
             workspace="workspace1",
             rate=1,
             sku="testsku",
         ),
         messages.BillingResourceConsumptionRateSample.get_fake(
-            sample_time="2025-01-01T02:55:00",
+            sample_time="2025-01-01T02:55:00Z",
             workspace="workspace1",
             rate=90,
             sku="testsku",
         ),
         messages.BillingResourceConsumptionRateSample.get_fake(
-            sample_time="2025-01-01T01:35:00",
+            sample_time="2025-01-01T01:35:00Z",
             workspace="workspace2",
             rate=900,
             sku="testsku",
         ),
         messages.BillingResourceConsumptionRateSample.get_fake(
-            sample_time="2025-01-01T01:35:00",
+            sample_time="2025-01-01T01:35:00Z",
             workspace="workspace1",
             rate=900,
             sku="nottestsku",
@@ -301,8 +334,8 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
             db_session,
             "workspace1",
             "testsku",
-            datetime(2025, 1, 1, 1, 0, 0),
-            datetime(2025, 1, 1, 2, 0, 0),
+            datetime(2025, 1, 1, 1, 0, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 2, 0, 0, tzinfo=timezone.utc),
         )
     )
 
@@ -325,7 +358,11 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
         #   * 1:15: 3 (exact start)
         #   * 1:25: 4 (exact end)
         # Consumption estimate is (3+4)/2 * 600
-        pytest.param(datetime(2025, 1, 1, 1, 15, 0), datetime(2025, 1, 1, 1, 25, 0), 3.5 * 600),
+        pytest.param(
+            datetime(2025, 1, 1, 1, 15, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 1, 25, 0, tzinfo=timezone.utc),
+            3.5 * 600,
+        ),
         # Samples for this 1h window should be:
         #   * 1:00: 2.25 (interpolated between 2 and 3)
         #   * 1:15: 3
@@ -334,14 +371,22 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
         #   * 2:00: 1.3333 (interpolated between 2 and 1)
         # Consumption estimate is 900*(2.25+3)/2 + 600*(3+4)/2 + 1500*(4+2)/2 + 600*(2+1.3333)/2
         #  = 9962.5
-        pytest.param(datetime(2025, 1, 1, 1, 0, 0), datetime(2025, 1, 1, 2, 0, 0), 9962.5),
+        pytest.param(
+            datetime(2025, 1, 1, 1, 0, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 2, 0, 0, tzinfo=timezone.utc),
+            9962.5,
+        ),
         # Samples for this 2 min window should be:
         #   * 1:15: 3 (before window)
         #   * 1:19: 3.4 (interpolated window start)
         #   * 1:21: 3.6 (interpolated window end)
         #   * 1:25: 4 (after window)
         # Consumption estimate is 120 * (3.6+3.4)/2
-        pytest.param(datetime(2025, 1, 1, 1, 19, 0), datetime(2025, 1, 1, 1, 21, 0), 420.0),
+        pytest.param(
+            datetime(2025, 1, 1, 1, 19, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 1, 21, 0, tzinfo=timezone.utc),
+            420.0,
+        ),
         # Samples for this 50m window should be:
         #   * 0:00: No samples
         #   * 0:45: 1
@@ -350,7 +395,11 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
         #
         # Consumption estimate is 300*(1+1.5)/2 = 375
         # Note: counted as zero up to first sample
-        pytest.param(datetime(2025, 1, 1, 0, 0, 0), datetime(2025, 1, 1, 0, 50, 0), 375),
+        pytest.param(
+            datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 0, 50, 0, tzinfo=timezone.utc),
+            375,
+        ),
         # Samples for this 1h window should be:
         #   * 2:05: 1 (before window)
         #   * 2:30: 45.5 (interpolated)
@@ -359,7 +408,11 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
         #   * 3:30: 0 (window end)
         #   * no later samples
         # Consumption estimate is 25*60*(45.5+90)/2 = 101625.0
-        pytest.param(datetime(2025, 1, 1, 2, 30, 0), datetime(2025, 1, 1, 3, 30, 0), 101625.0),
+        pytest.param(
+            datetime(2025, 1, 1, 2, 30, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 3, 30, 0, tzinfo=timezone.utc),
+            101625.0,
+        ),
     ],
 )
 def test_consumption_estimation_from_billingresourceconsumptionratesamples(

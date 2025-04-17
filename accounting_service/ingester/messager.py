@@ -1,6 +1,6 @@
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Sequence
 from uuid import UUID
 
@@ -104,8 +104,8 @@ class ConsumptionSampleRateIngesterMessager(
         # To prevent this the relevant collector should listen for resource deletion events
         # from Pulsar and generate zero rate messages at that timepoint and an hour later.
         # None do this at present, but deletion is currently rare.
-        msg_datetime = datetime.fromisoformat(msg.sample_time)
-        generate_upto = msg_datetime.replace(minute=0, second=0, microsecond=0, tzinfo=None)
+        msg_datetime = datetime.fromisoformat(msg.sample_time).astimezone(timezone.utc)
+        generate_upto = msg_datetime.replace(minute=0, second=0, microsecond=0)
         self._generate_new_estimates(msg.workspace, msg.sku, generate_upto)
 
         return []

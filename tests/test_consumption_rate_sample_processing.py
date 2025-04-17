@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID
 
 from eodhp_utils.pulsar import messages
@@ -66,10 +66,10 @@ def test_messages_across_two_hours_generates_appropriate_billing_events(db_sessi
     bes = list(models.BillingEvent.find_billing_events(db_session, crs1.workspace))
     assert len(bes) == 2
 
-    assert bes[0].event_start == datetime(2025, 1, 1, 1, 0, 0)
-    assert bes[0].event_end == datetime(2025, 1, 1, 2, 0, 0)
-    assert bes[1].event_start == datetime(2025, 1, 1, 2, 0, 0)
-    assert bes[1].event_end == datetime(2025, 1, 1, 3, 0, 0)
+    assert bes[0].event_start == datetime(2025, 1, 1, 1, 0, 0, tzinfo=timezone.utc)
+    assert bes[0].event_end == datetime(2025, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+    assert bes[1].event_start == datetime(2025, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+    assert bes[1].event_end == datetime(2025, 1, 1, 3, 0, 0, tzinfo=timezone.utc)
 
     assert bes[0].item.sku == crs1.sku
     assert bes[1].item.sku == crs1.sku

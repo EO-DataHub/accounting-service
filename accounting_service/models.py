@@ -1,11 +1,12 @@
 from collections import namedtuple
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Iterator, Optional, Self, Sequence
 from uuid import UUID, uuid4
 
 import eodhp_utils.pulsar.messages
 from sqlalchemy import (
+    TIMESTAMP,
     CheckConstraint,
     CursorResult,
     ForeignKey,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Result,
     Uuid,
     and_,
+    func,
     or_,
     select,
     text,
@@ -129,9 +131,13 @@ class BillingItemPrice(Base):
     item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
     item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
     price: Mapped[Decimal]  # This is in pounds.
-    valid_from: Mapped[datetime]
-    valid_until: Mapped[Optional[datetime]]  # None for current price, a time in the past otherwise.
-    configured_at: Mapped[datetime]  # Set to the current time at the time this row is added.
+    valid_from: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
+    valid_until: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True)
+    )  # None for current price, a time in the past otherwise.
+    configured_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), default=func.now()
+    )  # Set to the current time at the time this row is added.
 
     __table_args__ = (
         Index(
@@ -162,6 +168,13 @@ class BillingItemPrice(Base):
         return session.execute(query)
 
 
+def datetime_default_to_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt and not dt.tzinfo:
+        return dt.replace(tzinfo=timezone.utc)
+
+    return dt
+
+
 class BillingEvent(Base):
     """
     This records a particular workspace's consumption of a particular BillingItem at a particular
@@ -180,8 +193,8 @@ class BillingEvent(Base):
     __tablename__ = "billing_event"
 
     uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    event_start: Mapped[datetime] = mapped_column(index=True)
-    event_end: Mapped[datetime]
+    event_start: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), index=True)
+    event_end: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
     item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
     item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
     user: Mapped[Optional[UUID]]  # This is None for, for example, workspace storage.
@@ -297,8 +310,8 @@ class BillingEvent(Base):
             insert(cls)
             .values(
                 uuid=UUID(msg.uuid),
-                event_start=datetime.fromisoformat(msg.event_start),
-                event_end=datetime.fromisoformat(msg.event_end),
+                event_start=datetime_default_to_utc(datetime.fromisoformat(msg.event_start)),
+                event_end=datetime_default_to_utc(datetime.fromisoformat(msg.event_end)),
                 item_id=select(BillingItem.uuid)
                 .where(BillingItem.sku == msg.sku)
                 .scalar_subquery(),
@@ -345,7 +358,7 @@ class BillableResourceConsumptionRateSample(Base):
 
     # Typically this is the end of the sampling process, although we pretend here that it was
     # instantaneous.
-    sample_time: Mapped[datetime] = mapped_column(index=True)
+    sample_time: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), index=True)
 
     item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
     item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
@@ -373,7 +386,7 @@ class BillableResourceConsumptionRateSample(Base):
             insert(cls)
             .values(
                 uuid=UUID(msg.uuid),
-                sample_time=datetime.fromisoformat(msg.sample_time),
+                sample_time=datetime_default_to_utc(datetime.fromisoformat(msg.sample_time)),
                 item_id=(
                     select(BillingItem.uuid).where(BillingItem.sku == msg.sku).scalar_subquery()
                 ),
@@ -425,9 +438,6 @@ class BillableResourceConsumptionRateSample(Base):
     def calculate_consumption_for_interval(
         cls, session: Session, workspace: str, sku: str, start: datetime, end: datetime
     ) -> Optional[float]:
-        start = start.replace(tzinfo=None)
-        end = end.replace(tzinfo=None)
-
         rate_samples = list(cls.find_data_for_interval(session, workspace, sku, start, end))
 
         if not rate_samples:
