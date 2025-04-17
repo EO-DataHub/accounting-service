@@ -21,7 +21,7 @@ class DBIngester:
 
     def _add_observed_sku(self, msg):
         with Session(db.engine) as session:
-            session.add(models.BillingItem(sku=msg.sku, name="", unit=""))
+            models.BillingItem.ensure_sku_exists(session, msg.sku)
             session.commit()
 
 

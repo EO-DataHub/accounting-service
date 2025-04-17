@@ -102,6 +102,26 @@ class BillingItem(Base):
         result = session.execute(query).first()
         return result[0] if result else None
 
+    @classmethod
+    def ensure_sku_exists(cls, session: Session, sku: str) -> Optional[Self]:
+        """
+        This creates a stub BillingItem for an SKU if none already exists.
+        """
+        session.execute(
+            text(
+                "INSERT INTO billing_item (uuid, sku, name, unit) "
+                + "SELECT gen_random_uuid(), cast(:sku as text), '', '' "
+                + "WHERE NOT EXISTS ("
+                + "    SELECT 1 FROM billing_item "
+                + "    WHERE sku=:sku)"
+            ),
+            [
+                {
+                    "sku": sku,
+                }
+            ],
+        )
+
 
 class BillingItemPrice(Base):
     """
