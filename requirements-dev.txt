@@ -53,7 +53,7 @@ dnspython==2.7.0
     # via email-validator
 email-validator==2.2.0
     # via fastapi
-eodhp-utils @ git+https://github.com/UKEODHP/eodhp-utils@EODHP-906-consumption-rate-messages
+eodhp-utils @ git+https://github.com/UKEODHP/eodhp-utils@v0.1.8
     # via accounting-service (pyproject.toml)
 execnet==2.1.1
     # via pytest-xdist
@@ -236,7 +236,7 @@ rpds-py==0.24.0
     # via
     #   jsonschema
     #   referencing
-ruff==0.11.5
+ruff==0.11.6
     # via accounting-service (pyproject.toml)
 s3transfer==0.11.4
     # via boto3
