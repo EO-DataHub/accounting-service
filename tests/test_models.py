@@ -23,8 +23,8 @@ def test_round_trip_billingevent_insertfrommessage_retrieve(db_session: Session)
     ############# Behaviour check
     beobj = db_session.get(models.BillingEvent, beuuid)
     assert str(beobj.uuid) == bemsg.uuid
-    assert beobj.event_start == start
-    assert beobj.event_end == end
+    assert beobj.event_start_utc == start
+    assert beobj.event_end_utc == end
     assert str(beobj.user) == bemsg.user
     assert beobj.workspace == bemsg.workspace
     assert beobj.quantity == bemsg.quantity
@@ -312,7 +312,7 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
     ############# Behaviour check
     brobj = db_session.get(models.BillableResourceConsumptionRateSample, bruuid)
     assert str(brobj.uuid) == msg.uuid
-    assert brobj.sample_time.isoformat() == msg.sample_time
+    assert brobj.sample_time_utc.isoformat() == msg.sample_time
     assert str(brobj.user) == msg.user
     assert brobj.workspace == msg.workspace
     assert brobj.rate == msg.rate

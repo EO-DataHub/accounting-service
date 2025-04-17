@@ -1,3 +1,4 @@
+import uuid
 from collections import namedtuple
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -107,10 +108,11 @@ class BillingItem(Base):
         """
         This creates a stub BillingItem for an SKU if none already exists.
         """
+        rnd_uuid = uuid.uuid4()
         session.execute(
             text(
                 "INSERT INTO billing_item (uuid, sku, name, unit) "
-                + "SELECT gen_random_uuid(), cast(:sku as text), '', '' "
+                + "SELECT :uuid, cast(:sku as text), '', '' "
                 + "WHERE NOT EXISTS ("
                 + "    SELECT 1 FROM billing_item "
                 + "    WHERE sku=:sku)"
@@ -118,6 +120,9 @@ class BillingItem(Base):
             [
                 {
                     "sku": sku,
+                    "uuid": (
+                        rnd_uuid.hex if db.settings.SQL_DRIVER.startswith("sqlite") else rnd_uuid
+                    ),
                 }
             ],
         )
@@ -220,6 +225,19 @@ class BillingEvent(Base):
     user: Mapped[Optional[UUID]]  # This is None for, for example, workspace storage.
     workspace: Mapped[str]
     quantity: Mapped[float]  # The units involved are defined in the BillingItem
+
+    @property
+    def event_start_utc(self):
+        # In PostgreSQL we always have a sample_time with a timezone attached and it should always
+        # be UTC. In SQLite, used for tests, we get datetimes with no timezone, creating problems
+        # when we do comparisons.
+        #
+        # This harmonizes this.
+        return self.event_start.astimezone(timezone.utc)
+
+    @property
+    def event_end_utc(self):
+        return self.event_end.astimezone(timezone.utc)
 
     __table_args__ = (
         Index(
@@ -390,6 +408,15 @@ class BillableResourceConsumptionRateSample(Base):
     # eg, storage consumption is measured in GB-seconds, so this is in GB.
     rate: Mapped[float]
 
+    @property
+    def sample_time_utc(self):
+        # In PostgreSQL we always have a sample_time with a timezone attached and it should always
+        # be UTC. In SQLite, used for tests, we get datetimes with no timezone, creating problems
+        # when we do comparisons.
+        #
+        # This harmonizes this.
+        return self.sample_time.astimezone(timezone.utc)
+
     __table_args__ = (
         Index(
             "billableresourceconsumptionratesample_workspace_time_index",
@@ -449,6 +476,15 @@ class BillableResourceConsumptionRateSample(Base):
             .where(cls.sample_time < end)
         )
 
+        if db.settings.SQL_DRIVER.startswith("sqlite"):
+            # Only used in tests (but the tests can be run with PostgreSQL as well).
+            # SQLite can't cope with the UNION syntax used by SQLAlchemy.
+            return (
+                list(session.execute(last_before_start).scalars().all())
+                + list(session.execute(in_period).scalars().all())
+                + list(session.execute(first_after_end).scalars().all())
+            )
+
         query = select(cls).from_statement(
             union(last_before_start, first_after_end, in_period).order_by("sample_time")
         )
@@ -467,10 +503,12 @@ class BillableResourceConsumptionRateSample(Base):
         # We need an estimate of consumption rate at the start and end of the interval.
         # We use interpolation.
         def interpolate(at: datetime, s0, s1):
-            assert at >= s0.sample_time
-            assert at <= s1.sample_time
+            assert at >= s0.sample_time_utc
+            assert at <= s1.sample_time_utc
 
-            proportion: float = (at - s0.sample_time) / (s1.sample_time - s0.sample_time)
+            proportion: float = (at - s0.sample_time_utc) / (
+                s1.sample_time_utc - s0.sample_time_utc
+            )
 
             return s0.rate + proportion * (s1.rate - s0.rate)
 
@@ -481,7 +519,7 @@ class BillableResourceConsumptionRateSample(Base):
             # To avoid awkward questions, we treat consumption as zero up until the first
             # sample.
             RateTime(at=rate_samples[0].seconds_after(start), rate=0)
-            if rate_samples[0].sample_time > start
+            if rate_samples[0].sample_time_utc > start
             else RateTime(at=0, rate=interpolate(start, rate_samples[0], rate_samples[1]))
         )
 
@@ -490,7 +528,7 @@ class BillableResourceConsumptionRateSample(Base):
             # sometime after the last sample. Again, to avoid awkward questions we assume
             # this happened exactly at the last sample.
             RateTime(at=rate_samples[-1].seconds_after(start), rate=0)
-            if rate_samples[-1].sample_time < end
+            if rate_samples[-1].sample_time_utc < end
             else RateTime(
                 at=(end - start).seconds, rate=interpolate(end, rate_samples[-2], rate_samples[-1])
             )
@@ -536,10 +574,10 @@ class BillableResourceConsumptionRateSample(Base):
         return session.execute(query).scalar_one_or_none()
 
     def seconds_after(self, after: datetime) -> float:
-        return (self.sample_time - after).seconds
+        return (self.sample_time_utc - after).seconds
 
     def after(self, t: datetime) -> bool:
-        return self.sample_time > t
+        return self.sample_time_utc > t
 
     def __repr__(self):
         return (

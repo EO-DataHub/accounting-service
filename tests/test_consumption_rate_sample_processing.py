@@ -28,7 +28,7 @@ def test_message_results_in_sample_in_db(db_session: Session):
 
     obj = db_session.get(models.BillableResourceConsumptionRateSample, UUID(crs.uuid))
     assert str(obj.uuid) == crs.uuid
-    assert obj.sample_time == datetime.fromisoformat(crs.sample_time)
+    assert obj.sample_time_utc == datetime.fromisoformat(crs.sample_time)
     assert str(obj.user) == crs.user
     assert obj.workspace == crs.workspace
     assert obj.rate == crs.rate
@@ -66,10 +66,10 @@ def test_messages_across_two_hours_generates_appropriate_billing_events(db_sessi
     bes = list(models.BillingEvent.find_billing_events(db_session, crs1.workspace))
     assert len(bes) == 2
 
-    assert bes[0].event_start == datetime(2025, 1, 1, 1, 0, 0, tzinfo=timezone.utc)
-    assert bes[0].event_end == datetime(2025, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
-    assert bes[1].event_start == datetime(2025, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
-    assert bes[1].event_end == datetime(2025, 1, 1, 3, 0, 0, tzinfo=timezone.utc)
+    assert bes[0].event_start_utc == datetime(2025, 1, 1, 1, 0, 0, tzinfo=timezone.utc)
+    assert bes[0].event_end_utc == datetime(2025, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+    assert bes[1].event_start_utc == datetime(2025, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+    assert bes[1].event_end_utc == datetime(2025, 1, 1, 3, 0, 0, tzinfo=timezone.utc)
 
     assert bes[0].item.sku == crs1.sku
     assert bes[1].item.sku == crs1.sku

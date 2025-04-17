@@ -25,6 +25,10 @@ class DBIngester:
             session.commit()
 
 
+def truncate_to_hour(dt: datetime):
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
 class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.BillingEvent, bytes]):
     """
     This Messager receives Pulsar messages containing billing events and updates the
@@ -105,7 +109,7 @@ class ConsumptionSampleRateIngesterMessager(
         # from Pulsar and generate zero rate messages at that timepoint and an hour later.
         # None do this at present, but deletion is currently rare.
         msg_datetime = datetime.fromisoformat(msg.sample_time).astimezone(timezone.utc)
-        generate_upto = msg_datetime.replace(minute=0, second=0, microsecond=0)
+        generate_upto = truncate_to_hour(msg_datetime)
         self._generate_new_estimates(msg.workspace, msg.sku, generate_upto)
 
         return []
@@ -176,13 +180,9 @@ class ConsumptionSampleRateIngesterMessager(
                 )
                 assert earliest_sample is not None
 
-                generate_from = earliest_sample.sample_time.replace(
-                    minute=0, second=0, microsecond=0
-                )
+                generate_from = truncate_to_hour(earliest_sample.sample_time_utc)
 
-            generate_to = (generate_from + timedelta(hours=1)).replace(
-                minute=0, second=0, microsecond=0
-            )
+            generate_to = truncate_to_hour(generate_from + timedelta(hours=1))
 
             while generate_to <= upto:
                 logging.debug(
@@ -218,8 +218,6 @@ class ConsumptionSampleRateIngesterMessager(
                 )
 
                 generate_from = generate_to
-                generate_to = (generate_from + timedelta(hours=1)).replace(
-                    minute=0, second=0, microsecond=0
-                )
+                generate_to = truncate_to_hour(generate_from + timedelta(hours=1))
 
             session.commit()
