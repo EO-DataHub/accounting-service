@@ -171,7 +171,7 @@ class ConsumptionSampleRateIngesterMessager(
             )
             if last_estimate:
                 # Continue estimating from after the last estimate.
-                generate_from = last_estimate.event_end
+                generate_from = last_estimate.event_end_utc
             else:
                 # No prior estimates - estimate starting from when we first had consumption rate
                 # data.
