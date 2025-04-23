@@ -1,3 +1,4 @@
+from datetime import timezone
 from typing import Type
 from unittest.mock import Mock
 
@@ -41,7 +42,7 @@ def fake_event_known_times():
     ############# Setup
     bemsg: messages.BillingEvent = messages.BillingEvent.get_fake()
 
-    start = faker.past_datetime("-30d")
+    start = faker.past_datetime("-30d", tzinfo=timezone.utc)
     end = start + faker.time_delta("+10m")
     bemsg.event_start = start.isoformat()
     bemsg.event_end = end.isoformat()
