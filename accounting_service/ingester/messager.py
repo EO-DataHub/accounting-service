@@ -213,7 +213,7 @@ class ConsumptionSampleRateIngesterMessager(
                         item=item,
                         user=None,
                         workspace=workspace,
-                        quantity=consumption,
+                        quantity=consumption or 0,
                     )
                 )
 
