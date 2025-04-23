@@ -494,10 +494,24 @@ class BillableResourceConsumptionRateSample(Base):
     def calculate_consumption_for_interval(
         cls, session: Session, workspace: str, sku: str, start: datetime, end: datetime
     ) -> Optional[float]:
+        """
+        This calculates estimated consumption within a time interval, using linear interpolation
+        to estimate consumption rates from samples and then (effectively) integrating.
+
+        It's assumed that the resource did not exist (zero consumption rate) before the first
+        sample and after the last sample. Callers should endeavour not to call this for an interval
+        until sample collection has got as far as at least one sample after the end of the
+        interval. If no sample exists after the end of the interval then, if one is later
+        collected, the answer given by this method will change.
+        """
         rate_samples = list(cls.find_data_for_interval(session, workspace, sku, start, end))
 
-        if not rate_samples:
+        if not rate_samples or len(rate_samples) <= 1:
             # No record of any consumption at all.
+            #
+            # If there is one sample then this is equivalent to no consumption. THis is because
+            # we assume that the resource didn't exist until the first sample and didn't exist
+            # after the last one, so we act as if it existed for zero time.
             return None
 
         # We need an estimate of consumption rate at the start and end of the interval.
