@@ -41,6 +41,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       image_tag: ${{ steps.get-image-tag.outputs.IMAGE_TAG }}
+    permissions:
+      contents: read
     steps:
       - name: Get image tag
         id: get-image-tag
