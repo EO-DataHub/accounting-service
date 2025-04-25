@@ -16,6 +16,8 @@ jobs:
   pre-commit-preparation:
     name: Pre-commit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v3
 
@@ -30,12 +32,16 @@ jobs:
   security-scan:
     name: Call Security Scan
     uses: EO-DataHub/github-actions/.github/workflows/security.yaml@main
+    permissions:
+      contents: read
 
   unit-tests:
     name: Run unit tests
     uses: EO-DataHub/github-actions/.github/workflows/unit-tests-python.yaml@main
     with:
       PYTHON_VERSION: "3.12"
+    permissions:
+      contents: read
 
   get-tag-name:
     runs-on: ubuntu-latest
