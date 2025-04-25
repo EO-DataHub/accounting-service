@@ -309,8 +309,7 @@ def get_account_usage_data(
             examples=["4b48ebea-bdb8-4bb9-bce9-a7853ad3965d"],
         ),
     ],
-    authorization: Optional[str] = Header(...),  # Extract JWT from the header
-    # account_id: UUID = Depends(AccountAuthz(allow_hub_admin=True)),
+    authorization: Optional[str] = Header(...),
     start: Annotated[
         Optional[datetime],
         Query(
