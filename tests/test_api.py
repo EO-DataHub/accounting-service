@@ -1,13 +1,23 @@
 import pprint
 import uuid
 from datetime import datetime
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import delete
 from sqlalchemy.orm.session import Session
 
-from accounting_service import models
+from accounting_service import app, models
 from tests.test_models import gen_billingitem_data
+
+
+# Mock function for decode_jwt_token
+def mock_decode_jwt_token(authorization: str):
+    return {
+        "workspaces": ["workspace1", "workspace2"],
+        "workspaces_owned": ["workspace2"],
+        "realm_access": {"roles": ["user", "hub_admin"]},
+    }
 
 
 def test_workspace_usage_data_returns_correct_items_from_db(
@@ -35,21 +45,48 @@ def test_workspace_usage_data_returns_correct_items_from_db(
     )
 
     ############# Test
-    response = client.get("/workspaces/workspace2/accounting/usage-data")
+    with patch.object(app.app, "decode_jwt_token", mock_decode_jwt_token):
+        ############# Test
+        mock_token = "your_mock_jwt_token_here"
 
-    ############# Behaviour check
-    assert response.status_code == 200
-    assert response.json() == [
-        {
-            "uuid": str(event_uuids[1]),
-            "event_start": "2024-01-16T07:05:00Z",
-            "event_end": "2024-01-16T07:10:00Z",
-            "item": "sku2",
-            "user": str(uid),
-            "workspace": "workspace2",
-            "quantity": 1.23,
-        }
-    ]
+        response = client.get(
+            "/workspaces/workspace2/accounting/usage-data",
+            headers={"Authorization": f"Bearer {mock_token}"},
+        )
+
+        ############# Behaviour check
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "uuid": str(event_uuids[1]),
+                "event_start": "2024-01-16T07:05:00Z",
+                "event_end": "2024-01-16T07:10:00Z",
+                "item": "sku2",
+                "user": str(uid),
+                "workspace": "workspace2",
+                "quantity": 1.23,
+            }
+        ]
+    # mock_token = "your_mock_jwt_token_here"
+
+    # response = client.get(
+    #     "/workspaces/workspace2/accounting/usage-data",
+    #     headers={"Authorization": f"Bearer {mock_token}"},
+    # )
+
+    # ############# Behaviour check
+    # assert response.status_code == 200
+    # assert response.json() == [
+    #     {
+    #         "uuid": str(event_uuids[1]),
+    #         "event_start": "2024-01-16T07:05:00Z",
+    #         "event_end": "2024-01-16T07:10:00Z",
+    #         "item": "sku2",
+    #         "user": str(uid),
+    #         "workspace": "workspace2",
+    #         "quantity": 1.23,
+    #     }
+    # ]
 
 
 def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestClient):
