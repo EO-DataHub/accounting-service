@@ -1,3 +1,5 @@
+import base64
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -5,14 +7,16 @@ from typing import Annotated, Iterator, List, Optional
 from uuid import UUID
 
 from eodhp_utils.runner import log_component_version, setup_logging
-from fastapi import Depends, FastAPI, HTTPException, Path, Query, Response
+from fastapi import (Depends, FastAPI, Header, HTTPException, Path, Query,
+                     Response)
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from pydantic import BaseModel, Field
 from sqlalchemy import Result, Row
 from sqlalchemy.orm import Session
 
 from accounting_service.db import get_session
-from accounting_service.models import BillingEvent, BillingItem, BillingItemPrice
+from accounting_service.models import (BillingEvent, BillingItem,
+                                       BillingItemPrice)
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +162,90 @@ def add_global_data_headers(response: Response):
     response.headers["Cache-Control"] = "private,max-age=300"
 
 
+def decode_jwt_token(authorization: Optional[str] = Header(None)):
+    if authorization is None:
+        raise HTTPException(status_code=400, detail="Authorization header missing")
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=400, detail="Invalid Authorization header format")
+
+    token = authorization[len("Bearer ") :]
+    _, payload, _ = token.split(".")
+    decoded_payload = base64.urlsafe_b64decode(payload + "==")
+    return json.loads(decoded_payload)
+
+
+def workspace_authz(
+    require_owner: bool = False,
+    allow_hub_admin: bool = False,
+):
+    def _check_access(
+        workspace: Annotated[
+            str,
+            Path(
+                title="EO DataHub workspace name",
+                description="Billing events for this workspace will be returned.",
+                examples=["my-workspace"],
+            ),
+        ],
+        token_payload: dict = Depends(decode_jwt_token),
+    ):
+        workspaces = token_payload.get("workspaces", [])
+        owned = token_payload.get("workspaces_owned", [])
+        roles = token_payload["realm_access"].get("roles", [])
+
+        # Allow if user is hub admin
+        if allow_hub_admin and "hub_admin" in roles:
+            return workspace
+
+        # Require owner if specified
+        if require_owner:
+            if workspace not in owned:
+                raise HTTPException(status_code=401, detail="Must be workspace owner")
+        else:
+            # Must be a member of the workspace
+            if workspace not in workspaces:
+                raise HTTPException(
+                    status_code=401, detail="Access to this workspace is not allowed"
+                )
+
+        return workspace
+
+    return _check_access
+
+
+def account_authz(
+    allow_hub_admin: bool = False,
+):
+    def _check_access(
+        account_id: Annotated[
+            UUID,
+            Path(
+                title="EO DataHub account ID",
+                description=(
+                    "Billing events for all workspaces owned by this account will be "
+                    + "returned. This is a UUID, as found in the 'id' fields at /api/accounts"
+                ),
+                examples=["4b48ebea-bdb8-4bb9-bce9-a7853ad3965d"],
+            ),
+        ],
+        token_payload: dict = Depends(decode_jwt_token),
+    ):
+        billing_accounts = token_payload.get("billing-accounts", [])
+        roles = token_payload["realm_access"].get("roles", [])
+
+        # Allow if user is hub admin
+        if allow_hub_admin and "hub_admin" in roles:
+            return account_id
+
+        if str(account_id) not in billing_accounts:
+            raise HTTPException(status_code=401, detail="Must be account owner")
+
+        return account_id
+
+    return _check_access
+
+
 @app.get(
     "/workspaces/{workspace}/accounting/usage-data",
     response_model=List[BillingEventAPIResult],
@@ -166,14 +254,7 @@ def add_global_data_headers(response: Response):
 def get_workspace_usage_data(
     session: SessionDep,
     response: Response,
-    workspace: Annotated[
-        str,
-        Path(
-            title="EO DataHub workspace name",
-            description="Billing events for this workspace will be returned.",
-            examples=["my-workspace"],
-        ),
-    ],
+    workspace: str = Depends(workspace_authz(allow_hub_admin=True)),
     start: Annotated[
         Optional[datetime],
         Query(
@@ -221,6 +302,7 @@ def get_workspace_usage_data(
     Consumption data may be aggregated so that the time periods used get longer, but they will
     never be aggregated across day boundaries (midnight UTC).
     """
+
     events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
         session, workspace=workspace, start=start, end=end, limit=limit or 100, after=after
     )
@@ -237,17 +319,7 @@ def get_workspace_usage_data(
 def get_account_usage_data(
     session: SessionDep,
     response: Response,
-    account_id: Annotated[
-        UUID,
-        Path(
-            title="EO DataHub account ID",
-            description=(
-                "Billing events for all workspaces owned by this account will be "
-                + "returned. This is a UUID, as found in the 'id' fields at /api/accounts"
-            ),
-            examples=["4b48ebea-bdb8-4bb9-bce9-a7853ad3965d"],
-        ),
-    ],
+    account_id: str = Depends(account_authz(allow_hub_admin=True)),
     start: Annotated[
         Optional[datetime],
         Query(
