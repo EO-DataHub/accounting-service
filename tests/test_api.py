@@ -49,24 +49,24 @@ def test_workspace_usage_data_returns_correct_items_from_db(
 
         mock_token = "your_mock_jwt_token_here"
 
-    response = client.get(
-        "/workspaces/workspace2/accounting/usage-data",
-        headers={"Authorization": f"Bearer {mock_token}"},
-    )
+        response = client.get(
+            "/workspaces/workspace2/accounting/usage-data",
+            headers={"Authorization": f"Bearer {mock_token}"},
+        )
 
-    ############# Behaviour check
-    assert response.status_code == 200
-    assert response.json() == [
-        {
-            "uuid": str(event_uuids[1]),
-            "event_start": "2024-01-16T07:05:00Z",
-            "event_end": "2024-01-16T07:10:00Z",
-            "item": "sku2",
-            "user": str(uid),
-            "workspace": "workspace2",
-            "quantity": 1.23,
-        }
-    ]
+        ############# Behaviour check
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "uuid": str(event_uuids[1]),
+                "event_start": "2024-01-16T07:05:00Z",
+                "event_end": "2024-01-16T07:10:00Z",
+                "item": "sku2",
+                "user": str(uid),
+                "workspace": "workspace2",
+                "quantity": 1.23,
+            }
+        ]
 
 
 def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestClient):
@@ -102,33 +102,33 @@ def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestC
     with patch.object(app.app, "decode_jwt_token", mock_decode_jwt_token):
         mock_token = "your_mock_jwt_token_here"
 
-    response_page1 = client.get(
-        "/workspaces/workspace1/accounting/usage-data?limit=2",
-        headers={"Authorization": f"Bearer {mock_token}"},
-    )
+        response_page1 = client.get(
+            "/workspaces/workspace1/accounting/usage-data?limit=2",
+            headers={"Authorization": f"Bearer {mock_token}"},
+        )
 
-    after = response_page1.json()[1]["uuid"]
-    response_page2 = client.get(
-        f"/workspaces/workspace1/accounting/usage-data?limit=2&after={after}",
-        headers={"Authorization": f"Bearer {mock_token}"},
-    )
+        after = response_page1.json()[1]["uuid"]
+        response_page2 = client.get(
+            f"/workspaces/workspace1/accounting/usage-data?limit=2&after={after}",
+            headers={"Authorization": f"Bearer {mock_token}"},
+        )
 
-    ############# Behaviour check
-    assert response_page1.status_code == 200
-    assert response_page2.status_code == 200
+        ############# Behaviour check
+        assert response_page1.status_code == 200
+        assert response_page2.status_code == 200
 
-    page1 = response_page1.json()
-    page2 = response_page2.json()
-    assert len(page1) == 2
-    assert len(page2) == 1
+        page1 = response_page1.json()
+        page2 = response_page2.json()
+        assert len(page1) == 2
+        assert len(page2) == 1
 
-    # Results should always be in ascending time order.
-    assert datetime.fromisoformat(page1[0]["event_start"]) < datetime.fromisoformat(
-        page1[1]["event_start"]
-    )
-    assert datetime.fromisoformat(page1[1]["event_start"]) < datetime.fromisoformat(
-        page2[0]["event_start"]
-    )
+        # Results should always be in ascending time order.
+        assert datetime.fromisoformat(page1[0]["event_start"]) < datetime.fromisoformat(
+            page1[1]["event_start"]
+        )
+        assert datetime.fromisoformat(page1[1]["event_start"]) < datetime.fromisoformat(
+            page2[0]["event_start"]
+        )
 
 
 def test_account_usage_data_returns_correct_items_from_db(db_session: Session, client: TestClient):
@@ -172,29 +172,29 @@ def test_account_usage_data_returns_correct_items_from_db(db_session: Session, c
             headers={"Authorization": f"Bearer {mock_token}"},
         )
 
-    ############# Behaviour check
-    # We should get data for workspaces 1 and 3 only, in event_start time order.
-    assert response.status_code == 200
-    assert response.json() == [
-        {
-            "uuid": str(event_uuids[0]),
-            "event_start": "2024-01-16T06:10:00Z",
-            "event_end": "2024-01-16T06:15:00Z",
-            "item": "sku1",
-            "user": str(uid),
-            "workspace": "workspace1",
-            "quantity": 1.1,
-        },
-        {
-            "uuid": str(event_uuids[2]),
-            "event_start": "2024-01-16T07:05:00Z",
-            "event_end": "2024-01-16T07:10:00Z",
-            "item": "sku3",
-            "user": str(uid),
-            "workspace": "workspace3",
-            "quantity": 1.1,
-        },
-    ]
+        ############# Behaviour check
+        # We should get data for workspaces 1 and 3 only, in event_start time order.
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "uuid": str(event_uuids[0]),
+                "event_start": "2024-01-16T06:10:00Z",
+                "event_end": "2024-01-16T06:15:00Z",
+                "item": "sku1",
+                "user": str(uid),
+                "workspace": "workspace1",
+                "quantity": 1.1,
+            },
+            {
+                "uuid": str(event_uuids[2]),
+                "event_start": "2024-01-16T07:05:00Z",
+                "event_end": "2024-01-16T07:10:00Z",
+                "item": "sku3",
+                "user": str(uid),
+                "workspace": "workspace3",
+                "quantity": 1.1,
+            },
+        ]
 
 
 def test_skus_list_api_returns_items_correctly(db_session: Session, client: TestClient):
