@@ -46,47 +46,27 @@ def test_workspace_usage_data_returns_correct_items_from_db(
 
     ############# Test
     with patch.object(app.app, "decode_jwt_token", mock_decode_jwt_token):
-        ############# Test
+
         mock_token = "your_mock_jwt_token_here"
 
-        response = client.get(
-            "/workspaces/workspace2/accounting/usage-data",
-            headers={"Authorization": f"Bearer {mock_token}"},
-        )
+    response = client.get(
+        "/workspaces/workspace2/accounting/usage-data",
+        headers={"Authorization": f"Bearer {mock_token}"},
+    )
 
-        ############# Behaviour check
-        assert response.status_code == 200
-        assert response.json() == [
-            {
-                "uuid": str(event_uuids[1]),
-                "event_start": "2024-01-16T07:05:00Z",
-                "event_end": "2024-01-16T07:10:00Z",
-                "item": "sku2",
-                "user": str(uid),
-                "workspace": "workspace2",
-                "quantity": 1.23,
-            }
-        ]
-    # mock_token = "your_mock_jwt_token_here"
-
-    # response = client.get(
-    #     "/workspaces/workspace2/accounting/usage-data",
-    #     headers={"Authorization": f"Bearer {mock_token}"},
-    # )
-
-    # ############# Behaviour check
-    # assert response.status_code == 200
-    # assert response.json() == [
-    #     {
-    #         "uuid": str(event_uuids[1]),
-    #         "event_start": "2024-01-16T07:05:00Z",
-    #         "event_end": "2024-01-16T07:10:00Z",
-    #         "item": "sku2",
-    #         "user": str(uid),
-    #         "workspace": "workspace2",
-    #         "quantity": 1.23,
-    #     }
-    # ]
+    ############# Behaviour check
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "uuid": str(event_uuids[1]),
+            "event_start": "2024-01-16T07:05:00Z",
+            "event_end": "2024-01-16T07:10:00Z",
+            "item": "sku2",
+            "user": str(uid),
+            "workspace": "workspace2",
+            "quantity": 1.23,
+        }
+    ]
 
 
 def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestClient):
@@ -119,11 +99,18 @@ def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestC
     )
 
     ############# Test
-    response_page1 = client.get("/workspaces/workspace1/accounting/usage-data?limit=2")
+    with patch.object(app.app, "decode_jwt_token", mock_decode_jwt_token):
+        mock_token = "your_mock_jwt_token_here"
+
+    response_page1 = client.get(
+        "/workspaces/workspace1/accounting/usage-data?limit=2",
+        headers={"Authorization": f"Bearer {mock_token}"},
+    )
 
     after = response_page1.json()[1]["uuid"]
     response_page2 = client.get(
-        f"/workspaces/workspace1/accounting/usage-data?limit=2&after={after}"
+        f"/workspaces/workspace1/accounting/usage-data?limit=2&after={after}",
+        headers={"Authorization": f"Bearer {mock_token}"},
     )
 
     ############# Behaviour check
@@ -178,7 +165,12 @@ def test_account_usage_data_returns_correct_items_from_db(db_session: Session, c
     )
 
     ############# Test
-    response = client.get(f"/accounts/{account_uuid}/accounting/usage-data")
+    with patch.object(app.app, "decode_jwt_token", mock_decode_jwt_token):
+        mock_token = "your_mock_jwt_token_here"
+        response = client.get(
+            f"/accounts/{account_uuid}/accounting/usage-data",
+            headers={"Authorization": f"Bearer {mock_token}"},
+        )
 
     ############# Behaviour check
     # We should get data for workspaces 1 and 3 only, in event_start time order.
