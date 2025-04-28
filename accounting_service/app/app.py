@@ -371,7 +371,7 @@ def get_account_usage_data(
 
     # Check authorization
     account_id = account_authz(account_id, token_payload, allow_hub_admin=True)
-    
+
     start = datetime_default_to_utc(start)
     end = datetime_default_to_utc(end)
 
