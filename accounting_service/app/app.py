@@ -4,8 +4,9 @@ from datetime import datetime, timezone
 from typing import Annotated, Iterator, List, Optional
 from uuid import UUID
 
+import jwt
 from eodhp_utils.runner import log_component_version, setup_logging
-from fastapi import Depends, FastAPI, HTTPException, Path, Query, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Response
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from pydantic import BaseModel, Field
 from sqlalchemy import Result, Row
@@ -163,6 +164,57 @@ def add_global_data_headers(response: Response):
     response.headers["Cache-Control"] = "private,max-age=300"
 
 
+def decode_jwt_token(authorization: Optional[str] = Header(...)):
+    if authorization is None:
+        raise HTTPException(status_code=400, detail="Authorization header missing")
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=400, detail="Invalid Authorization header format")
+
+    token = authorization[len("Bearer ") :]
+
+    credentials = jwt.decode(token, options={"verify_signature": False}, algorithms=["RS256"])
+    return credentials
+
+
+def workspace_authz(
+    workspace: str, token_payload: dict, require_owner: bool = False, allow_hub_admin: bool = False
+):
+    workspaces = token_payload.get("workspaces", [])
+    owned = token_payload.get("workspaces_owned", [])
+    roles = token_payload["realm_access"].get("roles", [])
+
+    # Allow if user is hub admin
+    if allow_hub_admin and "hub_admin" in roles:
+        return workspace
+
+    # Require owner if specified
+    if require_owner:
+        if workspace not in owned:
+            raise HTTPException(status_code=401, detail="Must be workspace owner")
+    else:
+        # Must be a member of the workspace
+        if workspace not in workspaces:
+            raise HTTPException(status_code=401, detail="Access to this workspace is not allowed")
+
+    return workspace
+
+
+def account_authz(account_id: UUID, token_payload: dict, allow_hub_admin: bool = False):
+    billing_accounts = token_payload.get("billing-accounts", [])
+    roles = token_payload["realm_access"].get("roles", [])
+
+    # Allow if user is hub admin
+    if allow_hub_admin and "hub_admin" in roles:
+        return account_id
+
+    # Require owner if specified
+    if str(account_id) not in billing_accounts:
+        raise HTTPException(status_code=401, detail="Must be account owner")
+
+    return account_id
+
+
 @app.get(
     "/workspaces/{workspace}/accounting/usage-data",
     response_model=List[BillingEventAPIResult],
@@ -179,6 +231,7 @@ def get_workspace_usage_data(
             examples=["my-workspace"],
         ),
     ],
+    authorization: Optional[str] = Header(...),
     start: Annotated[
         Optional[datetime],
         Query(
@@ -226,6 +279,13 @@ def get_workspace_usage_data(
     Consumption data may be aggregated so that the time periods used get longer, but they will
     never be aggregated across day boundaries (midnight UTC).
     """
+
+    # Decode the JWT token
+    token_payload = decode_jwt_token(authorization)
+
+    # Check workspace authorization
+    workspace = workspace_authz(workspace, token_payload, allow_hub_admin=True)
+
     start = datetime_default_to_utc(start)
     end = datetime_default_to_utc(end)
 
@@ -256,6 +316,7 @@ def get_account_usage_data(
             examples=["4b48ebea-bdb8-4bb9-bce9-a7853ad3965d"],
         ),
     ],
+    authorization: Optional[str] = Header(...),
     start: Annotated[
         Optional[datetime],
         Query(
@@ -304,6 +365,13 @@ def get_account_usage_data(
     Consumption data may be aggregated so that the time periods used get longer, but they will
     never be aggregated across day boundaries (midnight UTC).
     """
+
+    # Decode the JWT token
+    token_payload = decode_jwt_token(authorization)
+
+    # Check authorization
+    account_id = account_authz(account_id, token_payload, allow_hub_admin=True)
+
     start = datetime_default_to_utc(start)
     end = datetime_default_to_utc(end)
 
