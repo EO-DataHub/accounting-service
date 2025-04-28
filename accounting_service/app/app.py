@@ -1,11 +1,10 @@
-import base64
-import json
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Annotated, Iterator, List, Optional
 from uuid import UUID
 
+import jwt
 from eodhp_utils.runner import log_component_version, setup_logging
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Response
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -168,9 +167,9 @@ def decode_jwt_token(authorization: Optional[str] = Header(...)):
         raise HTTPException(status_code=400, detail="Invalid Authorization header format")
 
     token = authorization[len("Bearer ") :]
-    header, payload, signature = token.split(".")
-    decoded_payload = base64.urlsafe_b64decode(payload + "==")
-    return json.loads(decoded_payload)
+
+    credentials = jwt.decode(token, options={"verify_signature": False}, algorithms=["RS256"])
+    return credentials
 
 
 def workspace_authz(

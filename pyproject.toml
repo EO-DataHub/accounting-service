@@ -71,6 +71,7 @@ dependencies = [
   "click",
   "opentelemetry-instrumentation-fastapi",
   "eodhp-utils @ git+https://github.com/UKEODHP/eodhp-utils@v0.1.7",
+  "pyjwt"
 ]
 
 # List additional groups of dependencies here (e.g. development
@@ -95,6 +96,7 @@ dev = [
   "pre-commit",
   "faker",
   "httpx",
+  "pyjwt",
 ]
 
 # List URLs that are relevant to your project
