@@ -13,12 +13,17 @@ from sqlalchemy import Result, Row
 from sqlalchemy.orm import Session
 
 from accounting_service.db import get_session
-from accounting_service.models import BillingEvent, BillingItem, BillingItemPrice
+from accounting_service.models import (
+    BillingEvent,
+    BillingItem,
+    BillingItemPrice,
+    datetime_default_to_utc,
+)
 
 logger = logging.getLogger(__name__)
 
 setup_logging(verbosity=1)
-log_component_version("annotations_api")
+log_component_version("accounting-service")
 
 
 root_path = os.environ.get("ROOT_PATH", "/api/")
@@ -281,6 +286,9 @@ def get_workspace_usage_data(
     # Check workspace authorization
     workspace = workspace_authz(workspace, token_payload, allow_hub_admin=True)
 
+    start = datetime_default_to_utc(start)
+    end = datetime_default_to_utc(end)
+
     events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
         session, workspace=workspace, start=start, end=end, limit=limit or 100, after=after
     )
@@ -363,6 +371,9 @@ def get_account_usage_data(
 
     # Check authorization
     account_id = account_authz(account_id, token_payload, allow_hub_admin=True)
+    
+    start = datetime_default_to_utc(start)
+    end = datetime_default_to_utc(end)
 
     events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
         session, account=account_id, start=start, end=end, limit=limit or 100, after=after

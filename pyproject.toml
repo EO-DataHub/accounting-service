@@ -70,8 +70,8 @@ dependencies = [
   "pydantic-settings",
   "click",
   "opentelemetry-instrumentation-fastapi",
-  "eodhp-utils @ git+https://github.com/UKEODHP/eodhp-utils@v0.1.7",
   "pyjwt"
+  "eodhp-utils @ git+https://github.com/UKEODHP/eodhp-utils@v0.1.8",
 ]
 
 # List additional groups of dependencies here (e.g. development

@@ -1,10 +1,13 @@
-from datetime import datetime
+import uuid
+from collections import namedtuple
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Iterator, Optional, Self
+from typing import Iterator, Optional, Self, Sequence
 from uuid import UUID, uuid4
 
 import eodhp_utils.pulsar.messages
 from sqlalchemy import (
+    TIMESTAMP,
     CheckConstraint,
     CursorResult,
     ForeignKey,
@@ -12,9 +15,11 @@ from sqlalchemy import (
     Result,
     Uuid,
     and_,
+    func,
     or_,
     select,
     text,
+    union,
 )
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
@@ -98,6 +103,30 @@ class BillingItem(Base):
         result = session.execute(query).first()
         return result[0] if result else None
 
+    @classmethod
+    def ensure_sku_exists(cls, session: Session, sku: str) -> Optional[Self]:
+        """
+        This creates a stub BillingItem for an SKU if none already exists.
+        """
+        rnd_uuid = uuid.uuid4()
+        session.execute(
+            text(
+                "INSERT INTO billing_item (uuid, sku, name, unit) "
+                + "SELECT :uuid, cast(:sku as text), '', '' "
+                + "WHERE NOT EXISTS ("
+                + "    SELECT 1 FROM billing_item "
+                + "    WHERE sku=:sku)"
+            ),
+            [
+                {
+                    "sku": sku,
+                    "uuid": (
+                        rnd_uuid.hex if db.settings.SQL_DRIVER.startswith("sqlite") else rnd_uuid
+                    ),
+                }
+            ],
+        )
+
 
 class BillingItemPrice(Base):
     """
@@ -127,13 +156,18 @@ class BillingItemPrice(Base):
     item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
     item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
     price: Mapped[Decimal]  # This is in pounds.
-    valid_from: Mapped[datetime]
-    valid_until: Mapped[Optional[datetime]]  # None for current price, a time in the past otherwise.
-    configured_at: Mapped[datetime]  # Set to the current time at the time this row is added.
+    valid_from: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
+    valid_until: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True)
+    )  # None for current price, a time in the past otherwise.
+    configured_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), default=func.now()
+    )  # Set to the current time at the time this row is added.
 
     __table_args__ = (
         Index(
-            "item",
+            "billingitemprice_item_validfrom_index",
+            "item_id",
             "valid_from",
         ),
         CheckConstraint("valid_until IS NULL OR valid_from <= valid_until"),
@@ -159,6 +193,13 @@ class BillingItemPrice(Base):
         return session.execute(query)
 
 
+def datetime_default_to_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt and not dt.tzinfo:
+        return dt.replace(tzinfo=timezone.utc)
+
+    return dt
+
+
 class BillingEvent(Base):
     """
     This records a particular workspace's consumption of a particular BillingItem at a particular
@@ -177,16 +218,30 @@ class BillingEvent(Base):
     __tablename__ = "billing_event"
 
     uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    event_start: Mapped[datetime] = mapped_column(index=True)
-    event_end: Mapped[datetime]
+    event_start: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), index=True)
+    event_end: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
     item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
     item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
     user: Mapped[Optional[UUID]]  # This is None for, for example, workspace storage.
     workspace: Mapped[str]
     quantity: Mapped[float]  # The units involved are defined in the BillingItem
 
+    @property
+    def event_start_utc(self):
+        # In PostgreSQL we always have a sample_time with a timezone attached and it should always
+        # be UTC. In SQLite, used for tests, we get datetimes with no timezone, creating problems
+        # when we do comparisons.
+        #
+        # This harmonizes this.
+        return self.event_start.astimezone(timezone.utc)
+
+    @property
+    def event_end_utc(self):
+        return self.event_end.astimezone(timezone.utc)
+
     __table_args__ = (
         Index(
+            "billingevent_workspace_eventstart_index",
             "workspace",
             "event_start",
         ),
@@ -261,6 +316,26 @@ class BillingEvent(Base):
         return map(lambda r: r[0], session.execute(query))
 
     @classmethod
+    def find_latest_billing_event(
+        cls,
+        session: Session,
+        workspace: Optional[str],
+        sku: Optional[str],
+    ) -> Optional[Self]:
+        """
+        Returns the most recent BillingEvent, optionally constrained by workspace and item.
+        """
+        query = select(cls).order_by(cls.event_end.desc()).limit(1)
+
+        if workspace is not None:
+            query = query.where(cls.workspace == workspace)
+
+        if sku is not None:
+            query = query.join(BillingItem).where(BillingItem.sku == sku)
+
+        return session.execute(query).scalar_one_or_none()
+
+    @classmethod
     def insert_from_message(
         cls, session: Session, msg: eodhp_utils.pulsar.messages.BillingEvent
     ) -> Optional[UUID]:
@@ -273,8 +348,8 @@ class BillingEvent(Base):
             insert(cls)
             .values(
                 uuid=UUID(msg.uuid),
-                event_start=datetime.fromisoformat(msg.event_start),
-                event_end=datetime.fromisoformat(msg.event_end),
+                event_start=datetime_default_to_utc(datetime.fromisoformat(msg.event_start)),
+                event_end=datetime_default_to_utc(datetime.fromisoformat(msg.event_end)),
                 item_id=select(BillingItem.uuid)
                 .where(BillingItem.sku == msg.sku)
                 .scalar_subquery(),
@@ -298,4 +373,233 @@ class BillingEvent(Base):
             + f"{self.user=}, "
             + f"{self.workspace=}, "
             + f"{self.quantity=})"
+        )
+
+
+class BillableResourceConsumptionRateSample(Base):
+    """
+    A consumption rate sample is a point-in-time sample of the rate at which a user is consuming a
+    billed-for resources, typically storage but it could be any other resource where the time it's
+    held for is the basis for the charge.
+
+    For example, if we measure storage use at 8GB then the consumption rate sample would be
+    '8GB-seconds per second'. The billable resource is measured in GB-seconds, and every second 8
+    of them are consumed.
+
+    Samples are used to generate estimated BillingEvents periodically by, effectively, interpolating
+    between samples and integrating.
+    """
+
+    __tablename__ = "billing_resource_consumption_rate_sample"
+
+    uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+
+    # Typically this is the end of the sampling process, although we pretend here that it was
+    # instantaneous.
+    sample_time: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), index=True)
+
+    item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
+    item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
+
+    user: Mapped[Optional[UUID]]  # This is None for, for example, workspace storage.
+    workspace: Mapped[str]
+
+    # The units of this are defined in the BillingItem and divided by seconds.
+    # eg, storage consumption is measured in GB-seconds, so this is in GB.
+    rate: Mapped[float]
+
+    @property
+    def sample_time_utc(self):
+        # In PostgreSQL we always have a sample_time with a timezone attached and it should always
+        # be UTC. In SQLite, used for tests, we get datetimes with no timezone, creating problems
+        # when we do comparisons.
+        #
+        # This harmonizes this.
+        return self.sample_time.astimezone(timezone.utc)
+
+    __table_args__ = (
+        Index(
+            "billableresourceconsumptionratesample_workspace_time_index",
+            "workspace",
+            "sample_time",
+        ),
+    )
+
+    @classmethod
+    def insert_from_message(
+        cls, session: Session, msg: eodhp_utils.pulsar.messages.BillingResourceConsumptionRateSample
+    ) -> Optional[UUID]:
+        result = session.execute(
+            insert(cls)
+            .values(
+                uuid=UUID(msg.uuid),
+                sample_time=datetime_default_to_utc(datetime.fromisoformat(msg.sample_time)),
+                item_id=(
+                    select(BillingItem.uuid).where(BillingItem.sku == msg.sku).scalar_subquery()
+                ),
+                user=UUID(msg.user) if msg.user else None,
+                workspace=msg.workspace,
+                rate=msg.rate,
+            )
+            .on_conflict_do_nothing(index_elements=["uuid"])
+            .returning(cls.uuid)
+        )
+
+        return result.scalar_one_or_none()
+
+    @classmethod
+    def find_data_for_interval(
+        cls, session: Session, workspace: str, sku: str, start: datetime, end: datetime
+    ) -> Sequence[Self]:
+        item_subquery = select(BillingItem.uuid).where(BillingItem.sku == sku).scalar_subquery()
+        last_before_start = (
+            select(cls)
+            .where(cls.item_id == item_subquery)
+            .where(cls.workspace == workspace)
+            .where(cls.sample_time <= start)
+            .order_by(cls.sample_time.desc())
+            .limit(1)
+        )
+        first_after_end = (
+            select(cls)
+            .where(cls.item_id == item_subquery)
+            .where(cls.workspace == workspace)
+            .where(cls.sample_time >= end)
+            .order_by(cls.sample_time)
+            .limit(1)
+        )
+        in_period = (
+            select(cls)
+            .where(cls.item_id == item_subquery)
+            .where(cls.workspace == workspace)
+            .where(cls.sample_time > start)
+            .where(cls.sample_time < end)
+        )
+
+        if db.settings.SQL_DRIVER.startswith("sqlite"):
+            # Only used in tests (but the tests can be run with PostgreSQL as well).
+            # SQLite can't cope with the UNION syntax used by SQLAlchemy.
+            return (
+                list(session.execute(last_before_start).scalars().all())
+                + list(session.execute(in_period).scalars().all())
+                + list(session.execute(first_after_end).scalars().all())
+            )
+
+        query = select(cls).from_statement(
+            union(last_before_start, first_after_end, in_period).order_by("sample_time")
+        )
+        return session.execute(query).scalars().all()
+
+    @classmethod
+    def calculate_consumption_for_interval(
+        cls, session: Session, workspace: str, sku: str, start: datetime, end: datetime
+    ) -> Optional[float]:
+        """
+        This calculates estimated consumption within a time interval, using linear interpolation
+        to estimate consumption rates from samples and then (effectively) integrating.
+
+        It's assumed that the resource did not exist (zero consumption rate) before the first
+        sample and after the last sample. Callers should endeavour not to call this for an interval
+        until sample collection has got as far as at least one sample after the end of the
+        interval. If no sample exists after the end of the interval then, if one is later
+        collected, the answer given by this method will change.
+        """
+        rate_samples = list(cls.find_data_for_interval(session, workspace, sku, start, end))
+
+        if not rate_samples or len(rate_samples) <= 1:
+            # No record of any consumption at all.
+            #
+            # If there is one sample then this is equivalent to no consumption. THis is because
+            # we assume that the resource didn't exist until the first sample and didn't exist
+            # after the last one, so we act as if it existed for zero time.
+            return None
+
+        # We need an estimate of consumption rate at the start and end of the interval.
+        # We use interpolation.
+        def interpolate(at: datetime, s0, s1):
+            assert at >= s0.sample_time_utc
+            assert at <= s1.sample_time_utc
+
+            proportion: float = (at - s0.sample_time_utc) / (
+                s1.sample_time_utc - s0.sample_time_utc
+            )
+
+            return s0.rate + proportion * (s1.rate - s0.rate)
+
+        RateTime = namedtuple("RateTime", ["at", "rate"])
+
+        starting_ratetime = (
+            # If no samples exist before the window then it may not have existed yet.
+            # To avoid awkward questions, we treat consumption as zero up until the first
+            # sample.
+            RateTime(at=rate_samples[0].seconds_after(start), rate=0)
+            if rate_samples[0].sample_time_utc > start
+            else RateTime(at=0, rate=interpolate(start, rate_samples[0], rate_samples[1]))
+        )
+
+        ending_ratetime = (
+            # If there are no samples after the window we assume the resource was destroyed
+            # sometime after the last sample. Again, to avoid awkward questions we assume
+            # this happened exactly at the last sample.
+            RateTime(at=rate_samples[-1].seconds_after(start), rate=0)
+            if rate_samples[-1].sample_time_utc < end
+            else RateTime(
+                at=(end - start).seconds, rate=interpolate(end, rate_samples[-2], rate_samples[-1])
+            )
+        )
+
+        mid_samples = filter(lambda s: s.after(start) and not s.after(end), rate_samples)
+        mid_ratetimes = map(lambda s: RateTime(at=s.seconds_after(start), rate=s.rate), mid_samples)
+
+        # Form a list of RateTimes tuples covering exactly the window, clipped to a shorter period
+        # only if we've assumed the resource was created/destroyed during the window.
+        ratelist: list[RateTime] = [starting_ratetime] + list(mid_ratetimes) + [ending_ratetime]
+
+        # Now imagine a linear interpolation between the points in ratelist being integrated to
+        # produce our answer.
+        total_consumption: float = 0.0
+        for s0, s1 in zip(ratelist, ratelist[1:], strict=False):
+            assert s1.at >= s0.at
+
+            duration = s1.at - s0.at
+            rate = (s0.rate + s1.rate) / 2.0
+            total_consumption += duration * rate
+
+        return total_consumption
+
+    @classmethod
+    def find_earliest(
+        cls,
+        session: Session,
+        workspace: Optional[str],
+        item_id: Optional[UUID],
+    ) -> Optional[Self]:
+        """
+        Returns the first observed sample for the given constraints.
+        """
+        query = select(cls).order_by(cls.sample_time).limit(1)
+
+        if workspace is not None:
+            query = query.where(cls.workspace == workspace)
+
+        if item_id is not None:
+            query = query.where(cls.item_id == item_id)
+
+        return session.execute(query).scalar_one_or_none()
+
+    def seconds_after(self, after: datetime) -> float:
+        return (self.sample_time_utc - after).seconds
+
+    def after(self, t: datetime) -> bool:
+        return self.sample_time_utc > t
+
+    def __repr__(self):
+        return (
+            "BillableResourceConsumptionRateSample("
+            + f"{self.uuid=}, "
+            + f"{self.sample_time=}, "
+            + f"{self.item_id=}, "
+            + f"{self.user=}, "
+            + f"{self.workspace=}, "
+            + f"{self.rate=})"
         )

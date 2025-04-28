@@ -34,8 +34,9 @@ def test_message_results_in_billingevent_in_db(db_session: Session):
 
     beobj = db_session.get(models.BillingEvent, UUID(bemsg.uuid))
     assert str(beobj.uuid) == bemsg.uuid
-    assert beobj.event_start == start
-    assert beobj.event_end == end
+
+    assert beobj.event_start_utc == start
+    assert beobj.event_end_utc == end
     assert str(beobj.user) == bemsg.user
     assert beobj.workspace == bemsg.workspace
     assert beobj.quantity == bemsg.quantity

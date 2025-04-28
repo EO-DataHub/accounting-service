@@ -4,6 +4,7 @@ from eodhp_utils.runner import log_component_version, run, setup_logging
 from accounting_service import db
 from accounting_service.ingester.messager import (
     AccountingIngesterMessager,
+    ConsumptionSampleRateIngesterMessager,
     WorkspaceSettingsIngesterMessager,
 )
 
@@ -14,7 +15,7 @@ from accounting_service.ingester.messager import (
 @click.option("--pulsar-url")
 def cli(takeover: bool, verbose: int, pulsar_url=None):
     setup_logging(verbosity=verbose)
-    log_component_version("annotations_ingester")
+    log_component_version("accounting-service")
 
     db.create_db_and_tables()
 
@@ -22,6 +23,7 @@ def cli(takeover: bool, verbose: int, pulsar_url=None):
         {
             "billing-events": AccountingIngesterMessager(),
             "workspace-settings": WorkspaceSettingsIngesterMessager(),
+            "billing-events-consumption-rate-samples": ConsumptionSampleRateIngesterMessager(),
         },
         "accounting-ingester",
         takeover_mode=takeover,
