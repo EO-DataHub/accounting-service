@@ -1,5 +1,6 @@
-from typing import Optional
+from typing import Optional, TextIO
 
+import yaml
 from pydantic_settings import BaseSettings
 from sqlalchemy import URL, create_engine
 from sqlalchemy.orm import Session
@@ -56,3 +57,29 @@ def drop_tables():
 def get_session():
     with Session(engine) as session:
         yield session
+
+
+def insert_configuration(config: TextIO):
+    """
+    This updates the database of prices and items based on the configuration given.
+
+    Example config (YAML format):
+    items:
+      - sku: "my-sku"
+        name: "my product"
+        unit: "GB-s"
+    prices:
+      - sku: "my-sku"
+        valid_from: "2025-01-01T00:00:00Z"
+        price: 12.34
+    """
+    config_obj = yaml.safe_load(config)
+
+    with Session(engine) as session:
+        for item in config_obj.get("items", []):
+            models.BillingItem.upsert_configured_item(session, item)
+
+        for price in config_obj.get("prices", []):
+            models.BillingItemPrice.upsert_configured_price(session, price)
+
+        session.commit()
