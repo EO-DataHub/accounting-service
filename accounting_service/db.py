@@ -1,9 +1,11 @@
+import logging
 from typing import Optional, TextIO
 
 import yaml
 from pydantic_settings import BaseSettings
 from sqlalchemy import URL, create_engine
 from sqlalchemy.orm import Session
+from yaml.error import YAMLError
 
 from accounting_service import models
 
@@ -73,7 +75,13 @@ def insert_configuration(config: TextIO):
         valid_from: "2025-01-01T00:00:00Z"
         price: 12.34
     """
-    config_obj = yaml.safe_load(config)
+    try:
+        config_obj = yaml.safe_load(config)
+        if not isinstance(config_obj, dict):
+            raise YAMLError("Expected a YAML dictionary in config file - check the format")
+    except YAMLError:
+        logging.fatal("accounting-service configuration file is not valid - check the format")
+        raise
 
     with Session(engine) as session:
         for item in config_obj.get("items", []):
