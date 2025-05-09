@@ -1,3 +1,4 @@
+import logging
 import uuid
 from collections import namedtuple
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ from sqlalchemy import (
     select,
     text,
     union,
+    update,
 )
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
@@ -127,6 +129,23 @@ class BillingItem(Base):
             ],
         )
 
+    @classmethod
+    def upsert_configured_item(cls, session: Session, item: dict):
+        """
+        This aimed at inserting or updating BillingItems based on a database-independent source
+        such as a YAML configuration file. 'item' should have fields 'sku', 'name' and 'unit'.
+        An item will be inserted if the SKU isn't known, otherwise name and unit will be updated.
+        """
+        item_obj = cls.find_billing_item(session, item["sku"])
+        if item_obj:
+            if "name" in item:
+                item_obj.name = item["name"]
+            if "unit" in item:
+                item_obj.unit = item["unit"]
+        else:
+            item_obj = BillingItem(**item)
+            session.add(item_obj)
+
 
 class BillingItemPrice(Base):
     """
@@ -191,6 +210,57 @@ class BillingItemPrice(Base):
         )
 
         return session.execute(query)
+
+    @classmethod
+    def upsert_configured_price(cls, session: Session, price: dict):
+        """
+        This aimed at inserting or updating prices based on a database-independent source
+        such as a YAML configuration file. 'price' must contain 'sku', 'price' and 'valid_from'.
+
+        'valid_from' must either be newer than the current price, in which case the new price
+        will replace it at that time, or must exactly match an existing configured price, in
+        which case its price will be updated.
+        """
+        item_obj = BillingItem.find_billing_item(session, price["sku"])
+        if not item_obj:
+            logging.error("Failed to find item %s when configuring price", price["sku"])
+            raise ValueError(f"Attempt to add price for unknown SKU {price["sku"]}")
+
+        valid_from = datetime.fromisoformat(price["valid_from"]).astimezone(timezone.utc)
+
+        existing_prices_updated = session.execute(
+            update(cls)
+            .where(cls.item == item_obj)
+            .where(cls.valid_from == valid_from)
+            .values(price=price["price"])
+        )
+
+        if existing_prices_updated.rowcount > 0:
+            return
+
+        latest_price = (
+            session.execute(
+                select(cls).where(cls.item == item_obj).order_by(cls.valid_from.desc()).limit(1)
+            )
+            .scalars()
+            .one_or_none()
+        )
+
+        if latest_price:
+            if latest_price.valid_from.astimezone(timezone.utc) > valid_from:
+                raise ValueError(
+                    f"Attempt to add price {price["sku"]} where valid_from is earlier "
+                    + f"than the latest existing price, {latest_price.valid_from}."
+                )
+
+            latest_price.valid_until = valid_from
+
+        price_obj = cls(
+            item=item_obj,
+            valid_from=valid_from,
+            price=price["price"],
+        )
+        session.add(price_obj)
 
 
 def datetime_default_to_utc(dt: Optional[datetime]) -> Optional[datetime]:

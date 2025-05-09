@@ -18,8 +18,8 @@ dynamic = ["version"]
 description = "A service which receives, records and serves accounting and price information in EODH"
 readme = "README.md"
 
-# Our target version is Python 3.11, but it may work with earlier versions.
-requires-python = ">=3.11"
+# Our target version is Python 3.13, but it may work with 3.12.
+requires-python = ">=3.12"
 
 license = {file = "LICENSE"}
 
@@ -51,7 +51,7 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
 
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3 :: Only",
 ]
 
