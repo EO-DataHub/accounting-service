@@ -21,6 +21,7 @@ from sqlalchemy import (
     select,
     text,
     union,
+    update,
 )
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
@@ -227,20 +228,14 @@ class BillingItemPrice(Base):
 
         valid_from = datetime.fromisoformat(price["valid_from"]).astimezone(timezone.utc)
 
-        existing_price = (
-            session.execute(
-                select(cls)
-                .where(cls.item == item_obj)
-                .where(cls.valid_from == valid_from)
-                .order_by(cls.price == price["price"])
-                .limit(1)
-            )
-            .scalars()
-            .one_or_none()
+        existing_prices_updated = session.execute(
+            update(cls)
+            .where(cls.item == item_obj)
+            .where(cls.valid_from == valid_from)
+            .values(price=price["price"])
         )
 
-        if existing_price:
-            existing_price.price = price["price"]
+        if existing_prices_updated.rowcount > 0:
             return
 
         latest_price = (
@@ -252,7 +247,6 @@ class BillingItemPrice(Base):
         )
 
         if latest_price:
-            print(f"{latest_price=}")
             if latest_price.valid_from.astimezone(timezone.utc) > valid_from:
                 raise ValueError(
                     f"Attempt to add price {price["sku"]} where valid_from is earlier "
