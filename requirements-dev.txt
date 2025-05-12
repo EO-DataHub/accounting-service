@@ -19,16 +19,16 @@ attrs==25.3.0
     #   referencing
 black==25.1.0
     # via accounting-service (pyproject.toml)
-boto3==1.38.2
+boto3==1.38.10
     # via eodhp-utils
-botocore==1.38.2
+botocore==1.38.10
     # via
     #   boto3
     #   eodhp-utils
     #   s3transfer
 build==1.2.2.post1
     # via pip-tools
-certifi==2025.1.31
+certifi==2025.4.26
     # via
     #   httpcore
     #   httpx
@@ -172,9 +172,9 @@ pluggy==1.5.0
     # via pytest
 pre-commit==4.2.0
     # via accounting-service (pyproject.toml)
-psycopg[binary,pool]==3.2.6
+psycopg[binary,pool]==3.2.7
     # via accounting-service (pyproject.toml)
-psycopg-binary==3.2.6
+psycopg-binary==3.2.7
     # via psycopg
 psycopg-pool==3.2.6
     # via psycopg
@@ -182,12 +182,12 @@ pulsar-client==3.6.1
     # via
     #   accounting-service (pyproject.toml)
     #   eodhp-utils
-pydantic==2.11.3
+pydantic==2.11.4
     # via
     #   accounting-service (pyproject.toml)
     #   fastapi
     #   pydantic-settings
-pydantic-core==2.33.1
+pydantic-core==2.33.2
     # via pydantic
 pydantic-settings==2.9.1
     # via accounting-service (pyproject.toml)
@@ -232,13 +232,13 @@ rich==14.0.0
     # via
     #   rich-toolkit
     #   typer
-rich-toolkit==0.14.3
+rich-toolkit==0.14.5
     # via fastapi-cli
 rpds-py==0.24.0
     # via
     #   jsonschema
     #   referencing
-ruff==0.11.7
+ruff==0.11.8
     # via accounting-service (pyproject.toml)
 s3transfer==0.12.0
     # via boto3
@@ -252,9 +252,9 @@ sqlalchemy==2.0.40
     # via accounting-service (pyproject.toml)
 starlette==0.46.2
     # via fastapi
-trove-classifiers==2025.4.11.15
+trove-classifiers==2025.5.1.12
     # via validate-pyproject
-typer==0.15.2
+typer==0.15.3
     # via fastapi-cli
 typing-extensions==4.13.2
     # via
@@ -283,7 +283,7 @@ uvloop==0.21.0
     # via uvicorn
 validate-pyproject[all]==0.24.1
     # via accounting-service (pyproject.toml)
-virtualenv==20.30.0
+virtualenv==20.31.1
     # via pre-commit
 watchdog==6.0.0
     # via pytest-watcher
