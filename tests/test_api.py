@@ -62,7 +62,6 @@ def test_workspace_usage_data_returns_correct_items_from_db(
                 "event_start": "2024-01-16T07:05:00Z",
                 "event_end": "2024-01-16T07:10:00Z",
                 "item": "sku2",
-                "user": str(uid),
                 "workspace": "workspace2",
                 "quantity": 1.23,
             }
@@ -181,7 +180,6 @@ def test_account_usage_data_returns_correct_items_from_db(db_session: Session, c
                 "event_start": "2024-01-16T06:10:00Z",
                 "event_end": "2024-01-16T06:15:00Z",
                 "item": "sku1",
-                "user": str(uid),
                 "workspace": "workspace1",
                 "quantity": 1.1,
             },
@@ -190,7 +188,6 @@ def test_account_usage_data_returns_correct_items_from_db(db_session: Session, c
                 "event_start": "2024-01-16T07:05:00Z",
                 "event_end": "2024-01-16T07:10:00Z",
                 "item": "sku3",
-                "user": str(uid),
                 "workspace": "workspace3",
                 "quantity": 1.1,
             },
