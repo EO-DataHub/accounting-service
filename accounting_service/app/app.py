@@ -73,15 +73,6 @@ class BillingEventAPIResult(BaseModel):
             examples=["0.42"],
         ),
     ]
-    user: Annotated[
-        UUID | None,
-        Field(
-            description=(
-                "User who triggered consumption. May be unset where there is no single user,"
-                + " such as for storage."
-            )
-        ),
-    ]
 
 
 def billingevent_to_api_object(event: BillingEvent):
@@ -92,7 +83,6 @@ def billingevent_to_api_object(event: BillingEvent):
         "item": event.item.sku,
         "workspace": event.workspace,
         "quantity": event.quantity,
-        "user": event.user,
     }
 
 
