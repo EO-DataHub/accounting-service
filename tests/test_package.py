@@ -1,5 +1,5 @@
 import io
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from faker import Faker
@@ -49,7 +49,7 @@ prices:
 
     price = prices[0]
     assert price.price == Decimal("12.34")
-    assert price.valid_from == datetime(2025, 1, 1, 0, 0, 0)
+    assert price.valid_from_utc == datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
     assert price.valid_until is None
     assert price.item_id == bi.uuid
 
@@ -102,12 +102,12 @@ prices:
 
     price = prices[0]
     assert price.price == Decimal("12.35")
-    assert price.valid_from == datetime(2025, 1, 1, 0, 0, 0)
-    assert price.valid_until == datetime(2025, 1, 2, 0, 0, 0)
+    assert price.valid_from_utc == datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    assert price.valid_until_utc == datetime(2025, 1, 2, 0, 0, 0, tzinfo=timezone.utc)
     assert price.item_id == bi.uuid
 
     price = prices[1]
     assert price.price == Decimal("11.0")
-    assert price.valid_from == datetime(2025, 1, 2, 0, 0, 0)
+    assert price.valid_from_utc == datetime(2025, 1, 2, 0, 0, 0, tzinfo=timezone.utc)
     assert price.valid_until is None
     assert price.item_id == bi.uuid

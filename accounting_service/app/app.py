@@ -260,6 +260,17 @@ def get_workspace_usage_data(
             examples=["456e15d1-d01b-4060-8b7b-85b93ecbf050"],
         ),
     ] = None,
+    time_aggregation: Annotated[
+        Optional[str],
+        Query(
+            title="Time aggregation of results",
+            description=(
+                "Optionally ggregate usage information into totals for the given time periods - "
+                + "'day' or 'month'"
+            ),
+            examples=["day", "month"],
+        ),
+    ] = None,
 ):
     """
     This returns resource consumption data for a workspace within some given time range (or all).
@@ -280,7 +291,13 @@ def get_workspace_usage_data(
     end = datetime_default_to_utc(end)
 
     events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
-        session, workspace=workspace, start=start, end=end, limit=limit or 100, after=after
+        session,
+        workspace=workspace,
+        start=start,
+        end=end,
+        limit=limit or 100,
+        after=after,
+        time_aggregation=time_aggregation,
     )
 
     add_usage_data_headers(response)

@@ -183,6 +183,14 @@ class BillingItemPrice(Base):
         TIMESTAMP(timezone=True), default=func.now()
     )  # Set to the current time at the time this row is added.
 
+    @property
+    def valid_from_utc(self):
+        return self.valid_from.astimezone(timezone.utc)
+
+    @property
+    def valid_until_utc(self):
+        return self.valid_until and self.valid_until.astimezone(timezone.utc)
+
     __table_args__ = (
         Index(
             "billingitemprice_item_validfrom_index",
@@ -328,19 +336,24 @@ class BillingEvent(Base):
         end: Optional[datetime] = None,
         after: Optional[UUID] = None,
         limit: int = 5_000,
+        time_aggregation: Optional[str] = None,
     ) -> Iterator[Self]:
         """
         Find and return BillingEvents matching some criteria.
 
         For paging, `after` should be the UUID of the last billing event on the previous page.
+
+        time_aggregation may be 'day' or 'month' to provide daily or monthly totals for each
+        SKU+workspace pair.
         """
-        query = select(cls).limit(limit)
+        query = select(cls, BillingItem.sku).join(BillingItem)
 
         # We need a complete and certain order so that the 'after' parameter works.
         query = query.order_by(
             cls.event_start,
             cls.event_end,
             cls.workspace,
+            BillingItem.sku,
             cls.uuid,
         )
 
@@ -383,7 +396,61 @@ class BillingEvent(Base):
                     )
                 )
 
-        return map(lambda r: r[0], session.execute(query))
+        if time_aggregation in {"day", "month"}:
+            if db.settings.SQL_DRIVER.startswith("sqlite"):
+                subq = text(
+                    f"""
+SELECT uuid, event_start, event_end, item_id, null as user, workspace, SUM(quantity)
+FROM (
+    SELECT last_value(uuid) OVER W AS uuid,
+           datetime(event_start, 'start of {time_aggregation}') || '.000000' AS event_start,
+           datetime(event_start, 'start of {time_aggregation}', '+1 {time_aggregation}') AS event_end,
+           item_id,
+           sku,
+           workspace,
+           quantity
+    FROM selected_bes
+    WINDOW w AS (PARTITION BY datetime(event_start, 'start of {time_aggregation}'), item_id, workspace)
+) AS window_be
+GROUP BY uuid, event_start, event_end, item_id, sku, workspace
+ORDER BY event_start, workspace, sku, uuid
+LIMIT :limit"""
+                )
+            else:
+                subq = text(
+                    f"""
+SELECT uuid, event_start, event_end, item_id, null as user, workspace, SUM(quantity)
+FROM (
+    SELECT last_value(uuid) OVER W AS uuid,
+           date_trunc('{time_aggregation}', event_start) AS event_start,
+           date_trunc('{time_aggregation}', event_start) + '1 {time_aggregation}'::interval AS event_end,
+           item_id,
+           sku,
+           workspace,
+           quantity
+    FROM selected_bes
+    WINDOW w AS (PARTITION BY date_trunc('{time_aggregation}', event_start), item_id, workspace)
+) AS window_be
+GROUP BY uuid, event_start, event_end, item_id, sku, workspace
+ORDER BY event_start, workspace, sku, uuid
+LIMIT :limit"""
+                )
+
+            subq = subq.columns(
+                BillingEvent.uuid,
+                BillingEvent.event_start,
+                BillingEvent.event_end,
+                BillingEvent.item_id,
+                BillingEvent.user,
+                BillingEvent.workspace,
+                BillingEvent.quantity,
+            )
+
+            query = select(BillingEvent).from_statement(subq.add_cte(query.cte("selected_bes")))
+
+            return map(lambda r: r[0], session.execute(query, {"limit": limit}))
+        else:
+            return map(lambda r: r[0], session.execute(query.limit(limit)))
 
     @classmethod
     def find_latest_billing_event(
