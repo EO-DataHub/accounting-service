@@ -260,7 +260,7 @@ def test_workspace_usage_data_correctly_time_aggregated(
 
         response_pages.append(
             client.get(
-                f"/workspaces/workspace1/accounting/usage-data?limit={page_size}&time_aggregation={aggregation}",
+                f"/workspaces/workspace1/accounting/usage-data?limit={page_size}&time-aggregation={aggregation}",
                 headers={"Authorization": f"Bearer {mock_token}"},
             )
         )
@@ -268,7 +268,7 @@ def test_workspace_usage_data_correctly_time_aggregated(
         after = response_pages[0].json()[-1]["uuid"]
         response_pages.append(
             client.get(
-                f"/workspaces/workspace1/accounting/usage-data?limit={page_size}&after={after}&time_aggregation={aggregation}",
+                f"/workspaces/workspace1/accounting/usage-data?limit={page_size}&after={after}&time-aggregation={aggregation}",
                 headers={"Authorization": f"Bearer {mock_token}"},
             )
         )

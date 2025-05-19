@@ -263,6 +263,7 @@ def get_workspace_usage_data(
     time_aggregation: Annotated[
         Optional[str],
         Query(
+            alias="time-aggregation",
             title="Time aggregation of results",
             description=(
                 "Optionally ggregate usage information into totals for the given time periods - "
@@ -365,6 +366,7 @@ def get_account_usage_data(
     time_aggregation: Annotated[
         Optional[str],
         Query(
+            alias="time-aggregation",
             title="Time aggregation of results",
             description=(
                 "Optionally ggregate usage information into totals for the given time periods - "
