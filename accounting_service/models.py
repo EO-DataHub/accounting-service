@@ -431,8 +431,8 @@ GROUP BY uuid, event_start, event_end, item_id, workspace
             #   after_be = session.get(cls, after)
             # but it works when billingevent_src is an alias rather than an ORM class.
             after_be = session.execute(
-                select(billingevent_src).where(billingevent_src.uuid == after)
-            ).scalar_one()
+                select(billingevent_src).where(billingevent_src.uuid == str(after))
+            ).scalar_one_or_none()
 
             if after_be is not None:
                 query = query.where(
