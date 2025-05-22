@@ -361,13 +361,16 @@ class BillingEvent(Base):
                 period_end_expr = (
                     f"datetime(event_start, 'start of {time_aggregation}', '+1 {time_aggregation}')"
                 )
+                uuid_expr = "uuid"
             else:
                 period_start_expr = f"date_trunc('{time_aggregation}', event_start)"
                 period_end_expr = f"{period_start_expr} + '1 {time_aggregation}'::interval"
+                uuid_expr = "uuid::UUID"
 
             select_aggregated_events = text(
                 f"""
-SELECT uuid, event_start, event_end, item_id, NULL AS user, workspace, SUM(quantity) AS quantity
+SELECT {uuid_expr} as uuid, event_start, event_end, item_id, NULL AS user, workspace,
+       SUM(quantity) AS quantity
 FROM (
     SELECT last_value(uuid) OVER W AS uuid,
            {period_start_expr} AS event_start,
@@ -431,7 +434,7 @@ GROUP BY uuid, event_start, event_end, item_id, workspace
             #   after_be = session.get(cls, after)
             # but it works when billingevent_src is an alias rather than an ORM class.
             after_be = session.execute(
-                select(billingevent_src).where(billingevent_src.uuid == str(after))
+                select(billingevent_src).where(billingevent_src.uuid == after)
             ).scalar_one_or_none()
 
             if after_be is not None:
