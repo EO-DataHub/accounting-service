@@ -361,28 +361,21 @@ class BillingEvent(Base):
                 period_end_expr = (
                     f"datetime(event_start, 'start of {time_aggregation}', '+1 {time_aggregation}')"
                 )
-                uuid_expr = "uuid"
             else:
                 period_start_expr = f"date_trunc('{time_aggregation}', event_start)"
                 period_end_expr = f"{period_start_expr} + '1 {time_aggregation}'::interval"
-                uuid_expr = "uuid::UUID"
 
             select_aggregated_events = text(
                 f"""
-SELECT {uuid_expr} as uuid, event_start, event_end, item_id, NULL AS user, workspace,
+SELECT CAST(MAX(CAST(uuid AS TEXT)) AS UUID) as uuid,
+       {period_start_expr} AS event_start,
+       {period_end_expr} AS event_end,
+       item_id,
+       NULL AS user,
+       workspace,
        SUM(quantity) AS quantity
-FROM (
-    SELECT last_value(uuid) OVER W AS uuid,
-           {period_start_expr} AS event_start,
-           {period_end_expr} AS event_end,
-           item_id,
-           workspace,
-           quantity
-    FROM {cls.__tablename__}
-    WINDOW w AS (PARTITION BY {period_start_expr}, item_id, workspace)
-    ORDER BY 2, 3, 5, 4
-) AS window_be
-GROUP BY uuid, event_start, event_end, item_id, workspace
+FROM {cls.__tablename__}
+GROUP BY 2, 3, 4, 6
 """
             )
 
