@@ -361,13 +361,15 @@ class BillingEvent(Base):
                 period_end_expr = (
                     f"datetime(event_start, 'start of {time_aggregation}', '+1 {time_aggregation}')"
                 )
+                uuid_expr = "MAX(CAST(uuid AS TEXT))"
             else:
                 period_start_expr = f"date_trunc('{time_aggregation}', event_start)"
                 period_end_expr = f"{period_start_expr} + '1 {time_aggregation}'::interval"
+                uuid_expr = "CAST(MAX(CAST(uuid AS TEXT)) AS UUID)"
 
             select_aggregated_events = text(
                 f"""
-SELECT CAST(MAX(CAST(uuid AS TEXT)) AS UUID) as uuid,
+SELECT {uuid_expr} as uuid,
        {period_start_expr} AS event_start,
        {period_end_expr} AS event_end,
        item_id,
