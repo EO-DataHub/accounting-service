@@ -177,6 +177,20 @@ def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestC
             ],
         ),
         pytest.param(
+            "day",
+            2,
+            [
+                [
+                    {"event_start": "2025-01-01T00:00:00Z", "item": "sku1", "quantity": 1.11},
+                    {"event_start": "2025-01-01T00:00:00Z", "item": "sku2", "quantity": 0.2},
+                ],
+                [
+                    {"event_start": "2025-01-02T00:00:00Z", "item": "sku1", "quantity": 0.2},
+                    {"event_start": "2025-02-02T00:00:00Z", "item": "sku1", "quantity": 0.4},
+                ],
+            ],
+        ),
+        pytest.param(
             "month",
             100,
             [
@@ -284,7 +298,7 @@ def test_workspace_usage_data_correctly_time_aggregated(
 
             assert len(response_json) == len(expected_json)
             for i in range(len(response_json)):
-                print(f"{response_json=}, {expected_json=}")
+                print(f"{response_json[i]=}, {expected_json[i]=}")
                 assert response_json[i]["item"] == expected_json[i]["item"]
                 assert response_json[i]["quantity"] == expected_json[i]["quantity"]
                 assert response_json[i]["event_start"] == expected_json[i]["event_start"]

@@ -24,7 +24,14 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    aliased,
+    mapped_column,
+    relationship,
+)
 
 from accounting_service import db
 
@@ -346,111 +353,117 @@ class BillingEvent(Base):
         time_aggregation may be 'day' or 'month' to provide daily or monthly totals for each
         SKU+workspace pair.
         """
-        query = select(cls, BillingItem.sku).join(BillingItem)
+        if time_aggregation in {"day", "month"}:
+            if db.settings.SQL_DRIVER.startswith("sqlite"):
+                period_start_expr = (
+                    f"datetime(event_start, 'start of {time_aggregation}') || '.000000'"
+                )
+                period_end_expr = (
+                    f"datetime(event_start, 'start of {time_aggregation}', '+1 {time_aggregation}')"
+                )
+            else:
+                period_start_expr = f"date_trunc('{time_aggregation}', event_start)"
+                period_end_expr = f"{period_start_expr} + '1 {time_aggregation}'::interval"
 
-        # We need a complete and certain order so that the 'after' parameter works.
-        query = query.order_by(
-            cls.event_start,
-            cls.event_end,
-            cls.workspace,
-            BillingItem.sku,
-            cls.uuid,
-        )
-
-        if workspace is not None:
-            query = query.where(cls.workspace == workspace)
-
-        if account is not None:
-            query = query.join(WorkspaceAccount, WorkspaceAccount.workspace == cls.workspace).where(
-                WorkspaceAccount.account == account
+            select_aggregated_events = text(
+                f"""
+SELECT uuid, event_start, event_end, item_id, NULL AS user, workspace, SUM(quantity) AS quantity
+FROM (
+    SELECT last_value(uuid) OVER W AS uuid,
+           {period_start_expr} AS event_start,
+           {period_end_expr} AS event_end,
+           item_id,
+           workspace,
+           quantity
+    FROM {cls.__tablename__}
+    WINDOW w AS (PARTITION BY {period_start_expr}, item_id, workspace)
+    ORDER BY 2, 3, 5, 4
+) AS window_be
+GROUP BY uuid, event_start, event_end, item_id, workspace
+"""
             )
 
+            select_aggregated_events = select_aggregated_events.columns(
+                cls.uuid,
+                cls.event_start,
+                cls.event_end,
+                cls.item_id,
+                cls.user,
+                cls.workspace,
+                cls.quantity,
+            )
+
+            billingevent_src = aliased(BillingEvent, select_aggregated_events.subquery())
+        else:
+            billingevent_src = cls
+
+        all_billing_events = select(billingevent_src).join(
+            BillingItem, BillingItem.uuid == billingevent_src.item_id
+        )
+
+        # We need a complete and certain order so that the 'after' parameter works.
+        query = all_billing_events.order_by(
+            billingevent_src.event_start,
+            billingevent_src.event_end,
+            billingevent_src.workspace,
+            BillingItem.sku,
+            billingevent_src.uuid,
+        )
+
+        query = query.limit(limit)
+
+        if workspace is not None:
+            query = query.where(billingevent_src.workspace == workspace)
+
+        if account is not None:
+            query = query.join(
+                WorkspaceAccount, WorkspaceAccount.workspace == billingevent_src.workspace
+            ).where(WorkspaceAccount.account == account)
+
         if start is not None:
-            query = query.where(cls.event_start >= start)
+            query = query.where(billingevent_src.event_start >= start)
 
         if end is not None:
-            query = query.where(cls.event_end < end)
+            query = query.where(billingevent_src.event_end < end)
 
         if after is not None:
-            after_be = session.get(cls, after)
+            # This is equivalent to
+            #   after_be = session.get(cls, after)
+            # but it works when billingevent_src is an alias rather than an ORM class.
+            after_be = session.execute(
+                select(billingevent_src).where(billingevent_src.uuid == after)
+            ).scalar_one()
 
             if after_be is not None:
                 query = query.where(
                     or_(
-                        (cls.event_start > after_be.event_start),
+                        (billingevent_src.event_start > after_be.event_start),
                         and_(
-                            cls.event_start == after_be.event_start,
-                            cls.event_end > after_be.event_end,
+                            billingevent_src.event_start == after_be.event_start,
+                            billingevent_src.event_end > after_be.event_end,
                         ),
                         and_(
-                            cls.event_start == after_be.event_start,
-                            cls.event_end == after_be.event_end,
-                            cls.workspace > after_be.workspace,
+                            billingevent_src.event_start == after_be.event_start,
+                            billingevent_src.event_end == after_be.event_end,
+                            billingevent_src.workspace > after_be.workspace,
                         ),
                         and_(
-                            cls.event_start == after_be.event_start,
-                            cls.event_end == after_be.event_end,
-                            cls.workspace == after_be.workspace,
-                            cls.uuid > after,
+                            billingevent_src.event_start == after_be.event_start,
+                            billingevent_src.event_end == after_be.event_end,
+                            billingevent_src.workspace == after_be.workspace,
+                            BillingItem.sku > after_be.item.sku,
+                        ),
+                        and_(
+                            billingevent_src.event_start == after_be.event_start,
+                            billingevent_src.event_end == after_be.event_end,
+                            billingevent_src.workspace == after_be.workspace,
+                            BillingItem.sku == after_be.item.sku,
+                            billingevent_src.uuid > after,
                         ),
                     )
                 )
 
-        if time_aggregation in {"day", "month"}:
-            if db.settings.SQL_DRIVER.startswith("sqlite"):
-                subq = text(
-                    f"""
-SELECT uuid, event_start, event_end, item_id, null as user, workspace, SUM(quantity)
-FROM (
-    SELECT last_value(uuid) OVER W AS uuid,
-           datetime(event_start, 'start of {time_aggregation}') || '.000000' AS event_start,
-           datetime(event_start, 'start of {time_aggregation}', '+1 {time_aggregation}') AS event_end,
-           item_id,
-           sku,
-           workspace,
-           quantity
-    FROM selected_bes
-    WINDOW w AS (PARTITION BY datetime(event_start, 'start of {time_aggregation}'), item_id, workspace)
-) AS window_be
-GROUP BY uuid, event_start, event_end, item_id, sku, workspace
-ORDER BY event_start, workspace, sku, uuid
-LIMIT :limit"""
-                )
-            else:
-                subq = text(
-                    f"""
-SELECT uuid, event_start, event_end, item_id, null as user, workspace, SUM(quantity)
-FROM (
-    SELECT last_value(uuid) OVER W AS uuid,
-           date_trunc('{time_aggregation}', event_start) AS event_start,
-           date_trunc('{time_aggregation}', event_start) + '1 {time_aggregation}'::interval AS event_end,
-           item_id,
-           sku,
-           workspace,
-           quantity
-    FROM selected_bes
-    WINDOW w AS (PARTITION BY date_trunc('{time_aggregation}', event_start), item_id, workspace)
-) AS window_be
-GROUP BY uuid, event_start, event_end, item_id, sku, workspace
-ORDER BY event_start, workspace, sku, uuid
-LIMIT :limit"""
-                )
-
-            subq = subq.columns(
-                BillingEvent.uuid,
-                BillingEvent.event_start,
-                BillingEvent.event_end,
-                BillingEvent.item_id,
-                BillingEvent.user,
-                BillingEvent.workspace,
-                BillingEvent.quantity,
-            )
-
-            query = select(BillingEvent).from_statement(subq.add_cte(query.cte("selected_bes")))
-
-            return map(lambda r: r[0], session.execute(query, {"limit": limit}))
-        else:
-            return map(lambda r: r[0], session.execute(query.limit(limit)))
+        return map(lambda r: r[0], session.execute(query))
 
     @classmethod
     def find_latest_billing_event(
