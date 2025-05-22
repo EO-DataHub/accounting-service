@@ -433,12 +433,13 @@ GROUP BY uuid, event_start, event_end, item_id, workspace
             # This is equivalent to
             #   after_be = session.get(cls, after)
             # but it works when billingevent_src is an alias rather than an ORM class.
+            logging.info(f"{select(billingevent_src).where(billingevent_src.uuid == after)=}")
+            logging.info(f"{after=}")
+
             after_be = session.execute(
                 select(billingevent_src).where(billingevent_src.uuid == after)
             ).scalar_one_or_none()
 
-            logging.info(f"{select(billingevent_src).where(billingevent_src.uuid == after)=}")
-            logging.info(f"{after=}")
             if after_be is None:
                 raise ValueError(f"{after} not found")
 
