@@ -435,6 +435,11 @@ GROUP BY uuid, event_start, event_end, item_id, workspace
             # but it works when billingevent_src is an alias rather than an ORM class.
             logging.info(f"{select(billingevent_src).where(billingevent_src.uuid == after)=}")
             logging.info(f"{after=}")
+            print(f"{after=}")
+            print(str(select(billingevent_src).where(billingevent_src.uuid == after)))
+
+            if isinstance(after, str):
+                after = UUID(after)
 
             after_be = session.execute(
                 select(billingevent_src).where(billingevent_src.uuid == after)
