@@ -1,6 +1,7 @@
 import pprint
 import uuid
 from datetime import datetime
+from http import HTTPStatus
 from unittest.mock import patch
 
 import pytest
@@ -129,6 +130,18 @@ def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestC
         assert datetime.fromisoformat(page1[1]["event_start"]) < datetime.fromisoformat(
             page2[0]["event_start"]
         )
+
+
+def test_page_after_unknown_event_produces_404(db_session: Session, client: TestClient):
+    with patch.object(app.app, "decode_jwt_token", mock_decode_jwt_token):
+        mock_token = "your_mock_jwt_token_here"
+
+        response = client.get(
+            "/workspaces/workspace1/accounting/usage-data?after=a659b597-7522-411d-a2e0-23f7f5629b16",
+            headers={"Authorization": f"Bearer {mock_token}"},
+        )
+
+        assert response.status_code == HTTPStatus.NOT_FOUND
 
 
 @pytest.mark.parametrize(

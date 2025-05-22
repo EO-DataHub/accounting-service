@@ -285,6 +285,12 @@ def datetime_default_to_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt
 
 
+class AfterBillingEventNotFound(Exception):
+    """Raised when paging and specifying the page after an unknown event"""
+
+    pass
+
+
 class BillingEvent(Base):
     """
     This records a particular workspace's consumption of a particular BillingItem at a particular
@@ -353,6 +359,14 @@ class BillingEvent(Base):
         time_aggregation may be 'day' or 'month' to provide daily or monthly totals for each
         SKU+workspace pair.
         """
+        # With no time aggregation we use the raw table as the source of rows to filter, sort,
+        # page and return.
+        #
+        # With time aggregation we use a sub-SELECT which calculates aggregated data as the
+        # source of rows. The UUID assigned is the lexicographically largest of all rows
+        # aggregated. This isn't perfect and can result in errors when fetching the last pages
+        # because new BillingEvents can arrive whilst paging and change the maximum UUIDs.
+        # This does not happen very often, especially with large page sizes.
         if time_aggregation in {"day", "month"}:
             if db.settings.SQL_DRIVER.startswith("sqlite"):
                 period_start_expr = (
@@ -428,20 +442,12 @@ GROUP BY 2, 3, 4, 6
             # This is equivalent to
             #   after_be = session.get(cls, after)
             # but it works when billingevent_src is an alias rather than an ORM class.
-            logging.info(f"{select(billingevent_src).where(billingevent_src.uuid == after)=}")
-            logging.info(f"{after=}")
-            print(f"{after=}")
-            print(str(select(billingevent_src).where(billingevent_src.uuid == after)))
-
-            if isinstance(after, str):
-                after = UUID(after)
-
             after_be = session.execute(
                 select(billingevent_src).where(billingevent_src.uuid == after)
             ).scalar_one_or_none()
 
             if after_be is None:
-                raise ValueError(f"{after} not found")
+                raise AfterBillingEventNotFound(f"after={after} not found")
 
             query = query.where(
                 or_(
