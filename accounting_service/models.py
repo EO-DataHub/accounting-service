@@ -437,34 +437,38 @@ GROUP BY uuid, event_start, event_end, item_id, workspace
                 select(billingevent_src).where(billingevent_src.uuid == after)
             ).scalar_one_or_none()
 
-            if after_be is not None:
-                query = query.where(
-                    or_(
-                        (billingevent_src.event_start > after_be.event_start),
-                        and_(
-                            billingevent_src.event_start == after_be.event_start,
-                            billingevent_src.event_end > after_be.event_end,
-                        ),
-                        and_(
-                            billingevent_src.event_start == after_be.event_start,
-                            billingevent_src.event_end == after_be.event_end,
-                            billingevent_src.workspace > after_be.workspace,
-                        ),
-                        and_(
-                            billingevent_src.event_start == after_be.event_start,
-                            billingevent_src.event_end == after_be.event_end,
-                            billingevent_src.workspace == after_be.workspace,
-                            BillingItem.sku > after_be.item.sku,
-                        ),
-                        and_(
-                            billingevent_src.event_start == after_be.event_start,
-                            billingevent_src.event_end == after_be.event_end,
-                            billingevent_src.workspace == after_be.workspace,
-                            BillingItem.sku == after_be.item.sku,
-                            billingevent_src.uuid > after,
-                        ),
-                    )
+            logging.info(f"{select(billingevent_src).where(billingevent_src.uuid == after)=}")
+            logging.info(f"{after=}")
+            if after_be is None:
+                raise ValueError(f"{after} not found")
+
+            query = query.where(
+                or_(
+                    (billingevent_src.event_start > after_be.event_start),
+                    and_(
+                        billingevent_src.event_start == after_be.event_start,
+                        billingevent_src.event_end > after_be.event_end,
+                    ),
+                    and_(
+                        billingevent_src.event_start == after_be.event_start,
+                        billingevent_src.event_end == after_be.event_end,
+                        billingevent_src.workspace > after_be.workspace,
+                    ),
+                    and_(
+                        billingevent_src.event_start == after_be.event_start,
+                        billingevent_src.event_end == after_be.event_end,
+                        billingevent_src.workspace == after_be.workspace,
+                        BillingItem.sku > after_be.item.sku,
+                    ),
+                    and_(
+                        billingevent_src.event_start == after_be.event_start,
+                        billingevent_src.event_end == after_be.event_end,
+                        billingevent_src.workspace == after_be.workspace,
+                        BillingItem.sku == after_be.item.sku,
+                        billingevent_src.uuid > after,
+                    ),
                 )
+            )
 
         return map(lambda r: r[0], session.execute(query))
 
