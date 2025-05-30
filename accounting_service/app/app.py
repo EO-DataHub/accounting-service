@@ -268,7 +268,7 @@ def get_workspace_usage_data(
             alias="time-aggregation",
             title="Time aggregation of results",
             description=(
-                "Optionally ggregate usage information into totals for the given time periods - "
+                "Optionally aggregate usage information into totals for the given time periods - "
                 + "'day' or 'month'"
             ),
             examples=["day", "month"],
