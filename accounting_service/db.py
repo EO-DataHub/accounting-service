@@ -1,47 +1,13 @@
 import logging
-from typing import Optional, TextIO
+from typing import TextIO
 
 import yaml
-from pydantic_settings import BaseSettings
-from sqlalchemy import URL, create_engine
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from yaml.error import YAMLError
 
 from accounting_service import models
-
-
-class Settings(BaseSettings):
-    SQL_DRIVER: str = "sqlite+pysqlite"
-    SQL_PORT: Optional[int] = None
-    SQL_PASSWORD: Optional[str] = None
-    SQL_USER: Optional[str] = None
-    SQL_DATABASE: str = "accounting"
-    SQL_HOST: Optional[str] = None
-    SQL_SCHEMA: str = "public"
-
-    class Config:
-        env_file = "./.env"
-
-
-settings = Settings()
-
-
-def get_db_url() -> URL:
-    return URL.create(
-        settings.SQL_DRIVER,
-        username=settings.SQL_USER,
-        password=settings.SQL_PASSWORD,
-        host=settings.SQL_HOST,
-        port=settings.SQL_PORT,
-        database=settings.SQL_DATABASE,
-        query={"options": f"-c search_path={settings.SQL_SCHEMA}"},
-    )
-
-
-if settings.SQL_DRIVER.startswith("sqlite"):
-    connect_args = {"check_same_thread": False}
-else:
-    connect_args = {}
+from accounting_service.db_settings import connect_args, get_db_url
 
 engine = create_engine(get_db_url(), connect_args=connect_args)
 

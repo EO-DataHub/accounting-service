@@ -33,7 +33,7 @@ from sqlalchemy.orm import (
     relationship,
 )
 
-from accounting_service import db
+from accounting_service import db_settings
 
 
 class Base(DeclarativeBase):
@@ -67,9 +67,7 @@ class WorkspaceAccount(Base):
             [
                 {
                     "workspace": workspace,
-                    "account": (
-                        account.hex if db.settings.SQL_DRIVER.startswith("sqlite") else account
-                    ),
+                    "account": (account.hex if db_settings.is_sqlite() else account),
                 }
             ],
         )
@@ -129,9 +127,7 @@ class BillingItem(Base):
             [
                 {
                     "sku": sku,
-                    "uuid": (
-                        rnd_uuid.hex if db.settings.SQL_DRIVER.startswith("sqlite") else rnd_uuid
-                    ),
+                    "uuid": (rnd_uuid.hex if db_settings.is_sqlite() else rnd_uuid),
                 }
             ],
         )
@@ -309,7 +305,7 @@ class BillingEvent(Base):
     __tablename__ = "billing_event"
 
     uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    event_start: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), index=True)
+    event_start: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
     event_end: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
     item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
     item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
@@ -338,6 +334,24 @@ class BillingEvent(Base):
         ),
         CheckConstraint("event_start <= event_end"),
     )
+
+    if not db_settings.is_sqlite():
+        __table_args__ += (
+            Index(
+                "billingevent_month_aggregate_index",
+                text("date_trunc('month', event_start AT TIME ZONE 'UTC')"),
+                text("(date_trunc('month', event_start AT TIME ZONE 'UTC') + '1 month'::interval)"),
+                "workspace",
+                "item_id",
+            ),
+            Index(
+                "billingevent_day_aggregate_index",
+                text("date_trunc('day', event_start AT TIME ZONE 'UTC')"),
+                text("(date_trunc('day', event_start AT TIME ZONE 'UTC') + '1 day'::interval)"),
+                "workspace",
+                "item_id",
+            ),
+        )
 
     @classmethod
     def find_billing_events(
@@ -368,7 +382,7 @@ class BillingEvent(Base):
         # because new BillingEvents can arrive whilst paging and change the maximum UUIDs.
         # This does not happen very often, especially with large page sizes.
         if time_aggregation in {"day", "month"}:
-            if db.settings.SQL_DRIVER.startswith("sqlite"):
+            if db_settings.is_sqlite():
                 period_start_expr = (
                     f"datetime(event_start, 'start of {time_aggregation}') || '.000000'"
                 )
@@ -377,7 +391,9 @@ class BillingEvent(Base):
                 )
                 uuid_expr = "MAX(CAST(uuid AS TEXT))"
             else:
-                period_start_expr = f"date_trunc('{time_aggregation}', event_start)"
+                period_start_expr = (
+                    f"date_trunc('{time_aggregation}', event_start AT TIME ZONE 'UTC')"
+                )
                 period_end_expr = f"{period_start_expr} + '1 {time_aggregation}'::interval"
                 uuid_expr = "CAST(MAX(CAST(uuid AS TEXT)) AS UUID)"
 
@@ -447,9 +463,10 @@ GROUP BY 2, 3, 4, 6
             ).scalar_one_or_none()
 
             if after_be is None:
-                raise AfterBillingEventNotFound(f"after={after} not found")
+                raise AfterBillingEventNotFound(f"No records matching after={after} found")
 
             query = query.where(
+                billingevent_src.event_start >= after_be.event_start,
                 or_(
                     (billingevent_src.event_start > after_be.event_start),
                     and_(
@@ -474,7 +491,7 @@ GROUP BY 2, 3, 4, 6
                         BillingItem.sku == after_be.item.sku,
                         billingevent_src.uuid > after,
                     ),
-                )
+                ),
             )
 
         return map(lambda r: r[0], session.execute(query))
@@ -640,7 +657,7 @@ class BillableResourceConsumptionRateSample(Base):
             .where(cls.sample_time < end)
         )
 
-        if db.settings.SQL_DRIVER.startswith("sqlite"):
+        if db_settings.is_sqlite():
             # Only used in tests (but the tests can be run with PostgreSQL as well).
             # SQLite can't cope with the UNION syntax used by SQLAlchemy.
             return (
