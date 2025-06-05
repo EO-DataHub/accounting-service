@@ -1,6 +1,7 @@
 import logging
 import os
 from datetime import datetime, timezone
+from http import HTTPStatus
 from typing import Annotated, Iterator, List, Optional
 from uuid import UUID
 
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from accounting_service.db import get_session
 from accounting_service.models import (
+    AfterBillingEventNotFound,
     BillingEvent,
     BillingItem,
     BillingItemPrice,
@@ -260,6 +262,18 @@ def get_workspace_usage_data(
             examples=["456e15d1-d01b-4060-8b7b-85b93ecbf050"],
         ),
     ] = None,
+    time_aggregation: Annotated[
+        Optional[str],
+        Query(
+            alias="time-aggregation",
+            title="Time aggregation of results",
+            description=(
+                "Optionally aggregate usage information into totals for the given time periods - "
+                + "'day' or 'month'"
+            ),
+            examples=["day", "month"],
+        ),
+    ] = None,
 ):
     """
     This returns resource consumption data for a workspace within some given time range (or all).
@@ -279,9 +293,18 @@ def get_workspace_usage_data(
     start = datetime_default_to_utc(start)
     end = datetime_default_to_utc(end)
 
-    events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
-        session, workspace=workspace, start=start, end=end, limit=limit or 100, after=after
-    )
+    try:
+        events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
+            session,
+            workspace=workspace,
+            start=start,
+            end=end,
+            limit=limit or 100,
+            after=after,
+            time_aggregation=time_aggregation,
+        )
+    except AfterBillingEventNotFound as e:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(e)) from e
 
     add_usage_data_headers(response)
     return list(map(billingevent_to_api_object, events))
@@ -345,6 +368,18 @@ def get_account_usage_data(
             examples=["456e15d1-d01b-4060-8b7b-85b93ecbf050"],
         ),
     ] = None,
+    time_aggregation: Annotated[
+        Optional[str],
+        Query(
+            alias="time-aggregation",
+            title="Time aggregation of results",
+            description=(
+                "Optionally ggregate usage information into totals for the given time periods - "
+                + "'day' or 'month'"
+            ),
+            examples=["day", "month"],
+        ),
+    ] = None,
 ):
     """
     This returns resource consumption data for all workspaces billed to a specified account an
@@ -365,9 +400,18 @@ def get_account_usage_data(
     start = datetime_default_to_utc(start)
     end = datetime_default_to_utc(end)
 
-    events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
-        session, account=account_id, start=start, end=end, limit=limit or 100, after=after
-    )
+    try:
+        events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
+            session,
+            account=account_id,
+            start=start,
+            end=end,
+            limit=limit or 100,
+            after=after,
+            time_aggregation=time_aggregation,
+        )
+    except AfterBillingEventNotFound as e:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(e)) from e
 
     add_usage_data_headers(response)
     return list(map(billingevent_to_api_object, events))

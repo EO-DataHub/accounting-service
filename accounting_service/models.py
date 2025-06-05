@@ -24,9 +24,16 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    aliased,
+    mapped_column,
+    relationship,
+)
 
-from accounting_service import db
+from accounting_service import db_settings
 
 
 class Base(DeclarativeBase):
@@ -60,9 +67,7 @@ class WorkspaceAccount(Base):
             [
                 {
                     "workspace": workspace,
-                    "account": (
-                        account.hex if db.settings.SQL_DRIVER.startswith("sqlite") else account
-                    ),
+                    "account": (account.hex if db_settings.is_sqlite() else account),
                 }
             ],
         )
@@ -122,9 +127,7 @@ class BillingItem(Base):
             [
                 {
                     "sku": sku,
-                    "uuid": (
-                        rnd_uuid.hex if db.settings.SQL_DRIVER.startswith("sqlite") else rnd_uuid
-                    ),
+                    "uuid": (rnd_uuid.hex if db_settings.is_sqlite() else rnd_uuid),
                 }
             ],
         )
@@ -182,6 +185,14 @@ class BillingItemPrice(Base):
     configured_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), default=func.now()
     )  # Set to the current time at the time this row is added.
+
+    @property
+    def valid_from_utc(self):
+        return self.valid_from.astimezone(timezone.utc)
+
+    @property
+    def valid_until_utc(self):
+        return self.valid_until and self.valid_until.astimezone(timezone.utc)
 
     __table_args__ = (
         Index(
@@ -270,6 +281,12 @@ def datetime_default_to_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt
 
 
+class AfterBillingEventNotFound(Exception):
+    """Raised when paging and specifying the page after an unknown event"""
+
+    pass
+
+
 class BillingEvent(Base):
     """
     This records a particular workspace's consumption of a particular BillingItem at a particular
@@ -288,7 +305,7 @@ class BillingEvent(Base):
     __tablename__ = "billing_event"
 
     uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    event_start: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), index=True)
+    event_start: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
     event_end: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
     item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
     item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
@@ -318,6 +335,24 @@ class BillingEvent(Base):
         CheckConstraint("event_start <= event_end"),
     )
 
+    if not db_settings.is_sqlite():
+        __table_args__ += (
+            Index(
+                "billingevent_month_aggregate_index",
+                text("date_trunc('month', event_start AT TIME ZONE 'UTC')"),
+                text("(date_trunc('month', event_start AT TIME ZONE 'UTC') + '1 month'::interval)"),
+                "workspace",
+                "item_id",
+            ),
+            Index(
+                "billingevent_day_aggregate_index",
+                text("date_trunc('day', event_start AT TIME ZONE 'UTC')"),
+                text("(date_trunc('day', event_start AT TIME ZONE 'UTC') + '1 day'::interval)"),
+                "workspace",
+                "item_id",
+            ),
+        )
+
     @classmethod
     def find_billing_events(
         cls,
@@ -328,60 +363,136 @@ class BillingEvent(Base):
         end: Optional[datetime] = None,
         after: Optional[UUID] = None,
         limit: int = 5_000,
+        time_aggregation: Optional[str] = None,
     ) -> Iterator[Self]:
         """
         Find and return BillingEvents matching some criteria.
 
         For paging, `after` should be the UUID of the last billing event on the previous page.
+
+        time_aggregation may be 'day' or 'month' to provide daily or monthly totals for each
+        SKU+workspace pair.
         """
-        query = select(cls).limit(limit)
+        # With no time aggregation we use the raw table as the source of rows to filter, sort,
+        # page and return.
+        #
+        # With time aggregation we use a sub-SELECT which calculates aggregated data as the
+        # source of rows. The UUID assigned is the lexicographically largest of all rows
+        # aggregated. This isn't perfect and can result in errors when fetching the last pages
+        # because new BillingEvents can arrive whilst paging and change the maximum UUIDs.
+        # This does not happen very often, especially with large page sizes.
+        if time_aggregation in {"day", "month"}:
+            if db_settings.is_sqlite():
+                period_start_expr = (
+                    f"datetime(event_start, 'start of {time_aggregation}') || '.000000'"
+                )
+                period_end_expr = (
+                    f"datetime(event_start, 'start of {time_aggregation}', '+1 {time_aggregation}')"
+                )
+                uuid_expr = "MAX(CAST(uuid AS TEXT))"
+            else:
+                period_start_expr = (
+                    f"date_trunc('{time_aggregation}', event_start AT TIME ZONE 'UTC')"
+                )
+                period_end_expr = f"{period_start_expr} + '1 {time_aggregation}'::interval"
+                uuid_expr = "CAST(MAX(CAST(uuid AS TEXT)) AS UUID)"
 
-        # We need a complete and certain order so that the 'after' parameter works.
-        query = query.order_by(
-            cls.event_start,
-            cls.event_end,
-            cls.workspace,
-            cls.uuid,
-        )
-
-        if workspace is not None:
-            query = query.where(cls.workspace == workspace)
-
-        if account is not None:
-            query = query.join(WorkspaceAccount, WorkspaceAccount.workspace == cls.workspace).where(
-                WorkspaceAccount.account == account
+            select_aggregated_events = text(
+                f"""
+SELECT {uuid_expr} as uuid,
+       {period_start_expr} AS event_start,
+       {period_end_expr} AS event_end,
+       item_id,
+       NULL AS user,
+       workspace,
+       SUM(quantity) AS quantity
+FROM {cls.__tablename__}
+GROUP BY 2, 3, 4, 6
+"""
             )
 
+            select_aggregated_events = select_aggregated_events.columns(
+                cls.uuid,
+                cls.event_start,
+                cls.event_end,
+                cls.item_id,
+                cls.user,
+                cls.workspace,
+                cls.quantity,
+            )
+
+            billingevent_src = aliased(BillingEvent, select_aggregated_events.subquery())
+        else:
+            billingevent_src = cls
+
+        all_billing_events = select(billingevent_src).join(
+            BillingItem, BillingItem.uuid == billingevent_src.item_id
+        )
+
+        # We need a complete and certain order so that the 'after' parameter works.
+        query = all_billing_events.order_by(
+            billingevent_src.event_start,
+            billingevent_src.event_end,
+            billingevent_src.workspace,
+            BillingItem.sku,
+            billingevent_src.uuid,
+        )
+
+        query = query.limit(limit)
+
+        if workspace is not None:
+            query = query.where(billingevent_src.workspace == workspace)
+
+        if account is not None:
+            query = query.join(
+                WorkspaceAccount, WorkspaceAccount.workspace == billingevent_src.workspace
+            ).where(WorkspaceAccount.account == account)
+
         if start is not None:
-            query = query.where(cls.event_start >= start)
+            query = query.where(billingevent_src.event_start >= start)
 
         if end is not None:
-            query = query.where(cls.event_end < end)
+            query = query.where(billingevent_src.event_end < end)
 
         if after is not None:
-            after_be = session.get(cls, after)
+            # This is equivalent to
+            #   after_be = session.get(cls, after)
+            # but it works when billingevent_src is an alias rather than an ORM class.
+            after_be = session.execute(
+                select(billingevent_src).where(billingevent_src.uuid == after)
+            ).scalar_one_or_none()
 
-            if after_be is not None:
-                query = query.where(
-                    or_(
-                        (cls.event_start > after_be.event_start),
-                        and_(
-                            cls.event_start == after_be.event_start,
-                            cls.event_end > after_be.event_end,
-                        ),
-                        and_(
-                            cls.event_start == after_be.event_start,
-                            cls.event_end == after_be.event_end,
-                            cls.workspace > after_be.workspace,
-                        ),
-                        and_(
-                            cls.event_start == after_be.event_start,
-                            cls.event_end == after_be.event_end,
-                            cls.workspace == after_be.workspace,
-                            cls.uuid > after,
-                        ),
-                    )
-                )
+            if after_be is None:
+                raise AfterBillingEventNotFound(f"No records matching after={after} found")
+
+            query = query.where(
+                billingevent_src.event_start >= after_be.event_start,
+                or_(
+                    (billingevent_src.event_start > after_be.event_start),
+                    and_(
+                        billingevent_src.event_start == after_be.event_start,
+                        billingevent_src.event_end > after_be.event_end,
+                    ),
+                    and_(
+                        billingevent_src.event_start == after_be.event_start,
+                        billingevent_src.event_end == after_be.event_end,
+                        billingevent_src.workspace > after_be.workspace,
+                    ),
+                    and_(
+                        billingevent_src.event_start == after_be.event_start,
+                        billingevent_src.event_end == after_be.event_end,
+                        billingevent_src.workspace == after_be.workspace,
+                        BillingItem.sku > after_be.item.sku,
+                    ),
+                    and_(
+                        billingevent_src.event_start == after_be.event_start,
+                        billingevent_src.event_end == after_be.event_end,
+                        billingevent_src.workspace == after_be.workspace,
+                        BillingItem.sku == after_be.item.sku,
+                        billingevent_src.uuid > after,
+                    ),
+                ),
+            )
 
         return map(lambda r: r[0], session.execute(query))
 
@@ -546,7 +657,7 @@ class BillableResourceConsumptionRateSample(Base):
             .where(cls.sample_time < end)
         )
 
-        if db.settings.SQL_DRIVER.startswith("sqlite"):
+        if db_settings.is_sqlite():
             # Only used in tests (but the tests can be run with PostgreSQL as well).
             # SQLite can't cope with the UNION syntax used by SQLAlchemy.
             return (

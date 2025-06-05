@@ -1,8 +1,10 @@
 import pprint
 import uuid
 from datetime import datetime
+from http import HTTPStatus
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete
 from sqlalchemy.orm.session import Session
@@ -128,6 +130,191 @@ def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestC
         assert datetime.fromisoformat(page1[1]["event_start"]) < datetime.fromisoformat(
             page2[0]["event_start"]
         )
+
+
+def test_page_after_unknown_event_produces_404(db_session: Session, client: TestClient):
+    with patch.object(app.app, "decode_jwt_token", mock_decode_jwt_token):
+        mock_token = "your_mock_jwt_token_here"
+
+        response = client.get(
+            "/workspaces/workspace1/accounting/usage-data?after=a659b597-7522-411d-a2e0-23f7f5629b16",
+            headers={"Authorization": f"Bearer {mock_token}"},
+        )
+
+        assert response.status_code == HTTPStatus.NOT_FOUND
+
+
+@pytest.mark.parametrize(
+    "aggregation,page_size,results",
+    [
+        pytest.param(
+            "",
+            100,
+            [
+                [
+                    {"event_start": "2025-01-01T00:00:00Z", "item": "sku1", "quantity": 0.01},
+                    {"event_start": "2025-01-01T02:00:00Z", "item": "sku1", "quantity": 0.1},
+                    {"event_start": "2025-01-01T02:00:00Z", "item": "sku2", "quantity": 0.2},
+                    {"event_start": "2025-01-01T23:00:00Z", "item": "sku1", "quantity": 1.0},
+                    {"event_start": "2025-01-02T02:00:00Z", "item": "sku1", "quantity": 0.2},
+                    {"event_start": "2025-02-02T00:00:00Z", "item": "sku1", "quantity": 0.4},
+                ],
+                [],
+            ],
+        ),
+        pytest.param(
+            "day",
+            100,
+            [
+                [
+                    {"event_start": "2025-01-01T00:00:00Z", "item": "sku1", "quantity": 1.11},
+                    {"event_start": "2025-01-01T00:00:00Z", "item": "sku2", "quantity": 0.2},
+                    {"event_start": "2025-01-02T00:00:00Z", "item": "sku1", "quantity": 0.2},
+                    {"event_start": "2025-02-02T00:00:00Z", "item": "sku1", "quantity": 0.4},
+                ],
+                [],
+            ],
+        ),
+        pytest.param(
+            "day",
+            3,
+            [
+                [
+                    {"event_start": "2025-01-01T00:00:00Z", "item": "sku1", "quantity": 1.11},
+                    {"event_start": "2025-01-01T00:00:00Z", "item": "sku2", "quantity": 0.2},
+                    {"event_start": "2025-01-02T00:00:00Z", "item": "sku1", "quantity": 0.2},
+                ],
+                [
+                    {"event_start": "2025-02-02T00:00:00Z", "item": "sku1", "quantity": 0.4},
+                ],
+            ],
+        ),
+        pytest.param(
+            "day",
+            2,
+            [
+                [
+                    {"event_start": "2025-01-01T00:00:00Z", "item": "sku1", "quantity": 1.11},
+                    {"event_start": "2025-01-01T00:00:00Z", "item": "sku2", "quantity": 0.2},
+                ],
+                [
+                    {"event_start": "2025-01-02T00:00:00Z", "item": "sku1", "quantity": 0.2},
+                    {"event_start": "2025-02-02T00:00:00Z", "item": "sku1", "quantity": 0.4},
+                ],
+            ],
+        ),
+        pytest.param(
+            "month",
+            100,
+            [
+                [
+                    {"event_start": "2025-01-01T00:00:00Z", "item": "sku1", "quantity": 1.31},
+                    {"event_start": "2025-01-01T00:00:00Z", "item": "sku2", "quantity": 0.2},
+                    {"event_start": "2025-02-01T00:00:00Z", "item": "sku1", "quantity": 0.4},
+                ],
+                [],
+            ],
+        ),
+    ],
+)
+def test_workspace_usage_data_correctly_time_aggregated(
+    db_session: Session, client: TestClient, aggregation, page_size, results
+):
+    ############# Setup
+    db_session.execute(delete(models.BillingEvent))
+    event_uuids, account_uuids, item_uuids = gen_billingitem_data(
+        db_session,
+        [
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2025, 1, 1, 0, 0, 0),
+                "event_end": datetime(2025, 1, 1, 1, 0, 0),
+                "quantity": 0.01,
+                "sku": "sku1",
+            },
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2025, 1, 1, 2, 0, 0),
+                "event_end": datetime(2025, 1, 1, 3, 0, 0),
+                "quantity": 0.1,
+                "sku": "sku1",
+            },
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2025, 1, 1, 23, 0, 0),
+                "event_end": datetime(2025, 1, 2, 0, 0, 0),
+                "quantity": 1,
+                "sku": "sku1",
+            },
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2025, 1, 2, 2, 0, 0),
+                "event_end": datetime(2025, 1, 2, 3, 0, 0),
+                "quantity": 0.2,
+                "sku": "sku1",
+            },
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2025, 2, 2, 0, 0, 0),
+                "event_end": datetime(2025, 2, 3, 0, 0, 0),
+                "quantity": 0.4,
+                "sku": "sku1",
+            },
+            {
+                "workspace": "workspace1",
+                "event_start": datetime(2025, 1, 1, 2, 0, 0),
+                "event_end": datetime(2025, 1, 1, 3, 0, 0),
+                "quantity": 0.2,
+                "sku": "sku2",
+            },
+            {
+                "workspace": "workspace2",
+                "event_start": datetime(2025, 1, 1, 2, 0, 0),
+                "event_end": datetime(2025, 1, 1, 3, 0, 0),
+                "quantity": 0.5,
+                "sku": "sku2",
+            },
+        ],
+    )
+
+    db_session.flush()
+
+    ############# Test
+    with patch.object(app.app, "decode_jwt_token", mock_decode_jwt_token):
+        mock_token = "your_mock_jwt_token_here"
+
+        response_pages = []
+
+        response_pages.append(
+            client.get(
+                f"/workspaces/workspace1/accounting/usage-data?limit={page_size}&time-aggregation={aggregation}",
+                headers={"Authorization": f"Bearer {mock_token}"},
+            )
+        )
+
+        after = response_pages[0].json()[-1]["uuid"]
+        response_pages.append(
+            client.get(
+                f"/workspaces/workspace1/accounting/usage-data?limit={page_size}&after={after}&time-aggregation={aggregation}",
+                headers={"Authorization": f"Bearer {mock_token}"},
+            )
+        )
+
+        ############# Behaviour check
+        for page in [0, 1]:
+            response_page = response_pages[page]
+
+            assert response_page.status_code == 200
+
+            response_json = response_page.json()
+            expected_json = results[page]
+
+            assert len(response_json) == len(expected_json)
+            for i in range(len(response_json)):
+                print(f"{response_json[i]=}, {expected_json[i]=}")
+                assert response_json[i]["item"] == expected_json[i]["item"]
+                assert response_json[i]["quantity"] == expected_json[i]["quantity"]
+                assert response_json[i]["event_start"] == expected_json[i]["event_start"]
 
 
 def test_account_usage_data_returns_correct_items_from_db(db_session: Session, client: TestClient):
