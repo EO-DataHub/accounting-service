@@ -7,7 +7,16 @@ from uuid import UUID
 
 import jwt
 from eodhp_utils.runner import log_component_version, setup_logging
-from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Response
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+)
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from pydantic import BaseModel, Field
 from sqlalchemy import Result, Row
@@ -207,16 +216,13 @@ def account_authz(account_id: UUID, token_payload: dict, allow_hub_admin: bool =
     return account_id
 
 
-def get_authorization(authorization: Optional[str] = Header(default=None)):
-    return authorization
-
-
 @app.get(
     "/workspaces/{workspace}/accounting/usage-data",
     response_model=List[BillingEventAPIResult],
     summary="Get resource consumption data for a workspace",
 )
 def get_workspace_usage_data(
+    request: Request,
     session: SessionDep,
     response: Response,
     workspace: Annotated[
@@ -227,7 +233,6 @@ def get_workspace_usage_data(
             examples=["my-workspace"],
         ),
     ],
-    authorization: Optional[str] = Depends(get_authorization, include_in_schema=False),
     start: Annotated[
         Optional[datetime],
         Query(
@@ -287,6 +292,8 @@ def get_workspace_usage_data(
     Consumption data may be aggregated so that the time periods used get longer, but they will
     never be aggregated across day boundaries (midnight UTC).
     """
+
+    authorization = request.headers.get("authorization")
 
     # Decode the JWT token
     token_payload = decode_jwt_token(authorization)
