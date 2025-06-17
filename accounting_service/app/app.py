@@ -207,6 +207,10 @@ def account_authz(account_id: UUID, token_payload: dict, allow_hub_admin: bool =
     return account_id
 
 
+def get_authorization(authorization: Optional[str] = Header(default=None)):
+    return authorization
+
+
 @app.get(
     "/workspaces/{workspace}/accounting/usage-data",
     response_model=List[BillingEventAPIResult],
@@ -223,7 +227,7 @@ def get_workspace_usage_data(
             examples=["my-workspace"],
         ),
     ],
-    authorization: Optional[str] = Header(...),
+    authorization: Optional[str] = Depends(get_authorization, include_in_schema=False),
     start: Annotated[
         Optional[datetime],
         Query(
