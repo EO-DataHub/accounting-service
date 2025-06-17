@@ -293,6 +293,7 @@ def get_workspace_usage_data(
     never be aggregated across day boundaries (midnight UTC).
     """
 
+    # Get the authorization header from the request
     authorization = request.headers.get("authorization")
 
     # Decode the JWT token
@@ -327,6 +328,7 @@ def get_workspace_usage_data(
     summary="Get resource consumption data for all workspaces in a billing account",
 )
 def get_account_usage_data(
+    request: Request,
     session: SessionDep,
     response: Response,
     account_id: Annotated[
@@ -340,7 +342,6 @@ def get_account_usage_data(
             examples=["4b48ebea-bdb8-4bb9-bce9-a7853ad3965d"],
         ),
     ],
-    authorization: Optional[str] = Header(...),
     start: Annotated[
         Optional[datetime],
         Query(
@@ -401,6 +402,9 @@ def get_account_usage_data(
     Consumption data may be aggregated so that the time periods used get longer, but they will
     never be aggregated across day boundaries (midnight UTC).
     """
+
+    # Get the authorization header from the request
+    authorization = request.headers.get("authorization")
 
     # Decode the JWT token
     token_payload = decode_jwt_token(authorization)
