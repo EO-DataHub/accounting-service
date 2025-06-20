@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.5.3
+
+- Remove 'authorization' from inputs in OpenAPI spec
+
 ## v0.5.2
 
 - Fix some double-counting problems when time-aggregating
