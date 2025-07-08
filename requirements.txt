@@ -11,15 +11,15 @@ anyio==4.9.0
     #   httpx
     #   starlette
     #   watchfiles
-asgiref==3.8.1
+asgiref==3.9.0
     # via opentelemetry-instrumentation-asgi
 attrs==25.3.0
     # via
     #   jsonschema
     #   referencing
-boto3==1.38.40
+boto3==1.39.3
     # via eodhp-utils
-botocore==1.38.40
+botocore==1.39.3
     # via
     #   boto3
     #   eodhp-utils
@@ -43,7 +43,7 @@ eodhp-utils @ git+https://github.com/UKEODHP/eodhp-utils@v0.1.8
     # via accounting-service (pyproject.toml)
 faker==37.4.0
     # via eodhp-utils
-fastapi[standard]==0.115.13
+fastapi[standard]==0.115.14
     # via accounting-service (pyproject.toml)
 fastapi-cli[standard]==0.0.7
     # via fastapi
@@ -138,15 +138,15 @@ pydantic==2.11.7
     #   pydantic-settings
 pydantic-core==2.33.2
     # via pydantic
-pydantic-settings==2.9.1
+pydantic-settings==2.10.1
     # via accounting-service (pyproject.toml)
-pygments==2.19.1
+pygments==2.19.2
     # via rich
 pyjwt==2.10.1
     # via accounting-service (pyproject.toml)
 python-dateutil==2.9.0.post0
     # via botocore
-python-dotenv==1.1.0
+python-dotenv==1.1.1
     # via
     #   pydantic-settings
     #   uvicorn
@@ -164,9 +164,9 @@ rich==14.0.0
     # via
     #   rich-toolkit
     #   typer
-rich-toolkit==0.14.7
+rich-toolkit==0.14.8
     # via fastapi-cli
-rpds-py==0.25.1
+rpds-py==0.26.0
     # via
     #   jsonschema
     #   referencing
@@ -184,7 +184,7 @@ starlette==0.46.2
     # via fastapi
 typer==0.16.0
     # via fastapi-cli
-typing-extensions==4.14.0
+typing-extensions==4.14.1
     # via
     #   fastapi
     #   opentelemetry-api
@@ -205,7 +205,7 @@ tzdata==2025.2
     # via faker
 urllib3==2.5.0
     # via botocore
-uvicorn[standard]==0.34.3
+uvicorn[standard]==0.35.0
     # via
     #   fastapi
     #   fastapi-cli
