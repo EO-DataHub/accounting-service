@@ -17,7 +17,7 @@ from tests.conftest import (
 )
 
 
-def test_message_results_in_billingevent_in_db(db_session: Session):
+def test_message_results_in_billingevent_in_db(db_session: Session) -> None:
     ############# Setup
     bemsg, start, end = fake_event_known_times()
     db_session.add(models.BillingItem(sku=bemsg.sku, name="test", unit="GB-h"))
@@ -32,7 +32,8 @@ def test_message_results_in_billingevent_in_db(db_session: Session):
     assert not failures.any_permanent()
     assert not failures.any_temporary()
 
-    beobj = db_session.get(models.BillingEvent, UUID(bemsg.uuid))
+    beobj = db_session.get(models.BillingEvent, UUID(str(bemsg.uuid)))
+    assert beobj is not None
     assert str(beobj.uuid) == bemsg.uuid
 
     assert beobj.event_start_utc == start
@@ -43,9 +44,9 @@ def test_message_results_in_billingevent_in_db(db_session: Session):
     assert beobj.item.sku == bemsg.sku
 
 
-def test_two_messages_same_uuid_results_in_one_billingevent_in_db(db_session: Session):
+def test_two_messages_same_uuid_results_in_one_billingevent_in_db(db_session: Session) -> None:
     ############# Setup
-    bemsg, start, end = fake_event_known_times()
+    bemsg, _start, _end = fake_event_known_times()
     db_session.add(models.BillingItem(sku=bemsg.sku, name="test", unit="GB-h"))
     db_session.flush()
     db_session.commit()
@@ -53,10 +54,10 @@ def test_two_messages_same_uuid_results_in_one_billingevent_in_db(db_session: Se
     ############# Test
     messager = AccountingIngesterMessager()
 
-    bemsg.quantity = 1
+    bemsg.quantity = float(1)
     failures1 = messager.consume(bemsg_to_pulsar_msg(bemsg))
 
-    bemsg.quantity = 2
+    bemsg.quantity = float(2)
     failures2 = messager.consume(bemsg_to_pulsar_msg(bemsg))
 
     ############# Behaviour check
@@ -66,11 +67,12 @@ def test_two_messages_same_uuid_results_in_one_billingevent_in_db(db_session: Se
     assert not failures2.any_permanent()
     assert not failures2.any_temporary()
 
-    beobj = db_session.get(models.BillingEvent, UUID(bemsg.uuid))
+    beobj = db_session.get(models.BillingEvent, UUID(str(bemsg.uuid)))
+    assert beobj is not None
     assert beobj.quantity == 1
 
 
-def test_message_with_no_user_results_in_billingevent_in_db(db_session: Session):
+def test_message_with_no_user_results_in_billingevent_in_db(db_session: Session) -> None:
     ############# Setup
     bemsg = messages.BillingEvent.get_fake()
     bemsg.user = None
@@ -87,12 +89,13 @@ def test_message_with_no_user_results_in_billingevent_in_db(db_session: Session)
     assert not failures.any_permanent()
     assert not failures.any_temporary()
 
-    beobj = db_session.get(models.BillingEvent, UUID(bemsg.uuid))
+    beobj = db_session.get(models.BillingEvent, UUID(str(bemsg.uuid)))
+    assert beobj is not None
     assert str(beobj.uuid) == bemsg.uuid
     assert beobj.user is None
 
 
-def test_message_with_unknown_sku_creates_billingitem(db_session):
+def test_message_with_unknown_sku_creates_billingitem(db_session: Session) -> None:
     ############# Setup
     bemsg = messages.BillingEvent.get_fake()
 
@@ -104,11 +107,12 @@ def test_message_with_unknown_sku_creates_billingitem(db_session):
     assert not failures.any_permanent()
     assert not failures.any_temporary()
 
-    beobj = db_session.get(models.BillingEvent, UUID(bemsg.uuid))
+    beobj = db_session.get(models.BillingEvent, UUID(str(bemsg.uuid)))
+    assert beobj is not None
     assert beobj.item.sku == bemsg.sku
 
 
-def test_message_with_invalid_uuid_produces_permanent_failure():
+def test_message_with_invalid_uuid_produces_permanent_failure() -> None:
     ############# Setup
     bemsg = messages.BillingEvent.get_fake()
     bemsg.uuid = "abc"
@@ -121,7 +125,7 @@ def test_message_with_invalid_uuid_produces_permanent_failure():
     assert failures.any_permanent()
 
 
-def test_db_operational_error_produces_temporary_failure():
+def test_db_operational_error_produces_temporary_failure() -> None:
     engine = create_engine("postgresql+psycopg://localhost:1/nonexistent")
     with mock.patch("accounting_service.ingester.messager.db.engine", engine):
         # session = scoped_session(sessionmaker(bind=engine))
@@ -138,8 +142,8 @@ def test_db_operational_error_produces_temporary_failure():
 
 
 def test_message_with_new_workspace_settings_results_in_workspace_account_relationship_recorded(
-    db_session,
-):
+    db_session: Session,
+) -> None:
     ############# Setup
     msg = messages.WorkspaceSettings.get_fake()
 
@@ -151,10 +155,12 @@ def test_message_with_new_workspace_settings_results_in_workspace_account_relati
     assert not failures.any_permanent()
     assert not failures.any_temporary()
 
-    assert db_session.get(models.WorkspaceAccount, msg.name).account == UUID(msg.account)
+    wa = db_session.get(models.WorkspaceAccount, msg.name)
+    assert wa is not None
+    assert wa.account == UUID(str(msg.account))
 
 
-def test_message_with_existing_workspace_changes_nothing(db_session):
+def test_message_with_existing_workspace_changes_nothing(db_session: Session) -> None:
     ############# Setup
     msg = messages.WorkspaceSettings.get_fake()
 
@@ -170,4 +176,6 @@ def test_message_with_existing_workspace_changes_nothing(db_session):
     assert not failures2.any_permanent()
     assert not failures2.any_temporary()
 
-    assert db_session.get(models.WorkspaceAccount, msg.name).account == UUID(msg.account)
+    wa = db_session.get(models.WorkspaceAccount, msg.name)
+    assert wa is not None
+    assert wa.account == UUID(str(msg.account))

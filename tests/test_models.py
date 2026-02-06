@@ -1,6 +1,7 @@
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Sequence
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from eodhp_utils.pulsar import messages
@@ -12,7 +13,7 @@ from accounting_service import models
 from tests.conftest import fake_event_known_times
 
 
-def test_round_trip_billingevent_insertfrommessage_retrieve(db_session: Session):
+def test_round_trip_billingevent_insertfrommessage_retrieve(db_session: Session) -> None:
     ############# Setup
     bemsg, start, end = fake_event_known_times()
     db_session.add(models.BillingItem(sku=bemsg.sku, name="test", unit="GB-h"))
@@ -22,6 +23,7 @@ def test_round_trip_billingevent_insertfrommessage_retrieve(db_session: Session)
 
     ############# Behaviour check
     beobj = db_session.get(models.BillingEvent, beuuid)
+    assert beobj is not None
     assert str(beobj.uuid) == bemsg.uuid
     assert beobj.event_start_utc == start
     assert beobj.event_end_utc == end
@@ -31,20 +33,21 @@ def test_round_trip_billingevent_insertfrommessage_retrieve(db_session: Session)
     assert beobj.item.sku == bemsg.sku
 
 
-def test_dup_billingevent_uuid_only_added_once(db_session: Session):
+def test_dup_billingevent_uuid_only_added_once(db_session: Session) -> None:
     ############# Setup
-    bemsg, start, end = fake_event_known_times()
+    bemsg, _start, _end = fake_event_known_times()
     db_session.add(models.BillingItem(sku=bemsg.sku, name="test", unit="GB-h"))
 
     ############# Test
-    bemsg.quantity = 1
+    bemsg.quantity = float(1)
     beuuid1 = models.BillingEvent.insert_from_message(db_session, bemsg)
 
-    bemsg.quantity = 2
+    bemsg.quantity = float(2)
     beuuid2 = models.BillingEvent.insert_from_message(db_session, bemsg)
 
     ############# Behaviour check
     beobj = db_session.get(models.BillingEvent, beuuid1)
+    assert beobj is not None
     assert str(beobj.uuid) == bemsg.uuid
     assert beobj.quantity == 1
 
@@ -52,8 +55,8 @@ def test_dup_billingevent_uuid_only_added_once(db_session: Session):
 
 
 def gen_billingitem_data(
-    db_session: Session, events: Sequence[dict], ws_accounts: Optional[Dict[str, str]] = None
-):
+    db_session: Session, events: Sequence[dict[str, Any]], ws_accounts: dict[str, str] | None = None
+) -> tuple[list[uuid.UUID], dict[str, uuid.UUID], dict[str, uuid.UUID]]:
     """
     This generates test BillingEvents, BillingItems and WorkspaceAccounts based on a spec.
     Example:
@@ -75,14 +78,12 @@ def gen_billingitem_data(
         db_session.add(models.WorkspaceAccount(workspace=workspace, account=account_uuid))
 
     item_uuids["testsku"] = uuid.uuid4()
-    db_session.add(
-        models.BillingItem(uuid=item_uuids["testsku"], sku="testsku", name="test", unit="GB-h")
-    )
+    db_session.add(models.BillingItem(uuid=item_uuids["testsku"], sku="testsku", name="test", unit="GB-h"))
 
     for event in events:
         event_uuid = uuid.uuid4()
 
-        start = event.get("event_start", fake.past_datetime("-30d", tzinfo=timezone.utc))
+        start = event.get("event_start", fake.past_datetime("-30d", tzinfo=UTC))
         end = event.get("event_end", start + timedelta(minutes=5))
 
         item_sku = event.get("sku", "testsku")
@@ -90,9 +91,7 @@ def gen_billingitem_data(
         if not item_uuid:
             item_uuid = uuid.uuid4()
             item_uuids[item_sku] = item_uuid
-            db_session.add(
-                models.BillingItem(uuid=item_uuid, sku=item_sku, name="test", unit="GB-h")
-            )
+            db_session.add(models.BillingItem(uuid=item_uuid, sku=item_sku, name="test", unit="GB-h"))
 
         db_session.add(
             models.BillingEvent(
@@ -110,7 +109,7 @@ def gen_billingitem_data(
     return (event_uuids, accounts_created, item_uuids)
 
 
-def test_finding_all_billing_events_for_workspace_returns_correct_number(db_session: Session):
+def test_finding_all_billing_events_for_workspace_returns_correct_number(db_session: Session) -> None:
     gen_billingitem_data(
         db_session,
         [{"workspace": "workspace1"}, {"workspace": "workspace1"}, {"workspace": "workspace2"}],
@@ -120,8 +119,8 @@ def test_finding_all_billing_events_for_workspace_returns_correct_number(db_sess
     assert len(list(bes)) == 2
 
 
-def test_finding_all_billing_events_for_account_returns_correct_number(db_session: Session):
-    event_uuids, account_uuids, item_uuids = gen_billingitem_data(
+def test_finding_all_billing_events_for_account_returns_correct_number(db_session: Session) -> None:
+    _event_uuids, account_uuids, _item_uuids = gen_billingitem_data(
         db_session,
         [
             {"workspace": "workspace1"},
@@ -139,34 +138,34 @@ def test_finding_all_billing_events_for_account_returns_correct_number(db_sessio
     assert len(list(bes)) == 1
 
 
-def test_finding_billing_events_for_workspace(db_session: Session):
+def test_finding_billing_events_for_workspace(db_session: Session) -> None:
     ############# Setup
-    event_uuids, account_uuids, item_uuids = gen_billingitem_data(
+    event_uuids, _account_uuids, _item_uuids = gen_billingitem_data(
         db_session,
         [
             {
                 "workspace": "workspace1",
-                "event_start": datetime(2024, 1, 16, 6, 10, 0, tzinfo=timezone.utc),
+                "event_start": datetime(2024, 1, 16, 6, 10, 0, tzinfo=UTC),
             },
             {
                 "workspace": "workspace1",
-                "event_start": datetime(2024, 1, 16, 7, 10, 0, tzinfo=timezone.utc),
+                "event_start": datetime(2024, 1, 16, 7, 10, 0, tzinfo=UTC),
             },
             {
                 "workspace": "workspace1",
-                "event_start": datetime(2024, 1, 16, 8, 10, 0, tzinfo=timezone.utc),
+                "event_start": datetime(2024, 1, 16, 8, 10, 0, tzinfo=UTC),
             },
             {
                 "workspace": "workspace1",
-                "event_start": datetime(2024, 1, 16, 9, 10, 0, tzinfo=timezone.utc),
+                "event_start": datetime(2024, 1, 16, 9, 10, 0, tzinfo=UTC),
             },
             {
                 "workspace": "workspace2",
-                "event_start": datetime(2024, 1, 16, 7, 5, 0, tzinfo=timezone.utc),
+                "event_start": datetime(2024, 1, 16, 7, 5, 0, tzinfo=UTC),
             },
             {
                 "workspace": "workspace3",
-                "event_start": datetime(2024, 1, 17, 7, 5, 0, tzinfo=timezone.utc),
+                "event_start": datetime(2024, 1, 17, 7, 5, 0, tzinfo=UTC),
             },
         ],
     )
@@ -175,8 +174,8 @@ def test_finding_billing_events_for_workspace(db_session: Session):
     bes = models.BillingEvent.find_billing_events(
         db_session,
         workspace="workspace1",
-        start=datetime(2024, 1, 16, 7, 5, 0, tzinfo=timezone.utc),
-        end=datetime(2024, 1, 16, 9, 5, 0, tzinfo=timezone.utc),
+        start=datetime(2024, 1, 16, 7, 5, 0, tzinfo=UTC),
+        end=datetime(2024, 1, 16, 9, 5, 0, tzinfo=UTC),
     )
 
     ############# Behaviour check
@@ -189,31 +188,31 @@ def test_finding_billing_events_for_workspace(db_session: Session):
     assert bes[1].uuid == event_uuids[2]
 
 
-def test_paging_billing_events_produces_all_events_once(db_session: Session):
+def test_paging_billing_events_produces_all_events_once(db_session: Session) -> None:
     ############# Setup
     db_session.execute(delete(models.BillingEvent))
-    event_uuids, account_uuids, item_uuids = gen_billingitem_data(
+    event_uuids, _account_uuids, _item_uuids = gen_billingitem_data(
         db_session,
         [
             {
                 "workspace": "workspace1",
-                "event_start": datetime(2024, 1, 16, 6, 10, 0, tzinfo=timezone.utc),
+                "event_start": datetime(2024, 1, 16, 6, 10, 0, tzinfo=UTC),
             },
             {
                 "workspace": "workspace2",
-                "event_start": datetime(2024, 1, 16, 7, 5, 0, tzinfo=timezone.utc),
+                "event_start": datetime(2024, 1, 16, 7, 5, 0, tzinfo=UTC),
             },
             {
                 "workspace": "workspace3",
-                "event_start": datetime(2024, 1, 16, 7, 5, 0, tzinfo=timezone.utc),
+                "event_start": datetime(2024, 1, 16, 7, 5, 0, tzinfo=UTC),
             },
             {
                 "workspace": "workspace1",
-                "event_start": datetime(2024, 1, 16, 7, 10, 0, tzinfo=timezone.utc),
+                "event_start": datetime(2024, 1, 16, 7, 10, 0, tzinfo=UTC),
             },
             {
                 "workspace": "workspace1",
-                "event_start": datetime(2024, 1, 16, 8, 10, 0, tzinfo=timezone.utc),
+                "event_start": datetime(2024, 1, 16, 8, 10, 0, tzinfo=UTC),
             },
         ],
     )
@@ -238,7 +237,7 @@ def test_paging_billing_events_produces_all_events_once(db_session: Session):
 
 
 @pytest.fixture
-def fake_rate_samples(db_session):
+def fake_rate_samples(db_session: Session) -> list[messages.BillingResourceConsumptionRateSample]:
     db_session.add(models.BillingItem(sku="testsku", name="test", unit="GB-h"))
     db_session.add(models.BillingItem(sku="nottestsku", name="test", unit="GB-h"))
     return [
@@ -301,7 +300,7 @@ def fake_rate_samples(db_session):
 
 def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retrieve(
     db_session: Session,
-):
+) -> None:
     ############# Setup
     msg = messages.BillingResourceConsumptionRateSample.get_fake()
     db_session.add(models.BillingItem(sku=msg.sku, name="test", unit="GB-h"))
@@ -311,6 +310,7 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
 
     ############# Behaviour check
     brobj = db_session.get(models.BillableResourceConsumptionRateSample, bruuid)
+    assert brobj is not None
     assert str(brobj.uuid) == msg.uuid
     assert brobj.sample_time_utc.isoformat() == msg.sample_time
     assert str(brobj.user) == msg.user
@@ -320,8 +320,8 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
 
 
 def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retrieve_interval(
-    db_session: Session, fake_rate_samples
-):
+    db_session: Session, fake_rate_samples: list[messages.BillingResourceConsumptionRateSample]
+) -> None:
     ############# Setup
     # This creates several samples around our window of interest, 1am-2am 2025-01-01, to send to
     # the data store.
@@ -334,8 +334,8 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
             db_session,
             "workspace1",
             "testsku",
-            datetime(2025, 1, 1, 1, 0, 0, tzinfo=timezone.utc),
-            datetime(2025, 1, 1, 2, 0, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 1, 0, 0, tzinfo=UTC),
+            datetime(2025, 1, 1, 2, 0, 0, tzinfo=UTC),
         )
     )
 
@@ -352,15 +352,15 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
 
 
 @pytest.mark.parametrize(
-    "start,end,expected_consumption",
+    ("start", "end", "expected_consumption"),
     [
         # Samples for this 10 min window should be:
         #   * 1:15: 3 (exact start)
         #   * 1:25: 4 (exact end)
         # Consumption estimate is (3+4)/2 * 600
         pytest.param(
-            datetime(2025, 1, 1, 1, 15, 0, tzinfo=timezone.utc),
-            datetime(2025, 1, 1, 1, 25, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 1, 15, 0, tzinfo=UTC),
+            datetime(2025, 1, 1, 1, 25, 0, tzinfo=UTC),
             3.5 * 600,
         ),
         # Samples for this 1h window should be:
@@ -372,8 +372,8 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
         # Consumption estimate is 900*(2.25+3)/2 + 600*(3+4)/2 + 1500*(4+2)/2 + 600*(2+1.3333)/2
         #  = 9962.5
         pytest.param(
-            datetime(2025, 1, 1, 1, 0, 0, tzinfo=timezone.utc),
-            datetime(2025, 1, 1, 2, 0, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 1, 0, 0, tzinfo=UTC),
+            datetime(2025, 1, 1, 2, 0, 0, tzinfo=UTC),
             9962.5,
         ),
         # Samples for this 2 min window should be:
@@ -383,8 +383,8 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
         #   * 1:25: 4 (after window)
         # Consumption estimate is 120 * (3.6+3.4)/2
         pytest.param(
-            datetime(2025, 1, 1, 1, 19, 0, tzinfo=timezone.utc),
-            datetime(2025, 1, 1, 1, 21, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 1, 19, 0, tzinfo=UTC),
+            datetime(2025, 1, 1, 1, 21, 0, tzinfo=UTC),
             420.0,
         ),
         # Samples for this 50m window should be:
@@ -396,8 +396,8 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
         # Consumption estimate is 300*(1+1.5)/2 = 375
         # Note: counted as zero up to first sample
         pytest.param(
-            datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
-            datetime(2025, 1, 1, 0, 50, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC),
+            datetime(2025, 1, 1, 0, 50, 0, tzinfo=UTC),
             375,
         ),
         # Samples for this 1h window should be:
@@ -409,15 +409,19 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
         #   * no later samples
         # Consumption estimate is 25*60*(45.5+90)/2 = 101625.0
         pytest.param(
-            datetime(2025, 1, 1, 2, 30, 0, tzinfo=timezone.utc),
-            datetime(2025, 1, 1, 3, 30, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 2, 30, 0, tzinfo=UTC),
+            datetime(2025, 1, 1, 3, 30, 0, tzinfo=UTC),
             101625.0,
         ),
     ],
 )
 def test_consumption_estimation_from_billingresourceconsumptionratesamples(
-    db_session: Session, fake_rate_samples, start, end, expected_consumption
-):
+    db_session: Session,
+    fake_rate_samples: list[messages.BillingResourceConsumptionRateSample],
+    start: datetime,
+    end: datetime,
+    expected_consumption: float,
+) -> None:
     ############# Setup
     # This creates several samples around our window of interest, 1am-2am 2025-01-01, to send to
     # the data store.

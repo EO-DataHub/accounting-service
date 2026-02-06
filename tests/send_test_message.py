@@ -46,12 +46,8 @@ from eodhp_utils.pulsar import messages
 
 client = pulsar.Client("pulsar://localhost:6650")
 
-billing_producer = client.create_producer(
-    "billing-events", schema=messages.generate_billingevent_schema()
-)
-workspace_producer = client.create_producer(
-    "workspace-settings", schema=messages.generate_workspacesettings_schema()
-)
+billing_producer = client.create_producer("billing-events", schema=messages.generate_billingevent_schema())
+workspace_producer = client.create_producer("workspace-settings", schema=messages.generate_workspacesettings_schema())
 
 wsmsg = messages.WorkspaceSettings.get_fake()
 wsmsg.name = "test-workspace"
