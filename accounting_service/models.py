@@ -1,9 +1,11 @@
+import itertools
 import logging
 import uuid
 from collections import namedtuple
-from datetime import datetime, timezone
+from collections.abc import Iterator, Sequence
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Iterator, Optional, Self, Sequence
+from typing import Any, Self
 from uuid import UUID, uuid4
 
 import eodhp_utils.pulsar.messages
@@ -102,7 +104,7 @@ class BillingItem(Base):
         return map(lambda r: r[0], session.execute(query))
 
     @classmethod
-    def find_billing_item(cls, session: Session, sku: str) -> Optional[Self]:
+    def find_billing_item(cls, session: Session, sku: str) -> Self | None:
         """Returns a specified BillingItem, assuming it's visible."""
         # This is currently any BillingItem but this could change if we add a 'deleted' flag
         # or some visibility rules.
@@ -111,7 +113,7 @@ class BillingItem(Base):
         return result[0] if result else None
 
     @classmethod
-    def ensure_sku_exists(cls, session: Session, sku: str) -> Optional[Self]:
+    def ensure_sku_exists(cls, session: Session, sku: str) -> Self | None:
         """
         This creates a stub BillingItem for an SKU if none already exists.
         """
@@ -133,7 +135,7 @@ class BillingItem(Base):
         )
 
     @classmethod
-    def upsert_configured_item(cls, session: Session, item: dict):
+    def upsert_configured_item(cls, session: Session, item: dict[str, Any]) -> None:
         """
         This aimed at inserting or updating BillingItems based on a database-independent source
         such as a YAML configuration file. 'item' should have fields 'sku', 'name' and 'unit'.
@@ -179,7 +181,7 @@ class BillingItemPrice(Base):
     item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
     price: Mapped[Decimal]  # This is in pounds.
     valid_from: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
-    valid_until: Mapped[Optional[datetime]] = mapped_column(
+    valid_until: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True)
     )  # None for current price, a time in the past otherwise.
     configured_at: Mapped[datetime] = mapped_column(
@@ -187,12 +189,12 @@ class BillingItemPrice(Base):
     )  # Set to the current time at the time this row is added.
 
     @property
-    def valid_from_utc(self):
-        return self.valid_from.astimezone(timezone.utc)
+    def valid_from_utc(self) -> datetime:
+        return self.valid_from.astimezone(UTC)
 
     @property
-    def valid_until_utc(self):
-        return self.valid_until and self.valid_until.astimezone(timezone.utc)
+    def valid_until_utc(self) -> datetime | None:
+        return self.valid_until and self.valid_until.astimezone(UTC)
 
     __table_args__ = (
         Index(
@@ -223,7 +225,7 @@ class BillingItemPrice(Base):
         return session.execute(query)
 
     @classmethod
-    def upsert_configured_price(cls, session: Session, price: dict):
+    def upsert_configured_price(cls, session: Session, price: dict[str, Any]) -> None:
         """
         This aimed at inserting or updating prices based on a database-independent source
         such as a YAML configuration file. 'price' must contain 'sku', 'price' and 'valid_from'.
@@ -235,32 +237,27 @@ class BillingItemPrice(Base):
         item_obj = BillingItem.find_billing_item(session, price["sku"])
         if not item_obj:
             logging.error("Failed to find item %s when configuring price", price["sku"])
-            raise ValueError(f"Attempt to add price for unknown SKU {price["sku"]}")
+            raise ValueError(f"Attempt to add price for unknown SKU {price['sku']}")
 
-        valid_from = datetime.fromisoformat(price["valid_from"]).astimezone(timezone.utc)
+        valid_from = datetime.fromisoformat(price["valid_from"]).astimezone(UTC)
 
         existing_prices_updated = session.execute(
-            update(cls)
-            .where(cls.item == item_obj)
-            .where(cls.valid_from == valid_from)
-            .values(price=price["price"])
+            update(cls).where(cls.item == item_obj).where(cls.valid_from == valid_from).values(price=price["price"])
         )
 
         if existing_prices_updated.rowcount > 0:
             return
 
         latest_price = (
-            session.execute(
-                select(cls).where(cls.item == item_obj).order_by(cls.valid_from.desc()).limit(1)
-            )
+            session.execute(select(cls).where(cls.item == item_obj).order_by(cls.valid_from.desc()).limit(1))
             .scalars()
             .one_or_none()
         )
 
         if latest_price:
-            if latest_price.valid_from.astimezone(timezone.utc) > valid_from:
+            if latest_price.valid_from.astimezone(UTC) > valid_from:
                 raise ValueError(
-                    f"Attempt to add price {price["sku"]} where valid_from is earlier "
+                    f"Attempt to add price {price['sku']} where valid_from is earlier "
                     + f"than the latest existing price, {latest_price.valid_from}."
                 )
 
@@ -274,9 +271,9 @@ class BillingItemPrice(Base):
         session.add(price_obj)
 
 
-def datetime_default_to_utc(dt: Optional[datetime]) -> Optional[datetime]:
+def datetime_default_to_utc(dt: datetime | None) -> datetime | None:
     if dt and not dt.tzinfo:
-        return dt.replace(tzinfo=timezone.utc)
+        return dt.replace(tzinfo=UTC)
 
     return dt
 
@@ -309,22 +306,22 @@ class BillingEvent(Base):
     event_end: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
     item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
     item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
-    user: Mapped[Optional[UUID]]  # This is None for, for example, workspace storage.
+    user: Mapped[UUID | None]  # This is None for, for example, workspace storage.
     workspace: Mapped[str]
     quantity: Mapped[float]  # The units involved are defined in the BillingItem
 
     @property
-    def event_start_utc(self):
+    def event_start_utc(self) -> datetime:
         # In PostgreSQL we always have a sample_time with a timezone attached and it should always
         # be UTC. In SQLite, used for tests, we get datetimes with no timezone, creating problems
         # when we do comparisons.
         #
         # This harmonizes this.
-        return self.event_start.astimezone(timezone.utc)
+        return self.event_start.astimezone(UTC)
 
     @property
-    def event_end_utc(self):
-        return self.event_end.astimezone(timezone.utc)
+    def event_end_utc(self) -> datetime:
+        return self.event_end.astimezone(UTC)
 
     __table_args__ = (
         Index(
@@ -357,13 +354,13 @@ class BillingEvent(Base):
     def find_billing_events(
         cls,
         session: Session,
-        workspace: Optional[str] = None,
-        account: Optional[UUID] = None,
-        start: Optional[datetime] = None,
-        end: Optional[datetime] = None,
-        after: Optional[UUID] = None,
+        workspace: str | None = None,
+        account: UUID | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        after: UUID | None = None,
         limit: int = 5_000,
-        time_aggregation: Optional[str] = None,
+        time_aggregation: str | None = None,
     ) -> Iterator[Self]:
         """
         Find and return BillingEvents matching some criteria.
@@ -383,17 +380,11 @@ class BillingEvent(Base):
         # This does not happen very often, especially with large page sizes.
         if time_aggregation in {"day", "month"}:
             if db_settings.is_sqlite():
-                period_start_expr = (
-                    f"datetime(event_start, 'start of {time_aggregation}') || '.000000'"
-                )
-                period_end_expr = (
-                    f"datetime(event_start, 'start of {time_aggregation}', '+1 {time_aggregation}')"
-                )
+                period_start_expr = f"datetime(event_start, 'start of {time_aggregation}') || '.000000'"
+                period_end_expr = f"datetime(event_start, 'start of {time_aggregation}', '+1 {time_aggregation}')"
                 uuid_expr = "MAX(CAST(uuid AS TEXT))"
             else:
-                period_start_expr = (
-                    f"date_trunc('{time_aggregation}', event_start AT TIME ZONE 'UTC')"
-                )
+                period_start_expr = f"date_trunc('{time_aggregation}', event_start AT TIME ZONE 'UTC')"
                 period_end_expr = f"{period_start_expr} + '1 {time_aggregation}'::interval"
                 uuid_expr = "CAST(MAX(CAST(uuid AS TEXT)) AS UUID)"
 
@@ -425,9 +416,7 @@ GROUP BY 2, 3, 4, 6
         else:
             billingevent_src = cls
 
-        all_billing_events = select(billingevent_src).join(
-            BillingItem, BillingItem.uuid == billingevent_src.item_id
-        )
+        all_billing_events = select(billingevent_src).join(BillingItem, BillingItem.uuid == billingevent_src.item_id)
 
         # We need a complete and certain order so that the 'after' parameter works.
         query = all_billing_events.order_by(
@@ -444,9 +433,9 @@ GROUP BY 2, 3, 4, 6
             query = query.where(billingevent_src.workspace == workspace)
 
         if account is not None:
-            query = query.join(
-                WorkspaceAccount, WorkspaceAccount.workspace == billingevent_src.workspace
-            ).where(WorkspaceAccount.account == account)
+            query = query.join(WorkspaceAccount, WorkspaceAccount.workspace == billingevent_src.workspace).where(
+                WorkspaceAccount.account == account
+            )
 
         if start is not None:
             query = query.where(billingevent_src.event_start >= start)
@@ -500,9 +489,9 @@ GROUP BY 2, 3, 4, 6
     def find_latest_billing_event(
         cls,
         session: Session,
-        workspace: Optional[str],
-        sku: Optional[str],
-    ) -> Optional[Self]:
+        workspace: str | None,
+        sku: str | None,
+    ) -> Self | None:
         """
         Returns the most recent BillingEvent, optionally constrained by workspace and item.
         """
@@ -517,9 +506,7 @@ GROUP BY 2, 3, 4, 6
         return session.execute(query).scalar_one_or_none()
 
     @classmethod
-    def insert_from_message(
-        cls, session: Session, msg: eodhp_utils.pulsar.messages.BillingEvent
-    ) -> Optional[UUID]:
+    def insert_from_message(cls, session: Session, msg: eodhp_utils.pulsar.messages.BillingEvent) -> UUID | None:
         """
         Adds a new BillingEvent to the DB based on a Pulsar message.
 
@@ -528,13 +515,11 @@ GROUP BY 2, 3, 4, 6
         result = session.execute(
             insert(cls)
             .values(
-                uuid=UUID(msg.uuid),
-                event_start=datetime_default_to_utc(datetime.fromisoformat(msg.event_start)),
-                event_end=datetime_default_to_utc(datetime.fromisoformat(msg.event_end)),
-                item_id=select(BillingItem.uuid)
-                .where(BillingItem.sku == msg.sku)
-                .scalar_subquery(),
-                user=UUID(msg.user) if msg.user else None,
+                uuid=UUID(str(msg.uuid)),
+                event_start=datetime_default_to_utc(datetime.fromisoformat(str(msg.event_start))),
+                event_end=datetime_default_to_utc(datetime.fromisoformat(str(msg.event_end))),
+                item_id=select(BillingItem.uuid).where(BillingItem.sku == msg.sku).scalar_subquery(),
+                user=UUID(str(msg.user)) if msg.user else None,
                 workspace=msg.workspace,
                 quantity=msg.quantity,
             )
@@ -544,7 +529,7 @@ GROUP BY 2, 3, 4, 6
 
         return result.scalar_one_or_none()
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             "BillingEvent("
             + f"{self.uuid=}, "
@@ -582,7 +567,7 @@ class BillableResourceConsumptionRateSample(Base):
     item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
     item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
 
-    user: Mapped[Optional[UUID]]  # This is None for, for example, workspace storage.
+    user: Mapped[UUID | None]  # This is None for, for example, workspace storage.
     workspace: Mapped[str]
 
     # The units of this are defined in the BillingItem and divided by seconds.
@@ -590,13 +575,13 @@ class BillableResourceConsumptionRateSample(Base):
     rate: Mapped[float]
 
     @property
-    def sample_time_utc(self):
+    def sample_time_utc(self) -> datetime:
         # In PostgreSQL we always have a sample_time with a timezone attached and it should always
         # be UTC. In SQLite, used for tests, we get datetimes with no timezone, creating problems
         # when we do comparisons.
         #
         # This harmonizes this.
-        return self.sample_time.astimezone(timezone.utc)
+        return self.sample_time.astimezone(UTC)
 
     __table_args__ = (
         Index(
@@ -609,16 +594,14 @@ class BillableResourceConsumptionRateSample(Base):
     @classmethod
     def insert_from_message(
         cls, session: Session, msg: eodhp_utils.pulsar.messages.BillingResourceConsumptionRateSample
-    ) -> Optional[UUID]:
+    ) -> UUID | None:
         result = session.execute(
             insert(cls)
             .values(
-                uuid=UUID(msg.uuid),
-                sample_time=datetime_default_to_utc(datetime.fromisoformat(msg.sample_time)),
-                item_id=(
-                    select(BillingItem.uuid).where(BillingItem.sku == msg.sku).scalar_subquery()
-                ),
-                user=UUID(msg.user) if msg.user else None,
+                uuid=UUID(str(msg.uuid)),
+                sample_time=datetime_default_to_utc(datetime.fromisoformat(str(msg.sample_time))),
+                item_id=(select(BillingItem.uuid).where(BillingItem.sku == msg.sku).scalar_subquery()),
+                user=UUID(str(msg.user)) if msg.user else None,
                 workspace=msg.workspace,
                 rate=msg.rate,
             )
@@ -674,7 +657,7 @@ class BillableResourceConsumptionRateSample(Base):
     @classmethod
     def calculate_consumption_for_interval(
         cls, session: Session, workspace: str, sku: str, start: datetime, end: datetime
-    ) -> Optional[float]:
+    ) -> float | None:
         """
         This calculates estimated consumption within a time interval, using linear interpolation
         to estimate consumption rates from samples and then (effectively) integrating.
@@ -697,13 +680,11 @@ class BillableResourceConsumptionRateSample(Base):
 
         # We need an estimate of consumption rate at the start and end of the interval.
         # We use interpolation.
-        def interpolate(at: datetime, s0, s1):
+        def interpolate(at: datetime, s0: Self, s1: Self) -> float:
             assert at >= s0.sample_time_utc
             assert at <= s1.sample_time_utc
 
-            proportion: float = (at - s0.sample_time_utc) / (
-                s1.sample_time_utc - s0.sample_time_utc
-            )
+            proportion: float = (at - s0.sample_time_utc) / (s1.sample_time_utc - s0.sample_time_utc)
 
             return s0.rate + proportion * (s1.rate - s0.rate)
 
@@ -724,9 +705,7 @@ class BillableResourceConsumptionRateSample(Base):
             # this happened exactly at the last sample.
             RateTime(at=rate_samples[-1].seconds_after(start), rate=0)
             if rate_samples[-1].sample_time_utc < end
-            else RateTime(
-                at=(end - start).seconds, rate=interpolate(end, rate_samples[-2], rate_samples[-1])
-            )
+            else RateTime(at=(end - start).seconds, rate=interpolate(end, rate_samples[-2], rate_samples[-1]))
         )
 
         mid_samples = filter(lambda s: s.after(start) and not s.after(end), rate_samples)
@@ -734,12 +713,12 @@ class BillableResourceConsumptionRateSample(Base):
 
         # Form a list of RateTimes tuples covering exactly the window, clipped to a shorter period
         # only if we've assumed the resource was created/destroyed during the window.
-        ratelist: list[RateTime] = [starting_ratetime] + list(mid_ratetimes) + [ending_ratetime]
+        ratelist: list[RateTime] = [starting_ratetime, *mid_ratetimes, ending_ratetime]
 
         # Now imagine a linear interpolation between the points in ratelist being integrated to
         # produce our answer.
         total_consumption: float = 0.0
-        for s0, s1 in zip(ratelist, ratelist[1:], strict=False):
+        for s0, s1 in itertools.pairwise(ratelist):
             assert s1.at >= s0.at
 
             duration = s1.at - s0.at
@@ -752,9 +731,9 @@ class BillableResourceConsumptionRateSample(Base):
     def find_earliest(
         cls,
         session: Session,
-        workspace: Optional[str],
-        item_id: Optional[UUID],
-    ) -> Optional[Self]:
+        workspace: str | None,
+        item_id: UUID | None,
+    ) -> Self | None:
         """
         Returns the first observed sample for the given constraints.
         """
@@ -774,7 +753,7 @@ class BillableResourceConsumptionRateSample(Base):
     def after(self, t: datetime) -> bool:
         return self.sample_time_utc > t
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             "BillableResourceConsumptionRateSample("
             + f"{self.uuid=}, "

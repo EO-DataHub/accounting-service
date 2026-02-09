@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Iterator
 from typing import TextIO
 
 import yaml
@@ -12,22 +13,22 @@ from accounting_service.db_settings import connect_args, get_db_url
 engine = create_engine(get_db_url(), connect_args=connect_args)
 
 
-def create_db_and_tables():
+def create_db_and_tables() -> None:
     with engine.begin() as conn:
         models.Base.metadata.create_all(conn)
 
 
-def drop_tables():
+def drop_tables() -> None:
     with engine.begin() as conn:
         models.Base.metadata.drop_all(conn)
 
 
-def get_session():
+def get_session() -> Iterator[Session]:
     with Session(engine) as session:
         yield session
 
 
-def insert_configuration(config: TextIO):
+def insert_configuration(config: TextIO) -> None:
     """
     This updates the database of prices and items based on the configuration given.
 

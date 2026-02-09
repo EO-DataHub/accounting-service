@@ -1,16 +1,14 @@
-from typing import Optional
-
 from pydantic_settings import BaseSettings
 from sqlalchemy import URL
 
 
 class Settings(BaseSettings):
     SQL_DRIVER: str = "sqlite+pysqlite"
-    SQL_PORT: Optional[int] = None
-    SQL_PASSWORD: Optional[str] = None
-    SQL_USER: Optional[str] = None
+    SQL_PORT: int | None = None
+    SQL_PASSWORD: str | None = None
+    SQL_USER: str | None = None
     SQL_DATABASE: str = "accounting"
-    SQL_HOST: Optional[str] = None
+    SQL_HOST: str | None = None
     SQL_SCHEMA: str = "public"
 
     class Config:
@@ -38,5 +36,5 @@ else:
     connect_args = {}
 
 
-def is_sqlite():
+def is_sqlite() -> bool:
     return settings.SQL_DRIVER.startswith("sqlite")

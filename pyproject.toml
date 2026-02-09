@@ -3,50 +3,23 @@ name = "accounting-service"
 dynamic = ["version"]
 description = "A service which receives, records and serves accounting and price information in EODH"
 readme = "README.md"
-
-# Our target version is Python 3.13, but it may work with 3.12.
-requires-python = ">=3.12"
-
+requires-python = ">=3.13,<3.14"
 license = {file = "LICENSE"}
-
-# This should be your name or the name of the organization who originally
-# authored the project, and a valid email address corresponding to the name
-# listed.
 authors = [
   {name = "Telespazio UK Ltd", email = "alex.hayward@telespazio.com" }
 ]
-
 maintainers = [
   {name = "Telespazio UK Ltd", email = "alex.hayward@telespazio.com" }
 ]
-
-# Classifiers help users find your project by categorizing it.
-#
-# For a list of valid classifiers, see https://pypi.org/classifiers/
 classifiers = [
-  # How mature is this project? Common values are
-  #   3 - Alpha
-  #   4 - Beta
-  #   5 - Production/Stable
   "Development Status :: 3 - Alpha",
-
-  # Indicate who your project is intended for
   "Intended Audience :: Science/Research",
   "Intended Audience :: Developers",
-
   "License :: OSI Approved :: Apache Software License",
-
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3 :: Only",
 ]
-
-# This field lists other packages that your project depends on to run.
-# Any package you put here will be installed by pip when your project is
-# installed, so they must be valid existing projects.
-#
-# For an analysis of this field vs pip's requirements files see:
-# https://packaging.python.org/discussions/install-requires-vs-requirements/
 dependencies = [
   "pulsar-client",
   "fastapi[standard]",
@@ -57,105 +30,73 @@ dependencies = [
   "click",
   "opentelemetry-instrumentation-fastapi",
   "pyjwt",
-  "eodhp-utils @ git+https://github.com/UKEODHP/eodhp-utils@v0.1.8",
+  "eodhp-utils",
 ]
 
-# List additional groups of dependencies here (e.g. development
-# dependencies). Users will be able to install these using the "extras"
-# syntax, for example:
-#
-#   $ pip install sampleproject[dev]
-#
-# Similar to `dependencies` above, these must be valid existing
-# projects.
-[project.optional-dependencies] # Optional
+[dependency-groups]
 dev = [
-  "pip-tools", 
-  "pytest",
-  "pytest-xdist",
-  "pytest-mock",
-  "pytest-watcher",
-  "black",
-  "ruff",
-  "isort",
-  "validate-pyproject[all]",
-  "pre-commit",
-  "faker",
-  "httpx",
-  "pyjwt",
+    "pre-commit",
+    "pyright",
+    "pytest",
+    "pytest-mock",
+    "pytest-watcher",
+    "pytest-xdist",
+    "ruff",
+    "validate-pyproject",
+    "faker",
+    "httpx",
 ]
 
-# List URLs that are relevant to your project
-#
-# This field corresponds to the "Project-URL" and "Home-Page" metadata fields:
-# https://packaging.python.org/specifications/core-metadata/#project-url-multiple-use
-# https://packaging.python.org/specifications/core-metadata/#home-page-optional
-#
-# Examples listed include a pattern for specifying where the package tracks
-# issues, where the source is hosted, where to say thanks to the package
-# maintainers, and where to support the project financially. The key is
-# what's used to render the link text on PyPI.
-[project.urls]  # Optional
+[project.urls]
 homepage = "https://github.com/EO-DataHub/"
 repository = "https://github.com/EO-DataHub/accounting-service"
 changelog = "https://github.com/EO-DataHub/accounting-service/blob/main/CHANGELOG.md"
 
 [build-system]
-# These are the assumed default build requirements from pip:
-# https://pip.pypa.io/en/stable/reference/pip/#pep-517-and-518-support
-requires = ["setuptools>=69.0.0", "wheel", "setuptools-git-versioning>=2.0,<3"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling", "uv-dynamic-versioning"]
+build-backend = "hatchling.build"
 
-[tool.setuptools-git-versioning]
-enabled = true
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[tool.uv-dynamic-versioning]
+fallback-version = "0.0.0"
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+eodhp-utils = { git = "https://github.com/UKEODHP/eodhp-utils", tag = "v0.1.8" }
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+addopts = ["--import-mode=importlib"]
 markers = [
   "integrationtest: Integration test"
 ]
 
-[tool.setuptools]
-packages = ["accounting_service"]
-
-[tool.black]
-line-length = 100
-target-version = ['py313']
-
 [tool.ruff]
-line-length = 110
-target-version = "py313"
-lint.select = ["E", "F", "B", "W"]
+line-length = 119
 
-exclude = [
-    ".bzr",
-    ".direnv",
-    ".eggs",
-    ".git",
-    ".git-rewrite",
-    ".hg",
-    ".mypy_cache",
-    ".nox",
-    ".pants.d",
-    ".pytype",
-    ".ruff_cache",
-    ".svn",
-    ".tox",
-    ".venv",
-    "__pypackages__",
-    "_build",
-    "buck-out",
-    "build",
-    "dist",
-    "node_modules",
-    "venv",
+[tool.ruff.lint]
+select = [
+    "E",    # Pycodestyle errors
+    "W",    # Pycodestyle warnings
+    "F",    # Pyflakes
+    "I",    # isort
+    "FAST", # FastAPI
+    "RUF",  # RUF-specific rules
+    "SIM",  # Simplifications
+    "B",    # Bugbear
+    "ANN",  # Annotations
+    "PLC",  # Pylint convention
+    "PLE",  # Pylint errors
+    "UP",   # pyupgrade
+    "FURB", # refurb
+    "PT",   # pytest
 ]
-
-[tool.pylint.'MESSAGES CONTROL']
-disable = '''
-    line-too-long,
-    missing-class-docstring, 
-    too-many-locals, 
-    too-many-instance-attributes,
-    logging-fstring-interpolation,
-'''
+ignore = [
+    "E501",   # line too long
+    "SIM108", # ternary operator
+    "SIM103", # return bool directly
+    "B008"    # function call in default argument (incompatible with FastAPI)
+]

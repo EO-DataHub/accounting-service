@@ -2,6 +2,7 @@ import pprint
 import uuid
 from datetime import datetime
 from http import HTTPStatus
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -9,12 +10,13 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete
 from sqlalchemy.orm.session import Session
 
-from accounting_service import app, models
+from accounting_service import models
+from accounting_service.app import app as app_module
 from tests.test_models import gen_billingitem_data
 
 
 # Mock function for decode_jwt_token
-def mock_decode_jwt_token(authorization: str):
+def mock_decode_jwt_token(authorization: str) -> dict[str, Any]:
     return {
         "workspaces": ["workspace1", "workspace2"],
         "workspaces_owned": ["workspace2"],
@@ -22,13 +24,11 @@ def mock_decode_jwt_token(authorization: str):
     }
 
 
-def test_workspace_usage_data_returns_correct_items_from_db(
-    db_session: Session, client: TestClient
-):
+def test_workspace_usage_data_returns_correct_items_from_db(db_session: Session, client: TestClient) -> None:
     ############# Setup
     db_session.execute(delete(models.BillingEvent))
     uid = uuid.uuid4()
-    event_uuids, account_uuids, item_uuids = gen_billingitem_data(
+    event_uuids, _account_uuids, _item_uuids = gen_billingitem_data(
         db_session,
         [
             {
@@ -47,8 +47,7 @@ def test_workspace_usage_data_returns_correct_items_from_db(
     )
 
     ############# Test
-    with patch.object(app.app, "decode_jwt_token", mock_decode_jwt_token):
-
+    with patch.object(app_module, "decode_jwt_token", mock_decode_jwt_token):
         mock_token = "your_mock_jwt_token_here"
 
         response = client.get(
@@ -70,10 +69,10 @@ def test_workspace_usage_data_returns_correct_items_from_db(
         ]
 
 
-def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestClient):
+def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestClient) -> None:
     ############# Setup
     db_session.execute(delete(models.BillingEvent))
-    event_uuids, account_uuids, item_uuids = gen_billingitem_data(
+    _event_uuids, _account_uuids, _item_uuids = gen_billingitem_data(
         db_session,
         [
             {
@@ -100,7 +99,7 @@ def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestC
     )
 
     ############# Test
-    with patch.object(app.app, "decode_jwt_token", mock_decode_jwt_token):
+    with patch.object(app_module, "decode_jwt_token", mock_decode_jwt_token):
         mock_token = "your_mock_jwt_token_here"
 
         response_page1 = client.get(
@@ -124,16 +123,12 @@ def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestC
         assert len(page2) == 1
 
         # Results should always be in ascending time order.
-        assert datetime.fromisoformat(page1[0]["event_start"]) < datetime.fromisoformat(
-            page1[1]["event_start"]
-        )
-        assert datetime.fromisoformat(page1[1]["event_start"]) < datetime.fromisoformat(
-            page2[0]["event_start"]
-        )
+        assert datetime.fromisoformat(page1[0]["event_start"]) < datetime.fromisoformat(page1[1]["event_start"])
+        assert datetime.fromisoformat(page1[1]["event_start"]) < datetime.fromisoformat(page2[0]["event_start"])
 
 
-def test_page_after_unknown_event_produces_404(db_session: Session, client: TestClient):
-    with patch.object(app.app, "decode_jwt_token", mock_decode_jwt_token):
+def test_page_after_unknown_event_produces_404(db_session: Session, client: TestClient) -> None:
+    with patch.object(app_module, "decode_jwt_token", mock_decode_jwt_token):
         mock_token = "your_mock_jwt_token_here"
 
         response = client.get(
@@ -145,7 +140,7 @@ def test_page_after_unknown_event_produces_404(db_session: Session, client: Test
 
 
 @pytest.mark.parametrize(
-    "aggregation,page_size,results",
+    ("aggregation", "page_size", "results"),
     [
         pytest.param(
             "",
@@ -218,11 +213,11 @@ def test_page_after_unknown_event_produces_404(db_session: Session, client: Test
     ],
 )
 def test_workspace_usage_data_correctly_time_aggregated(
-    db_session: Session, client: TestClient, aggregation, page_size, results
-):
+    db_session: Session, client: TestClient, aggregation: str, page_size: int, results: list[list[dict[str, Any]]]
+) -> None:
     ############# Setup
     db_session.execute(delete(models.BillingEvent))
-    event_uuids, account_uuids, item_uuids = gen_billingitem_data(
+    _event_uuids, _account_uuids, _item_uuids = gen_billingitem_data(
         db_session,
         [
             {
@@ -280,7 +275,7 @@ def test_workspace_usage_data_correctly_time_aggregated(
     db_session.flush()
 
     ############# Test
-    with patch.object(app.app, "decode_jwt_token", mock_decode_jwt_token):
+    with patch.object(app_module, "decode_jwt_token", mock_decode_jwt_token):
         mock_token = "your_mock_jwt_token_here"
 
         response_pages = []
@@ -317,7 +312,7 @@ def test_workspace_usage_data_correctly_time_aggregated(
                 assert response_json[i]["event_start"] == expected_json[i]["event_start"]
 
 
-def test_account_usage_data_returns_correct_items_from_db(db_session: Session, client: TestClient):
+def test_account_usage_data_returns_correct_items_from_db(db_session: Session, client: TestClient) -> None:
     ############# Setup
     db_session.execute(delete(models.BillingEvent))
 
@@ -326,7 +321,7 @@ def test_account_usage_data_returns_correct_items_from_db(db_session: Session, c
     db_session.add(models.WorkspaceAccount(workspace="workspace3", account=account_uuid))
 
     uid = uuid.uuid4()
-    event_uuids, account_uuids, item_uuids = gen_billingitem_data(
+    event_uuids, _account_uuids, _item_uuids = gen_billingitem_data(
         db_session,
         [
             {
@@ -351,7 +346,7 @@ def test_account_usage_data_returns_correct_items_from_db(db_session: Session, c
     )
 
     ############# Test
-    with patch.object(app.app, "decode_jwt_token", mock_decode_jwt_token):
+    with patch.object(app_module, "decode_jwt_token", mock_decode_jwt_token):
         mock_token = "your_mock_jwt_token_here"
         response = client.get(
             f"/accounts/{account_uuid}/accounting/usage-data",
@@ -381,7 +376,7 @@ def test_account_usage_data_returns_correct_items_from_db(db_session: Session, c
         ]
 
 
-def test_skus_list_api_returns_items_correctly(db_session: Session, client: TestClient):
+def test_skus_list_api_returns_items_correctly(db_session: Session, client: TestClient) -> None:
     ############# Setup
     db_session.execute(delete(models.BillingEvent))
     db_session.execute(delete(models.BillingItem))
@@ -405,7 +400,7 @@ def test_skus_list_api_returns_items_correctly(db_session: Session, client: Test
     ]
 
 
-def test_skus_api_returns_item_correctly(db_session: Session, client: TestClient):
+def test_skus_api_returns_item_correctly(db_session: Session, client: TestClient) -> None:
     ############# Setup
     db_session.execute(delete(models.BillingEvent))
     db_session.execute(delete(models.BillingItem))
@@ -427,7 +422,7 @@ def test_skus_api_returns_item_correctly(db_session: Session, client: TestClient
     }
 
 
-def test_skus_api_returns_404_for_unknown_item(db_session: Session, client: TestClient):
+def test_skus_api_returns_404_for_unknown_item(db_session: Session, client: TestClient) -> None:
     ############# Test
     response = client.get("/accounting/skus/nonexistent-sku")
 
@@ -436,7 +431,7 @@ def test_skus_api_returns_404_for_unknown_item(db_session: Session, client: Test
     assert response.json() == {"detail": "SKU not known"}
 
 
-def test_prices_api_returns_current_prices_correctly(db_session: Session, client: TestClient):
+def test_prices_api_returns_current_prices_correctly(db_session: Session, client: TestClient) -> None:
     ############# Setup
     db_session.execute(delete(models.BillingItemPrice))
 

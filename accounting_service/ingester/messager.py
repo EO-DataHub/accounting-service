@@ -1,7 +1,7 @@
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Sequence
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from eodhp_utils.messagers import Messager, PulsarJSONMessager
@@ -13,19 +13,19 @@ from accounting_service import db, models
 
 
 class DBIngester:
-    def is_temporary_error(self, e: Exception):
+    def is_temporary_error(self, e: Exception) -> bool:
         if isinstance(e, OperationalError):
             return True
 
         return False
 
-    def _add_observed_sku(self, msg):
+    def _add_observed_sku(self, msg: messages.BillingEvent | messages.BillingResourceConsumptionRateSample) -> None:
         with Session(db.engine) as session:
-            models.BillingItem.ensure_sku_exists(session, msg.sku)
+            models.BillingItem.ensure_sku_exists(session, str(msg.sku))
             session.commit()
 
 
-def truncate_to_hour(dt: datetime):
+def truncate_to_hour(dt: datetime) -> datetime:
     return dt.replace(minute=0, second=0, microsecond=0)
 
 
@@ -35,9 +35,9 @@ class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.Billing
     accounting DB.
     """
 
-    def process_payload(self, bemsg: messages.BillingEvent) -> Sequence[Messager.Action]:
+    def process_payload(self, obj: messages.BillingEvent) -> Sequence[Messager.Action]:
         try:
-            uuid = self._try_record_event(bemsg)
+            uuid = self._try_record_event(obj)
         except IntegrityError:
             # This is /probably/ because the SKU in the message is unknown.
             #
@@ -45,20 +45,20 @@ class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.Billing
             # create an empty item. This can be corrected later by an admin.
             logging.exception(
                 "IntegrityError recording BillingEvent with sku %s - assuming missing BillingItem",
-                bemsg.sku,
+                obj.sku,
             )
 
-            self._add_observed_sku(bemsg)
-            uuid = self._try_record_event(bemsg)
+            self._add_observed_sku(obj)
+            uuid = self._try_record_event(obj)
 
         if uuid:
             logging.debug("Recorded BillingEvent with uuid %s", str(uuid))
         else:
-            logging.info("Received duplicate BillingEvent uuid %s", bemsg.uuid)
+            logging.info("Received duplicate BillingEvent uuid %s", obj.uuid)
 
         return []
 
-    def _try_record_event(self, bemsg: messages.BillingEvent) -> Optional[UUID]:
+    def _try_record_event(self, bemsg: messages.BillingEvent) -> UUID | None:
         with Session(db.engine) as session:
             uuid = models.BillingEvent.insert_from_message(session, bemsg)
             session.commit()
@@ -66,20 +66,16 @@ class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.Billing
         return uuid
 
 
-class WorkspaceSettingsIngesterMessager(
-    DBIngester, PulsarJSONMessager[messages.WorkspaceSettings, bytes]
-):
-    def process_payload(self, wsmsg: messages.WorkspaceSettings) -> Sequence[Messager.Action]:
+class WorkspaceSettingsIngesterMessager(DBIngester, PulsarJSONMessager[messages.WorkspaceSettings, bytes]):
+    def process_payload(self, obj: messages.WorkspaceSettings) -> Sequence[Messager.Action]:
         with Session(db.engine) as session:
-            recorded = models.WorkspaceAccount.record_mapping(
-                session, UUID(wsmsg.account), wsmsg.name
-            )
+            recorded = models.WorkspaceAccount.record_mapping(session, UUID(str(obj.account)), str(obj.name))
             session.commit()
 
         if recorded:
-            logging.info("Associated workspace %s with account %s", wsmsg.name, wsmsg.account)
+            logging.info("Associated workspace %s with account %s", obj.name, obj.account)
         else:
-            logging.debug("Ignoring WorkspaceSettings for %s, already known", wsmsg.name)
+            logging.debug("Ignoring WorkspaceSettings for %s, already known", obj.name)
 
         return []
 
@@ -92,10 +88,8 @@ class ConsumptionSampleRateIngesterMessager(
     the accounting DB. It also converts them to estimated BillingEvents periodically.
     """
 
-    def process_payload(
-        self, msg: messages.BillingResourceConsumptionRateSample
-    ) -> Sequence[Messager.Action]:
-        self._record_event(msg)
+    def process_payload(self, obj: messages.BillingResourceConsumptionRateSample) -> Sequence[Messager.Action]:
+        self._record_event(obj)
 
         # We must convert previously recorded consumption rate data into billing events.
         # We do this in one hour windows.
@@ -108,13 +102,13 @@ class ConsumptionSampleRateIngesterMessager(
         # To prevent this the relevant collector should listen for resource deletion events
         # from Pulsar and generate zero rate messages at that timepoint and an hour later.
         # None do this at present, but deletion is currently rare.
-        msg_datetime = datetime.fromisoformat(msg.sample_time).astimezone(timezone.utc)
+        msg_datetime = datetime.fromisoformat(str(obj.sample_time)).astimezone(UTC)
         generate_upto = truncate_to_hour(msg_datetime)
-        self._generate_new_estimates(msg.workspace, msg.sku, generate_upto)
+        self._generate_new_estimates(str(obj.workspace), str(obj.sku), generate_upto)
 
         return []
 
-    def _record_event(self, msg: messages.BillingResourceConsumptionRateSample):
+    def _record_event(self, msg: messages.BillingResourceConsumptionRateSample) -> None:
         try:
             uuid = self._try_record_event(msg)
         except IntegrityError:
@@ -132,9 +126,7 @@ class ConsumptionSampleRateIngesterMessager(
         else:
             logging.info("Received duplicate %s uuid %s", type(msg), msg.uuid)
 
-    def _try_record_event(
-        self, msg: messages.BillingResourceConsumptionRateSample
-    ) -> Optional[UUID]:
+    def _try_record_event(self, msg: messages.BillingResourceConsumptionRateSample) -> UUID | None:
         with Session(db.engine) as session:
             uuid = models.BillableResourceConsumptionRateSample.insert_from_message(session, msg)
             session.commit()
@@ -142,7 +134,7 @@ class ConsumptionSampleRateIngesterMessager(
         return uuid
 
     @staticmethod
-    def _generate_new_estimates(workspace, sku, upto):
+    def _generate_new_estimates(workspace: str, sku: str, upto: datetime) -> None:
         """
         This generates BillingEvents with estimated resource consumption for one hour windows, each
         starting on the hour. The first will begin at the end time of the last generated
@@ -192,14 +184,12 @@ class ConsumptionSampleRateIngesterMessager(
                     generate_from,
                     generate_to,
                 )
-                consumption = (
-                    models.BillableResourceConsumptionRateSample.calculate_consumption_for_interval(
-                        session,
-                        workspace,
-                        sku,
-                        generate_from,
-                        generate_to,
-                    )
+                consumption = models.BillableResourceConsumptionRateSample.calculate_consumption_for_interval(
+                    session,
+                    workspace,
+                    sku,
+                    generate_from,
+                    generate_to,
                 )
 
                 session.add(

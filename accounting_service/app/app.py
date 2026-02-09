@@ -1,8 +1,9 @@
 import logging
 import os
-from datetime import datetime, timezone
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from http import HTTPStatus
-from typing import Annotated, Iterator, List, Optional
+from typing import Annotated, Any
 from uuid import UUID
 
 import jwt
@@ -74,9 +75,7 @@ class BillingEventAPIResult(BaseModel):
         Field(description="End time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
     ]
     item: Annotated[str, Field(description="Item (SKU) consumed", examples=["wfcpu"])]
-    workspace: Annotated[
-        str, Field(description="Workspace which consumed the resource", examples=["my-workspace"])
-    ]
+    workspace: Annotated[str, Field(description="Workspace which consumed the resource", examples=["my-workspace"])]
     quantity: Annotated[
         float,
         Field(
@@ -86,7 +85,7 @@ class BillingEventAPIResult(BaseModel):
     ]
 
 
-def billingevent_to_api_object(event: BillingEvent):
+def billingevent_to_api_object(event: BillingEvent) -> dict[str, Any]:
     return {
         "uuid": event.uuid,
         "event_start": event.event_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -117,7 +116,7 @@ class BillingItemAPIResult(BaseModel):
     unit: Annotated[str, Field(description="Unit the item is priced in", examples=["GB-months"])]
 
 
-def billingitem_to_api_object(item: BillingItem):
+def billingitem_to_api_object(item: BillingItem) -> dict[str, str]:
     return {
         "uuid": str(item.uuid),
         "sku": item.sku,
@@ -135,9 +134,7 @@ class BillingItemPriceAPIResult(BaseModel):
     uuid: UUID
     sku: Annotated[str, Field(description="The product this applies to", examples=["wfcpu"])]
     valid_from: datetime
-    valid_until: Annotated[
-        Optional[datetime], Field(description="Price was in-force until this time")
-    ] = None
+    valid_until: Annotated[datetime | None, Field(description="Price was in-force until this time")] = None
     price: Annotated[float, Field(description="Price-per-unit in Pounds", examples=["0.001"])]
 
 
@@ -155,17 +152,17 @@ def billingitemprice_to_api_object(price: Row[tuple[BillingItemPrice, str]]) -> 
     return result
 
 
-def add_usage_data_headers(response: Response):
+def add_usage_data_headers(response: Response) -> None:
     response.headers["Vary"] = "Cookie,Authorization,Accept-Encoding"
     response.headers["Cache-Control"] = "private,max-age=5"
 
 
-def add_global_data_headers(response: Response):
+def add_global_data_headers(response: Response) -> None:
     response.headers["Vary"] = "Accept-Encoding"
     response.headers["Cache-Control"] = "private,max-age=300"
 
 
-def decode_jwt_token(authorization: Optional[str] = Header(...)):
+def decode_jwt_token(authorization: str | None = Header(...)) -> dict[str, Any]:
     if authorization is None:
         raise HTTPException(status_code=400, detail="Authorization header missing")
 
@@ -179,8 +176,8 @@ def decode_jwt_token(authorization: Optional[str] = Header(...)):
 
 
 def workspace_authz(
-    workspace: str, token_payload: dict, require_owner: bool = False, allow_hub_admin: bool = False
-):
+    workspace: str, token_payload: dict[str, Any], require_owner: bool = False, allow_hub_admin: bool = False
+) -> str:
     workspaces = token_payload.get("workspaces", [])
     owned = token_payload.get("workspaces_owned", [])
     roles = token_payload["realm_access"].get("roles", [])
@@ -201,7 +198,7 @@ def workspace_authz(
     return workspace
 
 
-def account_authz(account_id: UUID, token_payload: dict, allow_hub_admin: bool = False):
+def account_authz(account_id: UUID, token_payload: dict[str, Any], allow_hub_admin: bool = False) -> UUID:
     billing_accounts = token_payload.get("billing-accounts", [])
     roles = token_payload["realm_access"].get("roles", [])
 
@@ -218,7 +215,7 @@ def account_authz(account_id: UUID, token_payload: dict, allow_hub_admin: bool =
 
 @app.get(
     "/workspaces/{workspace}/accounting/usage-data",
-    response_model=List[BillingEventAPIResult],
+    response_model=list[BillingEventAPIResult],
     summary="Get resource consumption data for a workspace",
 )
 def get_workspace_usage_data(
@@ -234,7 +231,7 @@ def get_workspace_usage_data(
         ),
     ],
     start: Annotated[
-        Optional[datetime],
+        datetime | None,
         Query(
             title="Start timestamp (RFC8601 timestamp)",
             description="Only billing events which ended after this time are included",
@@ -242,7 +239,7 @@ def get_workspace_usage_data(
         ),
     ] = None,
     end: Annotated[
-        Optional[datetime],
+        datetime | None,
         Query(
             title="End timestamp (RFC8601 timestamp)",
             description="Only billing events which started before this time are included",
@@ -250,18 +247,15 @@ def get_workspace_usage_data(
         ),
     ] = None,
     limit: Annotated[
-        Optional[int],
+        int | None,
         Query(
             title="Maximum number of results to return",
-            description=(
-                "When paging, set this to the page size and use 'after' to fetch "
-                + "subsequent pages"
-            ),
+            description=("When paging, set this to the page size and use 'after' to fetch " + "subsequent pages"),
             examples=["200"],
         ),
     ] = 100,
     after: Annotated[
-        Optional[UUID],
+        UUID | None,
         Query(
             title="Paging continuation location",
             description=(
@@ -272,18 +266,17 @@ def get_workspace_usage_data(
         ),
     ] = None,
     time_aggregation: Annotated[
-        Optional[str],
+        str | None,
         Query(
             alias="time-aggregation",
             title="Time aggregation of results",
             description=(
-                "Optionally aggregate usage information into totals for the given time periods - "
-                + "'day' or 'month'"
+                "Optionally aggregate usage information into totals for the given time periods - " + "'day' or 'month'"
             ),
             examples=["day", "month"],
         ),
     ] = None,
-):
+) -> list[dict[str, Any]]:
     """
     This returns resource consumption data for a workspace within some given time range (or all).
     Start and end times can be given in which case all consumption which overlaps this, even
@@ -324,7 +317,7 @@ def get_workspace_usage_data(
 
 @app.get(
     "/accounts/{account_id}/accounting/usage-data",
-    response_model=List[BillingEventAPIResult],
+    response_model=list[BillingEventAPIResult],
     summary="Get resource consumption data for all workspaces in a billing account",
 )
 def get_account_usage_data(
@@ -343,7 +336,7 @@ def get_account_usage_data(
         ),
     ],
     start: Annotated[
-        Optional[datetime],
+        datetime | None,
         Query(
             title="Start timestamp (RFC8601 timestamp)",
             description="Only billing events which ended after this time are included",
@@ -351,7 +344,7 @@ def get_account_usage_data(
         ),
     ] = None,
     end: Annotated[
-        Optional[datetime],
+        datetime | None,
         Query(
             title="End timestamp (RFC8601 timestamp)",
             description="Only billing events which started before this time are included",
@@ -359,18 +352,15 @@ def get_account_usage_data(
         ),
     ] = None,
     limit: Annotated[
-        Optional[int],
+        int | None,
         Query(
             title="Maximum number of results to return",
-            description=(
-                "When paging, set this to the page size and use 'after' to fetch "
-                + "subsequent pages"
-            ),
+            description=("When paging, set this to the page size and use 'after' to fetch " + "subsequent pages"),
             examples=["200"],
         ),
     ] = 100,
     after: Annotated[
-        Optional[UUID],
+        UUID | None,
         Query(
             title="Paging continuation location",
             description=(
@@ -381,18 +371,17 @@ def get_account_usage_data(
         ),
     ] = None,
     time_aggregation: Annotated[
-        Optional[str],
+        str | None,
         Query(
             alias="time-aggregation",
             title="Time aggregation of results",
             description=(
-                "Optionally ggregate usage information into totals for the given time periods - "
-                + "'day' or 'month'"
+                "Optionally aggregate usage information into totals for the given time periods - " + "'day' or 'month'"
             ),
             examples=["day", "month"],
         ),
     ] = None,
-):
+) -> list[dict[str, Any]]:
     """
     This returns resource consumption data for all workspaces billed to a specified account an
     within some given time range (or all).
@@ -435,9 +424,9 @@ def get_account_usage_data(
 @app.get(
     "/accounting/skus",
     summary="Describe available billing items (products / stock-keeping units).",
-    response_model=List[BillingItemAPIResult],
+    response_model=list[BillingItemAPIResult],
 )
-def get_item_list(session: SessionDep, response: Response):
+def get_item_list(session: SessionDep, response: Response) -> list[dict[str, str]]:
     """
     This returns all available billing items in SKU order. A billing item is a single 'product'
     sold by EO DataHub, such as CPU time or object storage. Note that prices must be fetched
@@ -453,14 +442,12 @@ def get_item_list(session: SessionDep, response: Response):
     summary="Describe a single billing item",
     response_model=BillingItemAPIResult,
 )
-def get_item(session: SessionDep, response: Response, sku: str):
+def get_item(session: SessionDep, response: Response, sku: str) -> dict[str, str]:
     """This returns a specific billing item based on its SKU."""
-    item: Optional[BillingItem] = BillingItem.find_billing_item(session, sku)
+    item: BillingItem | None = BillingItem.find_billing_item(session, sku)
 
     if item is None:
-        raise HTTPException(
-            status_code=404, detail="SKU not known", headers={"Cache-Control": "max-age=60"}
-        )
+        raise HTTPException(status_code=404, detail="SKU not known", headers={"Cache-Control": "max-age=60"})
     else:
         add_global_data_headers(response)
         return billingitem_to_api_object(item)
@@ -469,17 +456,15 @@ def get_item(session: SessionDep, response: Response, sku: str):
 @app.get(
     "/accounting/prices",
     summary="Return all current EO DataHub prices",
-    response_model=List[BillingItemPriceAPIResult],
+    response_model=list[BillingItemPriceAPIResult],
 )
-def get_prices(session: SessionDep, response: Response):
+def get_prices(session: SessionDep, response: Response) -> list[dict[str, Any]]:
     """
     This returns all current prices in SKU order. Prices which were only valid in the past or will
     be in the future are not returned. The cost is given in Pounds per unit, where the unit is
     defined in the billing item the price relates to.
     """
-    prices: Result[tuple[BillingItemPrice, str]] = BillingItemPrice.find_prices(
-        session, datetime.now(timezone.utc)
-    )
+    prices: Result[tuple[BillingItemPrice, str]] = BillingItemPrice.find_prices(session, datetime.now(UTC))
 
     add_global_data_headers(response)
     return list(map(billingitemprice_to_api_object, prices))
