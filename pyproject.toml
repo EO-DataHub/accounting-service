@@ -3,7 +3,7 @@ name = "accounting-service"
 dynamic = ["version"]
 description = "A service which receives, records and serves accounting and price information in EODH"
 readme = "README.md"
-requires-python = ">=3.13,<3.14"
+requires-python = ">=3.14,<3.15"
 license = {file = "LICENSE"}
 authors = [
   {name = "Telespazio UK Ltd", email = "alex.hayward@telespazio.com" }
