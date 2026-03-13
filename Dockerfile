@@ -1,5 +1,5 @@
-# syntax=docker/dockerfile:1
-FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim
+# syntax=docker/dockerfile:1@sha256:b6afd42430b15f2d2a4c5a02b919e98a525b785b1aaff16747d2f623364e39b6
+FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim@sha256:51eeabec8588bf3e6b1fbc6b0ee96e4b055c2aa8bd6301ec0aff8f2ad7a35eba
 
 RUN rm -f /etc/apt/apt.conf.d/docker-clean; \
     echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
