@@ -19,7 +19,7 @@ services:
       retries: 5
   
   pulsar:
-    image: apachepulsar/pulsar:4.0.10@sha256:d1015512935f91b2feb6728071a83441e04875b5bc3eca2f0f85e95b3fef50e0
+    image: apachepulsar/pulsar:4.2.1@sha256:951917ef3b285ccbcdb73c5fd75149406be74e89379485b4224df28d7f1cec87
     command: bin/pulsar standalone
     volumes:
       - pulsarconf:/pulsar/conf
