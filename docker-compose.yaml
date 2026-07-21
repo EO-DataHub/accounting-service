@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:17@sha256:de1e13ca94377fa5a27aafd0e9fc200df9692b15152f0090fdf074074ea5e397
+    image: postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d
     volumes:
       - db-data:/var/lib/postgresql/data
     environment:
@@ -19,7 +19,7 @@ services:
       retries: 5
   
   pulsar:
-    image: apachepulsar/pulsar:4.0.12@sha256:ff64bce17db6f667e78dc6b98c7faaf55cb500f65fd6ea594adf2454e450452a
+    image: apachepulsar/pulsar:4.2.3@sha256:71b014dd8a841469ad8f6c92053affdbc4b4a55361be919722d0c4896b480f39
     command: bin/pulsar standalone
     volumes:
       - pulsarconf:/pulsar/conf
