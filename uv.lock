@@ -35,7 +35,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click" },
-    { name = "eodhp-utils", git = "https://github.com/UKEODHP/eodhp-utils?tag=v0.1.13" },
+    { name = "eodhp-utils", git = "https://github.com/UKEODHP/eodhp-utils?tag=v0.1.14" },
     { name = "fastapi", extras = ["standard"] },
     { name = "opentelemetry-instrumentation-fastapi" },
     { name = "psycopg", extras = ["binary", "pool"] },
@@ -263,8 +263,8 @@ wheels = [
 
 [[package]]
 name = "eodhp-utils"
-version = "0.1.13"
-source = { git = "https://github.com/UKEODHP/eodhp-utils?tag=v0.1.13#ad6d2cdbfa45f4557898ea60249cb5f42a217dfd" }
+version = "0.1.14"
+source = { git = "https://github.com/UKEODHP/eodhp-utils?tag=v0.1.14#17593ff08601e8756a57605071636fd681f91870" }
 dependencies = [
     { name = "boto3" },
     { name = "botocore" },
