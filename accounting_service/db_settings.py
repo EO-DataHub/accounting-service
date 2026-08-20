@@ -11,8 +11,7 @@ class Settings(BaseSettings):
     SQL_HOST: str | None = None
     SQL_SCHEMA: str = "public"
 
-    class Config:
-        env_file = "./.env"
+    model_config = {"env_file": "./.env"}
 
 
 settings = Settings()

@@ -1,73 +1,106 @@
+name: accounting-service
+
+x-db-env: &db-env
+  SQL_DRIVER: postgresql+psycopg
+  SQL_HOST: db
+  SQL_PORT: "5432"
+  SQL_DATABASE: accounting
+  SQL_USER: accounting
+  SQL_PASSWORD: changeme
+  SQL_SCHEMA: public
+
+x-app: &app
+  build: .
+  image: accounting-service:latest
+  environment: *db-env
+  networks: [eodhp-net]
+  volumes:
+    # Only the package directory, so the image's /app/.venv survives the mount.
+    - ./accounting_service:/app/accounting_service:ro
+    # Migrations are mounted too, so a revision generated on the host applies
+    # without rebuilding the image. Read-only: generate revisions on the host,
+    # not inside the container.
+    - ./alembic:/app/alembic:ro
+    - ./alembic.ini:/app/alembic.ini:ro
+    - ./dev/accounting.conf:/etc/eodh/accounting.conf:ro
+
 services:
   db:
     image: postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d
     volumes:
       - db-data:/var/lib/postgresql/data
     environment:
-      - POSTGRES_PASSWORD=changeme
-      - POSTGRES_USER=accounting
-      - POSTGRES_DB=accounting
-    command: -c "listen_addresses=*"
-    networks:
-      - eodhp-net
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_USER: accounting
+      POSTGRES_DB: accounting
+    networks: [eodhp-net]
     ports:
-      - 5433:5432
+      # Published so host tools - psql, the PyCharm database view - can connect
+      # to localhost:5433 without going through a container.
+      - "5433:5432"
     healthcheck:
-      test: ["CMD", "su", "postgres", "-c", "psql template1 accounting -c 'SELECT 1;'"]
+      test: ["CMD-SHELL", "pg_isready -U accounting -d accounting"]
       interval: 5s
-      timeout: 10s
-      retries: 5
-  
+      timeout: 5s
+      retries: 10
+
+  # Runs once and exits. Both long-running services wait for it, so the schema
+  # never depends on which of them happens to be started. This mirrors the
+  # single migration runner the production deployment needs.
+  migrate:
+    <<: *app
+    command: ["uv", "run", "--no-sync", "alembic", "upgrade", "head"]
+    depends_on:
+      db: { condition: service_healthy }
+    restart: no
+
   pulsar:
+    # Behind a profile: API and schema work does not need it, and standalone
+    # Pulsar is slow to start and hungry for memory.
+    #   docker compose up                        -> db, migrate, api
+    #   docker compose --profile messaging up    -> everything
+    profiles: ["messaging"]
     image: apachepulsar/pulsar:4.2.4@sha256:cd5d4a64a32c0770d5d2dbb526169a70081605bbec4b59b73471b68d0a451fb4
     command: bin/pulsar standalone
     volumes:
-      - pulsarconf:/pulsar/conf
       - pulsardata:/pulsar/data
-    networks:
-      - eodhp-net
+    networks: [eodhp-net]
     ports:
-      - 6650:6650
-      - 8080:8080
+      - "6650:6650"
+      - "8080:8080"
+    healthcheck:
+      # If curl turns out to be missing from the image, this check never passes
+      # and the ingester never starts. The fallback is slower but has no
+      # dependencies: ["CMD-SHELL", "bin/pulsar-admin clusters list"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/admin/v2/clusters | grep -q standalone"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   ingester:
-    image: accounting-service:latest
-    command: python -m accounting_service.ingester --pulsar-url pulsar://pulsar
+    <<: *app
+    profiles: ["messaging"]
+    command: ["uv", "run", "--no-sync", "python", "-m", "accounting_service.ingester",
+              "--pulsar-url", "pulsar://pulsar:6650", "-vv"]
     depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      - SQL_DRIVER=postgresql+psycopg
-      - SQL_USER=accounting
-      - SQL_PASSWORD=changeme
-      - SQL_HOST=db
-      - SQL_PORT=5432
-      - SQL_SCHEMA=public
-    networks:
-      - eodhp-net
+      migrate: { condition: service_completed_successfully }
+      pulsar: { condition: service_healthy }
+    restart: unless-stopped
 
   api:
-    image: accounting-service:latest
-    command: fastapi run accounting_service/app/app.py
+    <<: *app
+    # 'fastapi dev' reloads on change, which the source mount above makes
+    # useful. It binds loopback by default, hence --host.
+    command: ["uv", "run", "--no-sync", "fastapi", "dev", "--host", "0.0.0.0",
+              "accounting_service/app/app.py"]
     depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      - SQL_DRIVER=postgresql+psycopg
-      - SQL_USER=accounting
-      - SQL_PASSWORD=changeme
-      - SQL_HOST=db
-      - SQL_PORT=5432
-      - SQL_SCHEMA=public
-    networks:
-      - eodhp-net
+      migrate: { condition: service_completed_successfully }
     ports:
-      - 8000:8000
+      - "8000:8000"
 
 networks:
   eodhp-net:
 
 volumes:
-  pulsarconf:
   pulsardata:
   db-data:
