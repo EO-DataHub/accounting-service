@@ -32,6 +32,7 @@ dependencies = [
     "opentelemetry-instrumentation-fastapi",
     "pyjwt",
     "eodhp-utils",
+    "pyyaml",
 ]
 
 [dependency-groups]

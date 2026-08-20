@@ -5,7 +5,7 @@ from collections import namedtuple
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Self
+from typing import Any, Self, cast
 from uuid import UUID, uuid4
 
 import eodhp_utils.pulsar.messages
@@ -257,7 +257,7 @@ class BillingItemPrice(Base):
             update(cls).where(cls.item == item_obj).where(cls.valid_from == valid_from).values(price=price["price"])
         )
 
-        if existing_prices_updated.rowcount > 0:
+        if cast(CursorResult, existing_prices_updated).rowcount > 0:
             return
 
         latest_price = (
@@ -701,13 +701,13 @@ class BillableResourceConsumptionRateSample(Base):
 
         # We need an estimate of consumption rate at the start and end of the interval.
         # We use interpolation.
-        def interpolate(at: datetime, s0: Self, s1: Self) -> float:
-            assert at >= s0.sample_time_utc
-            assert at <= s1.sample_time_utc
+        def interpolate(at: datetime, t0: Self, t1: Self) -> float:
+            assert at >= t0.sample_time_utc
+            assert at <= t1.sample_time_utc
 
-            proportion: float = (at - s0.sample_time_utc) / (s1.sample_time_utc - s0.sample_time_utc)
+            proportion: float = (at - t0.sample_time_utc) / (t1.sample_time_utc - t0.sample_time_utc)
 
-            return s0.rate + proportion * (s1.rate - s0.rate)
+            return t0.rate + proportion * (t1.rate - t0.rate)
 
         RateTime = namedtuple("RateTime", ["at", "rate"])
 
