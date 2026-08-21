@@ -33,6 +33,8 @@ dependencies = [
     "pyjwt",
     "eodhp-utils",
     "pyyaml",
+    "rich",
+    "rich-click",
 ]
 
 [dependency-groups]
@@ -53,6 +55,9 @@ dev = [
 homepage = "https://github.com/EO-DataHub/"
 repository = "https://github.com/EO-DataHub/accounting-service"
 changelog = "https://github.com/EO-DataHub/accounting-service/blob/main/CHANGELOG.md"
+
+[project.scripts]
+inject = "dev.inject:cli"
 
 [build-system]
 requires = ["hatchling", "uv-dynamic-versioning"]
