@@ -29,7 +29,6 @@ def cli(takeover: bool, verbose: int, config_file: str, pulsar_url: str | None =
     setup_logging(verbosity=verbose)
     log_component_version("accounting-service")
 
-    db.create_db_and_tables()
     load_config_file(config_file)
 
     messagers: dict[str, Any] = {

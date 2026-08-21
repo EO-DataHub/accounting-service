@@ -5,6 +5,11 @@
 # Virtual environments
 .venv
 
+# Local configuration. db_settings reads ./.env through pydantic-settings, so a
+# host-oriented file baked into the image would point the container at
+# localhost instead of the 'db' service.
+.env
+
 # Python cache and bytecode
 __pycache__
 *.py[cod]

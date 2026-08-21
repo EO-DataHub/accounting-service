@@ -18,6 +18,8 @@ from fastapi import (
     Request,
     Response,
 )
+
+# noinspection PyPackageRequirements
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from pydantic import BaseModel, Field
 from sqlalchemy import Result, Row

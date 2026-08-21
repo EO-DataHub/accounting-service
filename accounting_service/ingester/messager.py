@@ -37,7 +37,7 @@ class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.Billing
 
     def process_payload(self, obj: messages.BillingEvent) -> Sequence[Messager.Action]:
         try:
-            uuid = self._try_record_event(obj)
+            uuid_ = self._try_record_event(obj)
         except IntegrityError:
             # This is /probably/ because the SKU in the message is unknown.
             #
@@ -49,10 +49,10 @@ class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.Billing
             )
 
             self._add_observed_sku(obj)
-            uuid = self._try_record_event(obj)
+            uuid_ = self._try_record_event(obj)
 
-        if uuid:
-            logging.debug("Recorded BillingEvent with uuid %s", str(uuid))
+        if uuid_:
+            logging.debug("Recorded BillingEvent with uuid %s", str(uuid_))
         else:
             logging.info("Received duplicate BillingEvent uuid %s", obj.uuid)
 
@@ -60,10 +60,10 @@ class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.Billing
 
     def _try_record_event(self, bemsg: messages.BillingEvent) -> UUID | None:
         with Session(db.engine) as session:
-            uuid = models.BillingEvent.insert_from_message(session, bemsg)
+            uuid_ = models.BillingEvent.insert_from_message(session, bemsg)
             session.commit()
 
-        return uuid
+        return uuid_
 
 
 class WorkspaceSettingsIngesterMessager(DBIngester, PulsarJSONMessager[messages.WorkspaceSettings, bytes]):
@@ -110,7 +110,7 @@ class ConsumptionSampleRateIngesterMessager(
 
     def _record_event(self, msg: messages.BillingResourceConsumptionRateSample) -> None:
         try:
-            uuid = self._try_record_event(msg)
+            uuid_ = self._try_record_event(msg)
         except IntegrityError:
             logging.exception(
                 "IntegrityError recording %s with sku %s - assuming missing BillingItem",
@@ -119,19 +119,19 @@ class ConsumptionSampleRateIngesterMessager(
             )
 
             self._add_observed_sku(msg)
-            uuid = self._try_record_event(msg)
+            uuid_ = self._try_record_event(msg)
 
-        if uuid:
-            logging.debug("Recorded %s with uuid %s", type(msg), str(uuid))
+        if uuid_:
+            logging.debug("Recorded %s with uuid %s", type(msg), str(uuid_))
         else:
             logging.info("Received duplicate %s uuid %s", type(msg), msg.uuid)
 
     def _try_record_event(self, msg: messages.BillingResourceConsumptionRateSample) -> UUID | None:
         with Session(db.engine) as session:
-            uuid = models.BillableResourceConsumptionRateSample.insert_from_message(session, msg)
+            uuid_ = models.BillableResourceConsumptionRateSample.insert_from_message(session, msg)
             session.commit()
 
-        return uuid
+        return uuid_
 
     @staticmethod
     def _generate_new_estimates(workspace: str, sku: str, upto: datetime) -> None:
