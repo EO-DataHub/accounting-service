@@ -33,6 +33,20 @@ A number of `make` targets are defined:
 Dependencies are specified in `pyproject.toml`. After changing them, run `uv sync` to update the lockfile and
 virtual environment.
 
+## Database migrations
+
+This service manages its schema with [Alembic](https://alembic.sqlalchemy.org/). Migrations live in `alembic/versions/`.
+
+`docker compose up` applies migrations for you: a `migrate` service runs `alembic upgrade head` before `api` and `ingester` start. A deployed environment applies migrations the same way, through a Kubernetes Job that runs before the new version starts.
+
+To change the schema, edit the models in `accounting_service/models.py`, then generate a migration against your local database:
+
+```commandline
+SQL_DRIVER=postgresql+psycopg SQL_HOST=localhost SQL_PORT=5433 uv run alembic revision --autogenerate -m "describe the change"
+```
+
+Set `SQL_DRIVER` to `postgresql+psycopg`, even if you normally use SQLite. Some indexes are PostgreSQL-only, and autogenerate silently leaves them out under any other driver. Review the generated file before committing it - autogenerate does not always get everything right.
+
 # Management of this Component
 
 ## Adding BillingItems (SKUs) and Prices
@@ -41,7 +55,7 @@ virtual environment.
 
 The ingester creates a BillingItem automatically when it receives a Pulsar message for a SKU it does not know. The new item has no `name` or `unit`, so it does not display correctly in UIs. This logs an exception, but it is not a service failure.
 
-To set the `name` and `unit`, add the SKU to `accounting.conf`:
+To set the `name` and `unit` for the permanent catalog of known items, add the SKU to `accounting.conf`:
 
 - Locally: edit `dev/accounting.conf`.
 - In a deployed environment: edit the `products-prices` ConfigMap for that environment in `eodhp-argocd-deployment`.
@@ -55,20 +69,25 @@ items:
 
 The ingester loads this file on startup and updates any item with a matching SKU, including one it created automatically. Redeploy the ingester to apply a change.
 
+For a one-off fix that should not wait for a redeploy - eg. correcting a stub item right after it appears - use `billing-admin` instead:
+
+```commandline
+uv run billing-admin update-item --sku my-sku --name "My product" --unit "GB-s"
+```
+
+`billing-admin add-item` creates a brand new item with its initial price in one step. Both connect directly to the database, so point them at the right one first, eg. through a `kubectl port-forward`, the same way you would for `alembic`.
+
 ### Add or change a price
 
-In a deployed environment, `accounting.conf` never sets prices: the ConfigMap always ships an empty `prices` list. To add a price, connect to the database and insert a row into `billing_item_price`:
+`accounting.conf` never sets prices in a deployed environment: the ConfigMap always ships an empty `prices` list. Use `billing-admin` instead:
 
-```sql
-INSERT INTO billing_item_price (uuid, item_id, price, valid_from, configured_at)
-VALUES (gen_random_uuid(), (SELECT uuid FROM billing_item WHERE sku = 'my-sku'), 12.34, '2025-01-01T00:00:00Z', now());
+```commandline
+uv run billing-admin set-price --sku my-sku --price 12.34 --valid 2025-01-01T00:00:00Z
 ```
 
-Never update an existing price. Set `valid_until` on the old price, then insert a new price with a matching `valid_from`:
+`--valid` must be later than the item's current price, or match it exactly to correct that price - `billing-admin` rejects anything else. Under the hood this inserts a row into `billing_item_price` and, if it is replacing a price, sets `valid_until` on the old one. It never updates a price in place, so the price history stays intact.
 
-```sql
-UPDATE billing_item_price SET valid_until = '2025-02-01T00:00:00Z' WHERE uuid = '...';
-```
+Run `uv run billing-admin ls` to see all items and their current price, or `uv run billing-admin ls my-sku` for one item's full price history.
 
 ## Incompatible Schema
 
@@ -86,7 +105,9 @@ If you get an incompatible schema error and are sure it's safe to upgrade then y
 
 ## Adding a Test Entry
 
-- Forward Pulsar ports:
-  - kubectl port-forward service/pulsar-proxy -n pulsar 6650:6650
-- Run test message sender - edit it first if you need a particular message:
-  - PYTHONPATH=. python ./tests/send_test_message.py
+Send a fake billing event onto Pulsar, to exercise the ingester without a real event source:
+
+- Forward Pulsar ports: `kubectl port-forward service/pulsar-proxy -n pulsar 6650:6650` (skip this if you are running `docker compose --profile messaging up` locally).
+- `uv run inject billing-event --workspace my-workspace` (add `--sku` and `--quantity` to change what it sends; both default to a CPU-time reading).
+
+To also send a `WorkspaceSettings` message, or a message `inject` does not cover, edit and run `tests/send_test_message.py` instead - see the setup notes at the top of that file.
