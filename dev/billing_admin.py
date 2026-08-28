@@ -101,13 +101,67 @@ def _list_all_items(session: Session) -> None:
 
 
 @cli.command("set-price")
-@click.pass_obj
 @click.option("-s", "--sku", help="SKU to set price for", required=True)
 @click.option("-p", "--price", help="The set price in credits per unit", type=float, required=True)
 @click.option("--valid", help="The date and time from which the price is valid", type=click.DateTime(), required=True)
-def set_price(session: Session, sku: str, price: float, valid: datetime) -> None:
-    price_entry = {"prices": [{"sku": sku, "price": price, "valid_from": valid.isoformat()}]}
-    j = json.dumps(price_entry)
+def set_price(sku: str, price: float, valid: datetime) -> None:
+    configuration = {"prices": [{"sku": sku, "price": price, "valid_from": valid.isoformat()}]}
+    j = json.dumps(configuration)
+    try:
+        db.insert_configuration(StringIO(j))
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+
+
+@cli.command("add-item")
+@click.pass_obj
+@click.option("-s", "--sku", help="SKU to create", required=True)
+@click.option("-n", "--name", help="The SKU name", type=str, required=True)
+@click.option("-u", "--unit", help="The SKU unit", type=str, required=True)
+@click.option("-p", "--price", help="The set price in credits per unit", type=float, required=True)
+@click.option("--valid", help="The date and time from which the price is valid", type=click.DateTime(), required=True)
+def add_item(session: Session, sku: str, name: str, unit: str, price: float, valid: datetime) -> None:
+    query = session.query(models.BillingItem).filter(models.BillingItem.sku == sku).one_or_none()
+
+    if query is not None:
+        console.print(f"[red]SKU [blue]{sku}[/blue] already exists[/red]")
+        return
+
+    configuration = {
+        "items": [{"sku": sku, "name": name, "unit": unit}],
+        "prices": [{"sku": sku, "price": price, "valid_from": valid.isoformat()}],
+    }
+    j = json.dumps(configuration)
+
+    try:
+        db.insert_configuration(StringIO(j))
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+
+
+@cli.command("update-item")
+@click.pass_obj
+@click.option("-s", "--sku", help="SKU to change", required=True)
+@click.option("-n", "--name", help="The SKU name", type=str, required=False)
+@click.option("-u", "--unit", help="The SKU unit", type=str, required=False)
+def update_item(session: Session, sku: str, name: str | None, unit: str | None) -> None:
+    query = session.query(models.BillingItem).filter(models.BillingItem.sku == sku).one_or_none()
+
+    if query is None:
+        console.print(f"[red]SKU [blue]{sku}[/blue] doesn't exist[/red]")
+        return
+
+    # Either name or unit can be None, but the upsert functions just check for their existence in the database.
+    # So remove the None values from the items dictionary.
+    items = [{"sku": sku, "name": name, "unit": unit}]
+    clean_items = [{k: v for k, v in items[0].items() if v is not None}]
+
+    configuration = {
+        "items": clean_items,
+        "prices": [],
+    }
+    j = json.dumps(configuration)
+
     try:
         db.insert_configuration(StringIO(j))
     except ValueError as e:
