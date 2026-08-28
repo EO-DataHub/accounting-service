@@ -37,13 +37,38 @@ virtual environment.
 
 ## Adding BillingItems (SKUs) and Prices
 
-The service will automatically add any new BillingItems it sees from Pulsar (note that it will first log an SQL exception and this does not represent a service failure). However, it cannot set the `name` or `unit` fields which are necessary for proper display in UIs.
+### Add or update a billing item
 
-Prices cannot be added automatically.
+The ingester creates a BillingItem automatically when it receives a Pulsar message for a SKU it does not know. The new item has no `name` or `unit`, so it does not display correctly in UIs. This logs an exception, but it is not a service failure.
 
-To update items, connect to the database and `begin; UPDATE BillingItem SET name=..., unit=... WHERE sku=...`, check that one row was affected and then commit.
+To set the `name` and `unit`, add the SKU to `accounting.conf`:
 
-To add prices, insert into BillingItemPrice instead. Do not update prices. Instead, set valid_until in the old price and create a new price with a matching valid_from.
+- Locally: edit `dev/accounting.conf`.
+- In a deployed environment: edit the `products-prices` ConfigMap for that environment in `eodhp-argocd-deployment`.
+
+```yaml
+items:
+  - sku: my-sku
+    name: My product
+    unit: "GB-s"
+```
+
+The ingester loads this file on startup and updates any item with a matching SKU, including one it created automatically. Redeploy the ingester to apply a change.
+
+### Add or change a price
+
+In a deployed environment, `accounting.conf` never sets prices: the ConfigMap always ships an empty `prices` list. To add a price, connect to the database and insert a row into `billing_item_price`:
+
+```sql
+INSERT INTO billing_item_price (uuid, item_id, price, valid_from, configured_at)
+VALUES (gen_random_uuid(), (SELECT uuid FROM billing_item WHERE sku = 'my-sku'), 12.34, '2025-01-01T00:00:00Z', now());
+```
+
+Never update an existing price. Set `valid_until` on the old price, then insert a new price with a matching `valid_from`:
+
+```sql
+UPDATE billing_item_price SET valid_until = '2025-02-01T00:00:00Z' WHERE uuid = '...';
+```
 
 ## Incompatible Schema
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.1
+
+- Add a simple CLI tool to manage billing items
+
+## v0.6.0
+
+- Use Alembic for database migrations
+
 ## v0.5.3
 
 - Remove 'authorization' from inputs in OpenAPI spec

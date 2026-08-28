@@ -55,3 +55,7 @@ def billing_event(client: pulsar.Client, workspace: str, sku: str, quantity: flo
     console.print("[blue]billing-event[/blue] sent")
 
     producer.close()
+
+
+if __name__ == "__main__":
+    cli()

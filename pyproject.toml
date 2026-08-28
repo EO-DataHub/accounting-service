@@ -58,6 +58,7 @@ changelog = "https://github.com/EO-DataHub/accounting-service/blob/main/CHANGELO
 
 [project.scripts]
 inject = "dev.inject:cli"
+billing-admin = "dev.billing_admin:cli"
 
 [build-system]
 requires = ["hatchling", "uv-dynamic-versioning"]
