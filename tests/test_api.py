@@ -19,7 +19,7 @@ from tests.test_models import gen_billingitem_data
 def mock_decode_jwt_token(authorization: str) -> dict[str, Any]:
     return {
         "workspaces": ["workspace1", "workspace2"],
-        "workspaces_owned": ["workspace2"],
+        "workspaces-owned": ["workspace2"],
         "realm_access": {"roles": ["user", "hub_admin"]},
     }
 

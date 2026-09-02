@@ -181,7 +181,7 @@ def workspace_authz(
     workspace: str, token_payload: dict[str, Any], require_owner: bool = False, allow_hub_admin: bool = False
 ) -> str:
     workspaces = token_payload.get("workspaces", [])
-    owned = token_payload.get("workspaces_owned", [])
+    owned = token_payload.get("workspaces-owned", [])
     roles = token_payload["realm_access"].get("roles", [])
 
     # Allow if user is hub admin

@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pulsar
 import rich_click as click
 from eodhp_utils.pulsar import messages
+from eodhp_utils.runner import setup_logging
 from rich.console import Console
 from rich.json import JSON
 from rich.logging import RichHandler
@@ -36,6 +37,8 @@ def cli(ctx: click.Context) -> None:
 @click.option("-s", "--sku", help="SKU to send billing event for", default="cpu-seconds")
 @click.option("-q", "--quantity", help="Quantity of the SKU to send billing event for", default=0.0004, type=float)
 def billing_event(client: pulsar.Client, workspace: str, sku: str, quantity: float) -> None:
+    setup_logging(verbosity=3, enable_otel_logging=True)
+
     console.print("Creating a [blue]billing-event[/blue] producer")
     producer = client.create_producer(topic="billing-events", schema=AccountingIngesterMessager.get_schema())
     now = datetime.now(tz=UTC)
