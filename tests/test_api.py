@@ -1,9 +1,10 @@
 import pprint
 import uuid
+from collections.abc import Callable
 from datetime import datetime
+from decimal import Decimal
 from http import HTTPStatus
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,17 +12,22 @@ from sqlalchemy import delete
 from sqlalchemy.orm.session import Session
 
 from accounting_service import models
-from accounting_service.app import app as app_module
+from tests.conftest import (
+    TOKEN_ADMIN,
+    TOKEN_HUB_ADMIN,
+    TOKEN_MEMBER,
+    TOKEN_NO_REALM_ACCESS,
+    TOKEN_OWNER,
+    TOKEN_SCALAR_CLAIM,
+    TOKEN_STRANGER,
+)
 from tests.test_models import gen_billingitem_data
 
+# The `client` fixture authenticates as a hub_admin, which satisfies every tier
+# check. Tests below that care about authorisation use `authenticate_as`.
 
-# Mock function for decode_jwt_token
-def mock_decode_jwt_token(authorization: str) -> dict[str, Any]:
-    return {
-        "workspaces": ["workspace1", "workspace2"],
-        "workspaces-owned": ["workspace2"],
-        "realm_access": {"roles": ["user", "hub_admin"]},
-    }
+MOCK_TOKEN = "your_mock_jwt_token_here"
+AUTH_HEADERS = {"Authorization": f"Bearer {MOCK_TOKEN}"}
 
 
 def test_workspace_usage_data_returns_correct_items_from_db(db_session: Session, client: TestClient) -> None:
@@ -47,26 +53,23 @@ def test_workspace_usage_data_returns_correct_items_from_db(db_session: Session,
     )
 
     ############# Test
-    with patch.object(app_module, "decode_jwt_token", mock_decode_jwt_token):
-        mock_token = "your_mock_jwt_token_here"
+    response = client.get(
+        "/workspaces/workspace2/accounting/usage-data",
+        headers=AUTH_HEADERS,
+    )
 
-        response = client.get(
-            "/workspaces/workspace2/accounting/usage-data",
-            headers={"Authorization": f"Bearer {mock_token}"},
-        )
-
-        ############# Behaviour check
-        assert response.status_code == 200
-        assert response.json() == [
-            {
-                "uuid": str(event_uuids[1]),
-                "event_start": "2024-01-16T07:05:00Z",
-                "event_end": "2024-01-16T07:10:00Z",
-                "item": "sku2",
-                "workspace": "workspace2",
-                "quantity": 1.23,
-            }
-        ]
+    ############# Behaviour check
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "uuid": str(event_uuids[1]),
+            "event_start": "2024-01-16T07:05:00Z",
+            "event_end": "2024-01-16T07:10:00Z",
+            "item": "sku2",
+            "workspace": "workspace2",
+            "quantity": 1.23,
+        }
+    ]
 
 
 def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestClient) -> None:
@@ -99,44 +102,38 @@ def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestC
     )
 
     ############# Test
-    with patch.object(app_module, "decode_jwt_token", mock_decode_jwt_token):
-        mock_token = "your_mock_jwt_token_here"
+    response_page1 = client.get(
+        "/workspaces/workspace1/accounting/usage-data?limit=2",
+        headers=AUTH_HEADERS,
+    )
 
-        response_page1 = client.get(
-            "/workspaces/workspace1/accounting/usage-data?limit=2",
-            headers={"Authorization": f"Bearer {mock_token}"},
-        )
+    after = response_page1.json()[1]["uuid"]
+    response_page2 = client.get(
+        f"/workspaces/workspace1/accounting/usage-data?limit=2&after={after}",
+        headers=AUTH_HEADERS,
+    )
 
-        after = response_page1.json()[1]["uuid"]
-        response_page2 = client.get(
-            f"/workspaces/workspace1/accounting/usage-data?limit=2&after={after}",
-            headers={"Authorization": f"Bearer {mock_token}"},
-        )
+    ############# Behaviour check
+    assert response_page1.status_code == 200
+    assert response_page2.status_code == 200
 
-        ############# Behaviour check
-        assert response_page1.status_code == 200
-        assert response_page2.status_code == 200
+    page1 = response_page1.json()
+    page2 = response_page2.json()
+    assert len(page1) == 2
+    assert len(page2) == 1
 
-        page1 = response_page1.json()
-        page2 = response_page2.json()
-        assert len(page1) == 2
-        assert len(page2) == 1
-
-        # Results should always be in ascending time order.
-        assert datetime.fromisoformat(page1[0]["event_start"]) < datetime.fromisoformat(page1[1]["event_start"])
-        assert datetime.fromisoformat(page1[1]["event_start"]) < datetime.fromisoformat(page2[0]["event_start"])
+    # Results should always be in ascending time order.
+    assert datetime.fromisoformat(page1[0]["event_start"]) < datetime.fromisoformat(page1[1]["event_start"])
+    assert datetime.fromisoformat(page1[1]["event_start"]) < datetime.fromisoformat(page2[0]["event_start"])
 
 
 def test_page_after_unknown_event_produces_404(db_session: Session, client: TestClient) -> None:
-    with patch.object(app_module, "decode_jwt_token", mock_decode_jwt_token):
-        mock_token = "your_mock_jwt_token_here"
+    response = client.get(
+        "/workspaces/workspace1/accounting/usage-data?after=a659b597-7522-411d-a2e0-23f7f5629b16",
+        headers=AUTH_HEADERS,
+    )
 
-        response = client.get(
-            "/workspaces/workspace1/accounting/usage-data?after=a659b597-7522-411d-a2e0-23f7f5629b16",
-            headers={"Authorization": f"Bearer {mock_token}"},
-        )
-
-        assert response.status_code == HTTPStatus.NOT_FOUND
+    assert response.status_code == HTTPStatus.NOT_FOUND
 
 
 @pytest.mark.parametrize(
@@ -275,41 +272,36 @@ def test_workspace_usage_data_correctly_time_aggregated(
     db_session.flush()
 
     ############# Test
-    with patch.object(app_module, "decode_jwt_token", mock_decode_jwt_token):
-        mock_token = "your_mock_jwt_token_here"
-
-        response_pages = []
-
-        response_pages.append(
-            client.get(
-                f"/workspaces/workspace1/accounting/usage-data?limit={page_size}&time-aggregation={aggregation}",
-                headers={"Authorization": f"Bearer {mock_token}"},
-            )
+    response_pages = [
+        client.get(
+            f"/workspaces/workspace1/accounting/usage-data?limit={page_size}&time-aggregation={aggregation}",
+            headers=AUTH_HEADERS,
         )
+    ]
 
-        after = response_pages[0].json()[-1]["uuid"]
-        response_pages.append(
-            client.get(
-                f"/workspaces/workspace1/accounting/usage-data?limit={page_size}&after={after}&time-aggregation={aggregation}",
-                headers={"Authorization": f"Bearer {mock_token}"},
-            )
+    after = response_pages[0].json()[-1]["uuid"]
+    response_pages.append(
+        client.get(
+            f"/workspaces/workspace1/accounting/usage-data?limit={page_size}&after={after}&time-aggregation={aggregation}",
+            headers=AUTH_HEADERS,
         )
+    )
 
-        ############# Behaviour check
-        for page in [0, 1]:
-            response_page = response_pages[page]
+    ############# Behaviour check
+    for page in [0, 1]:
+        response_page = response_pages[page]
 
-            assert response_page.status_code == 200
+        assert response_page.status_code == 200
 
-            response_json = response_page.json()
-            expected_json = results[page]
+        response_json = response_page.json()
+        expected_json = results[page]
 
-            assert len(response_json) == len(expected_json)
-            for i in range(len(response_json)):
-                print(f"{response_json[i]=}, {expected_json[i]=}")
-                assert response_json[i]["item"] == expected_json[i]["item"]
-                assert response_json[i]["quantity"] == expected_json[i]["quantity"]
-                assert response_json[i]["event_start"] == expected_json[i]["event_start"]
+        assert len(response_json) == len(expected_json)
+        for i in range(len(response_json)):
+            print(f"{response_json[i]=}, {expected_json[i]=}")
+            assert response_json[i]["item"] == expected_json[i]["item"]
+            assert response_json[i]["quantity"] == expected_json[i]["quantity"]
+            assert response_json[i]["event_start"] == expected_json[i]["event_start"]
 
 
 def test_account_usage_data_returns_correct_items_from_db(db_session: Session, client: TestClient) -> None:
@@ -346,34 +338,32 @@ def test_account_usage_data_returns_correct_items_from_db(db_session: Session, c
     )
 
     ############# Test
-    with patch.object(app_module, "decode_jwt_token", mock_decode_jwt_token):
-        mock_token = "your_mock_jwt_token_here"
-        response = client.get(
-            f"/accounts/{account_uuid}/accounting/usage-data",
-            headers={"Authorization": f"Bearer {mock_token}"},
-        )
+    response = client.get(
+        f"/accounts/{account_uuid}/accounting/usage-data",
+        headers=AUTH_HEADERS,
+    )
 
-        ############# Behaviour check
-        # We should get data for workspaces 1 and 3 only, in event_start time order.
-        assert response.status_code == 200
-        assert response.json() == [
-            {
-                "uuid": str(event_uuids[0]),
-                "event_start": "2024-01-16T06:10:00Z",
-                "event_end": "2024-01-16T06:15:00Z",
-                "item": "sku1",
-                "workspace": "workspace1",
-                "quantity": 1.1,
-            },
-            {
-                "uuid": str(event_uuids[2]),
-                "event_start": "2024-01-16T07:05:00Z",
-                "event_end": "2024-01-16T07:10:00Z",
-                "item": "sku3",
-                "workspace": "workspace3",
-                "quantity": 1.1,
-            },
-        ]
+    ############# Behaviour check
+    # We should get data for workspaces 1 and 3 only, in event_start time order.
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "uuid": str(event_uuids[0]),
+            "event_start": "2024-01-16T06:10:00Z",
+            "event_end": "2024-01-16T06:15:00Z",
+            "item": "sku1",
+            "workspace": "workspace1",
+            "quantity": 1.1,
+        },
+        {
+            "uuid": str(event_uuids[2]),
+            "event_start": "2024-01-16T07:05:00Z",
+            "event_end": "2024-01-16T07:10:00Z",
+            "item": "sku3",
+            "workspace": "workspace3",
+            "quantity": 1.1,
+        },
+    ]
 
 
 def test_skus_list_api_returns_items_correctly(db_session: Session, client: TestClient) -> None:
@@ -431,6 +421,89 @@ def test_skus_api_returns_404_for_unknown_item(db_session: Session, client: Test
     assert response.json() == {"detail": "SKU not known"}
 
 
+@pytest.mark.parametrize(
+    ("claims", "workspace", "expected_status"),
+    [
+        # hub_admin overrides every tier, including for a workspace it holds no
+        # claim for at all.
+        pytest.param(TOKEN_HUB_ADMIN, "workspace1", 200, id="hub-admin"),
+        pytest.param(TOKEN_HUB_ADMIN, "never-heard-of-it", 200, id="hub-admin-unknown-workspace"),
+        # A plain member reaches its own workspace and no others.
+        pytest.param(TOKEN_MEMBER, "workspace1", 200, id="member-own-workspace"),
+        pytest.param(TOKEN_MEMBER, "workspace2", 401, id="member-other-workspace"),
+        # Tier ordering: neither of these tokens lists the workspace under
+        # 'workspaces', so both rely on outranking the MEMBER minimum.
+        pytest.param(TOKEN_OWNER, "workspace2", 200, id="owner-outranks-member"),
+        pytest.param(TOKEN_ADMIN, "workspace1", 200, id="admin-outranks-member"),
+        pytest.param(TOKEN_STRANGER, "workspace1", 401, id="stranger"),
+        # 'workspace1' is a substring of the scalar claim 'workspace1-prod'. A
+        # bare `in` test against a string would grant owner access here.
+        pytest.param(TOKEN_SCALAR_CLAIM, "workspace1", 401, id="scalar-claim-is-not-substring-matched"),
+        # A missing realm_access must deny, not raise.
+        pytest.param(TOKEN_NO_REALM_ACCESS, "workspace1", 200, id="no-realm-access-still-a-member"),
+        pytest.param(TOKEN_NO_REALM_ACCESS, "workspace2", 401, id="no-realm-access-non-member"),
+    ],
+)
+def test_workspace_usage_data_enforces_minimum_tier(
+    client: TestClient,
+    authenticate_as: Callable[[dict[str, Any]], None],
+    claims: dict[str, Any],
+    workspace: str,
+    expected_status: int,
+) -> None:
+    """The usage-data endpoint requires MEMBER, so every tier at or above it passes.
+
+    These assert status codes only. An authorised request against a workspace
+    with no billing events is a 200 with an empty list, so no fixture data is
+    needed and the test stays about authorisation.
+    """
+    authenticate_as(claims)
+
+    response = client.get(
+        f"/workspaces/{workspace}/accounting/usage-data",
+        headers=AUTH_HEADERS,
+    )
+
+    assert response.status_code == expected_status
+
+
+def test_account_usage_data_denies_unrelated_account(
+    client: TestClient,
+    authenticate_as: Callable[[dict[str, Any]], None],
+) -> None:
+    """Account access comes from the billing-accounts claim, not workspace tiers."""
+    authenticate_as(TOKEN_MEMBER)
+
+    response = client.get(
+        f"/accounts/{uuid.uuid4()}/accounting/usage-data",
+        headers=AUTH_HEADERS,
+    )
+
+    assert response.status_code == 401
+
+
+def test_account_usage_data_allows_listed_account(
+    client: TestClient,
+    authenticate_as: Callable[[dict[str, Any]], None],
+) -> None:
+    account_uuid = uuid.uuid4()
+
+    authenticate_as(
+        {
+            "workspaces": [],
+            "billing-accounts": [str(account_uuid)],
+            "realm_access": {"roles": ["user"]},
+        }
+    )
+
+    response = client.get(
+        f"/accounts/{account_uuid}/accounting/usage-data",
+        headers=AUTH_HEADERS,
+    )
+
+    assert response.status_code == 200
+
+
 def test_prices_api_returns_current_prices_correctly(db_session: Session, client: TestClient) -> None:
     ############# Setup
     db_session.execute(delete(models.BillingItemPrice))
@@ -447,7 +520,7 @@ def test_prices_api_returns_current_prices_correctly(db_session: Session, client
     db_session.add(
         models.BillingItemPrice(
             uuid=uuid_price1,
-            price=2.34,
+            price=Decimal("2.34"),
             valid_from=datetime(2024, 1, 16, 0, 0, 0),
             configured_at=datetime(2024, 1, 16, 0, 0, 0),
             item_id=uuid_item_a,
@@ -457,7 +530,7 @@ def test_prices_api_returns_current_prices_correctly(db_session: Session, client
     db_session.add(
         models.BillingItemPrice(
             uuid=uuid_price2,
-            price=2.30,
+            price=Decimal("2.30"),
             valid_from=datetime(2023, 1, 16, 0, 0, 0),
             valid_until=datetime(2024, 1, 16, 0, 0, 0),
             configured_at=datetime(2023, 1, 16, 0, 0, 0),
@@ -468,7 +541,7 @@ def test_prices_api_returns_current_prices_correctly(db_session: Session, client
     db_session.add(
         models.BillingItemPrice(
             uuid=uuid_price3,
-            price=0.000000412,
+            price=Decimal("0.000000412"),
             valid_from=datetime(2023, 1, 16, 0, 0, 0),
             configured_at=datetime(2023, 1, 17, 0, 0, 0),
             item_id=uuid_item_b,

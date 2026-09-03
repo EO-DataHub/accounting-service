@@ -51,6 +51,20 @@ class Base(DeclarativeBase):
     )
 
 
+def as_utc(dt: datetime) -> datetime:
+    """
+    Return `dt` in UTC, treating a naive value as already being UTC.
+
+    PostgreSQL returns aware datetimes and SQLite, used by the unit tests, returns naive ones,
+    so both reach the `*_utc` properties below.
+
+    Do not use astimezone on its own here. Given a naive datetime it assumes local time, so on
+    a machine which is not on UTC it shifts the value by the local offset. That made the
+    consumption-sample tests fail during British Summer Time and pass in winter.
+    """
+    return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).astimezone(UTC)
+
+
 class WorkspaceAccount(Base):
     """
     This records which account contains each workspace.
@@ -199,11 +213,11 @@ class BillingItemPrice(Base):
 
     @property
     def valid_from_utc(self) -> datetime:
-        return self.valid_from.astimezone(UTC)
+        return as_utc(self.valid_from)
 
     @property
     def valid_until_utc(self) -> datetime | None:
-        return self.valid_until and self.valid_until.astimezone(UTC)
+        return as_utc(self.valid_until) if self.valid_until else None
 
     __table_args__ = (
         Index(
@@ -324,16 +338,11 @@ class BillingEvent(Base):
 
     @property
     def event_start_utc(self) -> datetime:
-        # In PostgreSQL we always have a sample_time with a timezone attached and it should always
-        # be UTC. In SQLite, used for tests, we get datetimes with no timezone, creating problems
-        # when we do comparisons.
-        #
-        # This harmonizes this.
-        return self.event_start.astimezone(UTC)
+        return as_utc(self.event_start)
 
     @property
     def event_end_utc(self) -> datetime:
-        return self.event_end.astimezone(UTC)
+        return as_utc(self.event_end)
 
     __table_args__ = (
         Index(
@@ -597,12 +606,7 @@ class BillableResourceConsumptionRateSample(Base):
 
     @property
     def sample_time_utc(self) -> datetime:
-        # In PostgreSQL we always have a sample_time with a timezone attached and it should always
-        # be UTC. In SQLite, used for tests, we get datetimes with no timezone, creating problems
-        # when we do comparisons.
-        #
-        # This harmonizes this.
-        return self.sample_time.astimezone(UTC)
+        return as_utc(self.sample_time)
 
     __table_args__ = (
         Index(
