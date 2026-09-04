@@ -101,9 +101,16 @@ def test_a_naive_stored_instant_is_read_as_utc() -> None:
 
 
 class TestConfiguredPrice:
+    """Validation of one `prices:` entry.
+
+    Built with model_validate on a dict, which is how the loader does it: the entries come
+    from YAML, so the values arrive as whatever YAML produced - a float for a price, a string
+    for a timestamp - and the coercion is the thing being tested.
+    """
+
     def test_a_yaml_float_becomes_an_exact_decimal(self) -> None:
         """12.34 must not arrive as the binary approximation of 12.34."""
-        entry = ConfiguredPrice(sku="s", price=12.34, valid_from="2025-01-01T00:00:00Z")
+        entry = ConfiguredPrice.model_validate({"sku": "s", "price": 12.34, "valid_from": "2025-01-01T00:00:00Z"})
 
         assert entry.price == Decimal("12.34")
 
@@ -113,27 +120,27 @@ class TestConfiguredPrice:
         On a host in Europe/London a summer date was stored an hour early and a winter one
         was not, so the same configuration meant different things depending on the date.
         """
-        entry = ConfiguredPrice(sku="s", price=1, valid_from="2025-07-01T00:00:00")
+        entry = ConfiguredPrice.model_validate({"sku": "s", "price": 1, "valid_from": "2025-07-01T00:00:00"})
 
         assert entry.valid_from == datetime(2025, 7, 1, tzinfo=UTC)
 
     def test_an_offset_timestamp_is_converted(self) -> None:
-        entry = ConfiguredPrice(sku="s", price=1, valid_from="2025-07-01T01:00:00+01:00")
+        entry = ConfiguredPrice.model_validate({"sku": "s", "price": 1, "valid_from": "2025-07-01T01:00:00+01:00"})
 
         assert entry.valid_from == datetime(2025, 7, 1, tzinfo=UTC)
 
     def test_a_missing_field_is_named(self) -> None:
         """A KeyError from a dict lookup did not say which entry or which field."""
         with pytest.raises(ValidationError, match="valid_from"):
-            ConfiguredPrice(sku="s", price=1)  # type: ignore[call-arg]
+            ConfiguredPrice.model_validate({"sku": "s", "price": 1})
 
     def test_an_unexpected_field_is_rejected(self) -> None:
         """A misspelled key in the configuration should fail rather than being ignored."""
         with pytest.raises(ValidationError, match="prise"):
-            ConfiguredPrice(sku="s", price=1, valid_from="2025-01-01T00:00:00Z", prise=2)  # type: ignore[call-arg]
+            ConfiguredPrice.model_validate({"sku": "s", "price": 1, "valid_from": "2025-01-01T00:00:00Z", "prise": 2})
 
     def test_entries_are_immutable(self) -> None:
-        entry = ConfiguredPrice(sku="s", price=1, valid_from="2025-01-01T00:00:00Z")
+        entry = ConfiguredPrice.model_validate({"sku": "s", "price": 1, "valid_from": "2025-01-01T00:00:00Z"})
 
         with pytest.raises(ValidationError):
             entry.price = Decimal(2)

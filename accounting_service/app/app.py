@@ -114,7 +114,7 @@ def get_workspace_usage_data(
         time_aggregation=query.time_aggregation,
     )
 
-    return [BillingEventAPIResult.from_billing_event(event) for event in events]
+    return [BillingEventAPIResult.model_validate(event) for event in events]
 
 
 @app.get(
@@ -157,7 +157,7 @@ def get_account_usage_data(
         time_aggregation=query.time_aggregation,
     )
 
-    return [BillingEventAPIResult.from_billing_event(event) for event in events]
+    return [BillingEventAPIResult.model_validate(event) for event in events]
 
 
 @app.get(
@@ -172,7 +172,7 @@ def get_item_list(session: SessionDep) -> list[BillingItemAPIResult]:
     separately and may vary over time.
     """
     items: Iterator[BillingItem] = BillingItem.find_billing_items(session)
-    return [BillingItemAPIResult.from_billing_item(item) for item in items]
+    return [BillingItemAPIResult.model_validate(item) for item in items]
 
 
 @app.get(
@@ -187,7 +187,7 @@ def get_item(session: SessionDep, sku: str) -> BillingItemAPIResult:
     if item is None:
         raise HTTPException(status_code=404, detail="SKU not known", headers={"Cache-Control": "max-age=60"})
 
-    return BillingItemAPIResult.from_billing_item(item)
+    return BillingItemAPIResult.model_validate(item)
 
 
 @app.get(

@@ -35,6 +35,7 @@ dependencies = [
     "pyyaml",
     "rich",
     "rich-click",
+    "sqlmodel>=0.0.42",
 ]
 
 [dependency-groups]
@@ -60,6 +61,23 @@ changelog = "https://github.com/EO-DataHub/accounting-service/blob/main/CHANGELO
 [project.scripts]
 inject = "dev.inject:cli"
 billing-admin = "dev.billing_admin:cli"
+
+[tool.pyright]
+# Stated explicitly rather than inherited from whatever a given pyright release defaults to,
+# so upgrading the tool cannot quietly change what is checked.
+include = ["accounting_service", "tests", "dev", "alembic"]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+
+# Resolve imports against the project venv. Without this an editor running its own pyright
+# reports every third-party import as unresolved, which buries the diagnostics that matter.
+venvPath = "."
+venv = ".venv"
+
+# There are no rule overrides here on purpose. Where pyright cannot check something - SQLModel
+# query expressions, mainly - the suppression sits in the file that needs it, with the reason
+# next to it. See the header of accounting_service/models.py. A rule turned off here would
+# apply to code nobody had thought about.
 
 [build-system]
 requires = ["hatchling", "uv-dynamic-versioning"]

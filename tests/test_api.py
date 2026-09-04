@@ -1,7 +1,8 @@
 import pprint
 import uuid
 from collections.abc import Callable
-from datetime import datetime
+from contextlib import AbstractContextManager
+from datetime import datetime, timedelta
 from decimal import Decimal
 from http import HTTPStatus
 from typing import Any
@@ -567,3 +568,49 @@ def test_prices_api_returns_current_prices_correctly(db_session: Session, client
             "sku": "sku2",
         },
     ]
+
+
+def test_usage_data_query_count_does_not_grow_with_the_page(
+    db_session: Session,
+    client: TestClient,
+    counting_selects: Callable[[], AbstractContextManager[list[str]]],
+) -> None:
+    """Reading a page of usage data costs the same number of queries whatever its size.
+
+    The join in find_billing_events exists for the ordering and paging predicates and does
+    not populate `item`, so reading the SKU on the way out used to cost one query per row: a
+    page of 100 events issued 101 queries. A selectinload fixes it, and nothing else in the
+    suite would notice if it were removed, because the responses stay correct either way.
+
+    Asserted as a shape rather than a magic number: the count must not depend on the number
+    of rows. Distinct SKUs per event, so a lazy load could not be served from the identity
+    map and would show up here.
+    """
+    ############# Setup
+    gen_billingitem_data(
+        db_session,
+        [
+            {
+                "workspace": "wsCount",
+                "event_start": datetime(2025, 1, 1, 0, 0) + timedelta(minutes=minute),
+                "sku": f"count-sku{minute}",
+            }
+            for minute in range(40)
+        ],
+    )
+    db_session.commit()
+
+    ############# Test
+    counts = {}
+    for limit in (4, 40):
+        with counting_selects() as statements:
+            response = client.get(
+                f"/workspaces/wsCount/accounting/usage-data?limit={limit}",
+                headers=AUTH_HEADERS,
+            )
+        assert len(response.json()) == limit
+        counts[limit] = len(statements)
+
+    ############# Behaviour check
+    assert counts[4] == counts[40], f"query count grew with the page size: {counts}"
+    assert counts[40] <= 3, f"expected a small constant number of queries, got {counts[40]}"

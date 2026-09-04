@@ -214,7 +214,10 @@ class ConsumptionSampleRateIngesterMessager(
                 )
 
                 session.add(
-                    models.BillingEvent(
+                    # item_id is set from the `item` relationship at flush. SQLModel's
+                    # generated __init__ knows nothing about relationships, so pyright reads
+                    # this as a missing argument.
+                    models.BillingEvent(  # pyright: ignore[reportCallIssue]
                         uuid=uuid.uuid5(
                             uuid.UUID("67f9a35c-567c-4a30-b51d-2fc64328bd55"),
                             f"{workspace}-{sku}-{generate_from.isoformat()}",

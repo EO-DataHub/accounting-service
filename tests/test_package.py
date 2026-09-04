@@ -5,9 +5,10 @@ from decimal import Decimal
 from faker import Faker
 from sqlalchemy import inspect, select
 from sqlalchemy.orm import Session
+from sqlmodel import SQLModel
 
 import accounting_service.db
-from accounting_service.models import Base, BillingItem, BillingItemPrice
+from accounting_service.models import BillingItem, BillingItemPrice
 
 
 def test_model_creation(db_session: Session) -> None:
@@ -18,7 +19,7 @@ def test_model_creation(db_session: Session) -> None:
     which lets the assertion be about the result.
     """
     present = set(inspect(db_session.get_bind()).get_table_names())
-    missing = set(Base.metadata.tables) - present
+    missing = set(SQLModel.metadata.tables) - present
 
     assert not missing, f"Tables declared by the models but not created: {sorted(missing)}"
 

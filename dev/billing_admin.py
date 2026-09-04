@@ -111,7 +111,9 @@ def _list_all_items(session: Session) -> None:
                 models.BillingItemPrice.valid_from <= now,
                 or_(
                     models.BillingItemPrice.valid_until == None,  # noqa: E711
-                    models.BillingItemPrice.valid_until > now,
+                    # A SQL comparison, not a Python one. SQLModel declares the field as
+                    # `datetime | None`, so pyright reads this as comparing None with >.
+                    models.BillingItemPrice.valid_until > now,  # pyright: ignore[reportOptionalOperand]
                 ),
             ),
         )

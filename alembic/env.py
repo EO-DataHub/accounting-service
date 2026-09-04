@@ -12,8 +12,9 @@ from logging.config import fileConfig
 from typing import Any
 
 from sqlalchemy import create_engine, pool
+from sqlmodel import SQLModel
 
-from accounting_service import db_settings, models
+from accounting_service import db_settings
 from alembic import context
 
 config = context.config
@@ -21,7 +22,7 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-target_metadata = models.Base.metadata
+target_metadata = SQLModel.metadata
 
 # PostgreSQL rewrites index expressions when it stores them, adding explicit
 # casts and parentheses: date_trunc('day', event_start AT TIME ZONE 'UTC')

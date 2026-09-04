@@ -1,5 +1,6 @@
 import os
 from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import Mock
@@ -11,11 +12,12 @@ from fastapi.testclient import TestClient
 
 # noinspection PyPackageRequirements
 from pulsar import Message
-from sqlalchemy import Connection
+from sqlalchemy import Connection, event
 from sqlalchemy.orm import Session, sessionmaker
+from sqlmodel import SQLModel
 from testcontainers.community.postgres import PostgresContainer
 
-from accounting_service import db, db_settings, models
+from accounting_service import db, db_settings
 from accounting_service.app.app import app as fastapi_app
 from accounting_service.app.authz import decode_jwt_token
 from accounting_service.ingester.messager import (
@@ -113,7 +115,7 @@ def postgres_container() -> Iterator[PostgresContainer]:
 def db_schema(postgres_container: PostgresContainer) -> None:
     """Create the schema once. The container starts empty, so nothing is dropped."""
     with db.get_engine().begin() as conn:
-        models.Base.metadata.create_all(conn)
+        SQLModel.metadata.create_all(conn)
 
 
 @pytest.fixture
@@ -219,6 +221,43 @@ def client(db_session: Session) -> Iterator[TestClient]:
     yield TestClient(fastapi_app)
 
     fastapi_app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def counting_selects() -> Callable[[], AbstractContextManager[list[str]]]:
+    """Record the SELECT statements issued inside a block.
+
+    For asserting what a read path costs. A query per row is invisible to every other kind of
+    test: the response is correct, the suite is green, and the cost only shows up under load.
+
+        with counting_selects() as statements:
+            client.get(...)
+        assert len(statements) == 2
+    """
+
+    @contextmanager
+    def _counting() -> Iterator[list[str]]:
+        recorded: list[str] = []
+
+        def before(
+            _conn: object,
+            _cursor: object,
+            statement: str,
+            _params: object,
+            _context: object,
+            _executemany: object,
+        ) -> None:
+            if statement.lstrip().upper().startswith("SELECT"):
+                recorded.append(statement)
+
+        engine = db.get_engine()
+        event.listen(engine, "before_cursor_execute", before)
+        try:
+            yield recorded
+        finally:
+            event.remove(engine, "before_cursor_execute", before)
+
+    return _counting
 
 
 @pytest.fixture

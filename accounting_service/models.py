@@ -1,3 +1,21 @@
+# pyright: reportArgumentType=false, reportCallIssue=false, reportAssignmentType=false
+# pyright: reportOptionalOperand=false, reportAttributeAccessIssue=false
+#
+# Pyright cannot type-check SQLModel query expressions, and this is the module where they all
+# live. SQLModel declares fields as bare annotations rather than SQLAlchemy's Mapped[...], so
+# at class level pyright sees the Python value type instead of a SQL expression. The identical
+# query checks clean one way and not the other:
+#
+#     select(WithMapped).where(WithMapped.valid_until > at)      # no diagnostics
+#     select(WithSQLModel).where(WithSQLModel.valid_until > at)  # error + warning
+#
+# So `where(cls.valid_from <= at)` reports a bool where a ColumnElement is wanted, a nullable
+# column compared with > is an invalid operand, `__tablename__ = "..."` is not a declared_attr,
+# and constructing a row with `item=obj` looks like a missing item_id because the generated
+# __init__ knows nothing about relationships. All of it works; none of it is checkable.
+#
+# Suppressed here only. Every other module keeps these rules, and the rules that catch real
+# mistakes - undefined names, bad returns, unreachable code - stay on everywhere including here.
 import logging
 import uuid
 from collections.abc import Iterator, Sequence
@@ -8,15 +26,14 @@ from typing import Any, Self
 from uuid import UUID, uuid4
 
 import eodhp_utils.pulsar.messages
+from pydantic_core import PydanticUndefined
 from sqlalchemy import (
     TIMESTAMP,
     CheckConstraint,
     CursorResult,
-    ForeignKey,
     Index,
     MetaData,
     Result,
-    Uuid,
     and_,
     func,
     or_,
@@ -26,33 +43,56 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import (
-    DeclarativeBase,
-    Mapped,
-    Session,
-    aliased,
-    mapped_column,
-    relationship,
-)
+from sqlalchemy.orm import Session, aliased, selectinload
+from sqlmodel import Field as SQLModelField
+from sqlmodel import Relationship, SQLModel
 
 from accounting_service.consumption import ConsumptionWindow, RateSample, estimate_consumption
 from accounting_service.pricing import ConfiguredPrice, PriceAction, plan_price_change
 from accounting_service.timestamps import as_utc, datetime_default_to_utc
 
+# Every table here is a SQLModel. The naming convention is set on SQLModel's own MetaData so
+# that indexes, unique constraints, check constraints, foreign keys and primary keys all get
+# deterministic names. Alembic matches constraints by name, so without this a later revision
+# could not reference one - see the Constraint naming section of the schema note.
+#
+# Check constraints still need naming in the model, because an anonymous one can never be
+# matched against the name PostgreSQL invents for it. Give the bare name only; the convention
+# adds the ck_<table>_ prefix.
+SQLModel.metadata = MetaData(
+    naming_convention={
+        "ix": "ix_%(column_0_label)s",
+        "uq": "uq_%(table_name)s_%(column_0_name)s",
+        "ck": "ck_%(table_name)s_%(constraint_name)s",
+        "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+        "pk": "pk_%(table_name)s",
+    }
+)
 
-class Base(DeclarativeBase):
-    metadata = MetaData(
-        naming_convention={
-            "ix": "ix_%(column_0_label)s",
-            "uq": "uq_%(table_name)s_%(column_0_name)s",
-            "ck": "ck_%(table_name)s_%(constraint_name)s",
-            "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
-            "pk": "pk_%(table_name)s",
-        }
-    )
+
+def aware_timestamp(
+    *,
+    default: object = PydanticUndefined,
+    index: bool = False,
+) -> Any:  # noqa: ANN401 - SQLModel's Field() returns Any so it can be assigned to any field
+    """Declare a `timestamptz` column.
+
+    The one place the timezone decision is made. SQLModel maps a bare `datetime` to TIMESTAMP
+    WITHOUT TIME ZONE, which discards the offset on write and hands back a naive value on read
+    - the failure this codebase has already had three times.
+
+    A function rather than an annotated type. `Annotated[datetime, Field(sa_type=...)]` looks
+    tidier but does not compose: both `| None` and an explicit `Field(...)` on the attribute
+    discard the annotation's metadata, silently reverting the column to TIMESTAMP WITHOUT TIME
+    ZONE. Only the simplest of the six timestamp columns would have been covered.
+
+    `default` takes a value, None, or a SQL function such as func.now(). Left unset it means
+    the column has no default, which is what PydanticUndefined signals to SQLModel.
+    """
+    return SQLModelField(sa_type=TIMESTAMP(timezone=True), default=default, index=index)
 
 
-class WorkspaceAccount(Base):
+class WorkspaceAccount(SQLModel, table=True):
     """
     This records which account contains each workspace.
 
@@ -61,8 +101,8 @@ class WorkspaceAccount(Base):
 
     __tablename__ = "workspace_account"
 
-    workspace: Mapped[str] = mapped_column(index=True, primary_key=True)
-    account: Mapped[UUID] = mapped_column(index=True)
+    workspace: str = SQLModelField(index=True, primary_key=True)
+    account: UUID = SQLModelField(index=True)
 
     @staticmethod
     def record_mapping(session: Session, account: UUID, workspace: str) -> bool:
@@ -88,22 +128,50 @@ class WorkspaceAccount(Base):
         return result.rowcount > 0
 
 
-class BillingItem(Base):
+class BillingItemBase(SQLModel):
     """
+    The fields a BillingItem has, shared by the table and the API response.
+
     A BillingItem is a thing we sell: a unit of CPU time, a unit of bandwidth, etc.
 
+    Declared once because the two shapes are identical. Where a response deliberately differs
+    from what is stored - BillingEvent exposes its item as a SKU string rather than a
+    relationship - there is no shared base and the response model maps the difference itself.
+
+    The Field arguments carry both concerns: `index` and `primary_key` are acted on only by
+    the table subclass, and the descriptions are used only by the OpenAPI schema, so neither
+    costs the other anything.
+
+    `uuid` is declared here rather than on the table so that the column order matches what is
+    already deployed. Base-class fields are emitted before subclass fields, so declaring it
+    below would move it to the end of the table.
+    """
+
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)  # Internal ID
+
+    # User-visible ID like 'cpusecs-computenodes'. 'sku' = 'stock-keeping unit'.
+    sku: str = SQLModelField(
+        index=True,
+        description="Human-readable codename (SKU/stock-keeping unit) for the item",
+        schema_extra={"examples": ["wfcpu"]},
+    )
+    name: str = SQLModelField(
+        description="Human-readable name for the item",
+        schema_extra={"examples": ["Workflow CPU seconds"]},
+    )
+    unit: str = SQLModelField(
+        description="Unit the item is priced in",
+        schema_extra={"examples": ["GB-months"]},
+    )
+
+
+class BillingItem(BillingItemBase, table=True):
+    """
     BillingItems should be pre-created, but if we see a BillingEvent referring to an unknown one
     we auto-create it. The name and unit will be empty.
     """
 
     __tablename__ = "billing_item"
-
-    uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)  # Internal ID
-    sku: Mapped[str] = mapped_column(
-        index=True
-    )  # User-visible ID like 'cpusecs-computenodes'. 'sku' = 'stock-keeping unit'.
-    name: Mapped[str]  # User-visible name like 'CPU time in notebooks and workflows'
-    unit: Mapped[str]  # Units, like seconds or GB-hours
 
     @classmethod
     def find_billing_items(cls, session: Session) -> Iterator[Self]:
@@ -162,7 +230,7 @@ class BillingItem(Base):
             session.add(item_obj)
 
 
-class BillingItemPrice(Base):
+class BillingItemPrice(SQLModel, table=True):
     """
     How much we charged for a particular item between a particular time range. `valid_until` will
     be None for the current price.
@@ -186,17 +254,16 @@ class BillingItemPrice(Base):
 
     __tablename__ = "billing_item_price"
 
-    uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
-    item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
-    price: Mapped[Decimal]  # This is in pounds.
-    valid_from: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
-    valid_until: Mapped[datetime | None] = mapped_column(
-        TIMESTAMP(timezone=True)
-    )  # None for current price, a time in the past otherwise.
-    configured_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), default=func.now()
-    )  # Set to the current time at the time this row is added.
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
+    item_id: UUID = SQLModelField(foreign_key="billing_item.uuid")
+    price: Decimal  # This is in pounds.
+    valid_from: datetime = aware_timestamp()
+    # None for current price, a time in the past otherwise.
+    valid_until: datetime | None = aware_timestamp(default=None)
+    # Set to the current time at the time this row is added.
+    configured_at: datetime = aware_timestamp(default=func.now())
+
+    item: BillingItem = Relationship()
 
     @property
     def valid_from_utc(self) -> datetime:
@@ -307,7 +374,7 @@ class AfterBillingEventNotFound(Exception):
     pass
 
 
-class BillingEvent(Base):
+class BillingEvent(SQLModel, table=True):
     """
     This records a particular workspace's consumption of a particular BillingItem at a particular
     time or over a particular period. This consumption is priced at its start date.
@@ -324,14 +391,15 @@ class BillingEvent(Base):
 
     __tablename__ = "billing_event"
 
-    uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    event_start: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
-    event_end: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
-    item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
-    item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
-    user: Mapped[UUID | None]  # This is None for, for example, workspace storage.
-    workspace: Mapped[str]
-    quantity: Mapped[float]  # The units involved are defined in the BillingItem
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
+    event_start: datetime = aware_timestamp()
+    event_end: datetime = aware_timestamp()
+    item_id: UUID = SQLModelField(foreign_key="billing_item.uuid")
+    user: UUID | None = SQLModelField(default=None)  # None for, for example, workspace storage.
+    workspace: str
+    quantity: float  # The units involved are defined in the BillingItem
+
+    item: BillingItem = Relationship()
 
     @property
     def event_start_utc(self) -> datetime:
@@ -440,7 +508,19 @@ GROUP BY 2, 3, 4, 6
         else:
             billingevent_src = cls
 
-        all_billing_events = select(billingevent_src).join(BillingItem, BillingItem.uuid == billingevent_src.item_id)
+        # The join is here for the ordering and paging predicates below, which compare
+        # BillingItem.sku. It does not populate `item`, so reading event.item.sku on the way
+        # out cost one query per row - a page of 100 events issued 101 queries.
+        #
+        # selectinload rather than contains_eager: contains_eager would reuse the join and
+        # need no second query at all, but it would then depend on a join that exists for
+        # ordering and could reasonably be removed. selectinload is one extra query for the
+        # whole page and is independent of the query's shape.
+        all_billing_events = (
+            select(billingevent_src)
+            .join(BillingItem, BillingItem.uuid == billingevent_src.item_id)
+            .options(selectinload(billingevent_src.item))
+        )
 
         # We need a complete and certain order so that the 'after' parameter works.
         query = all_billing_events.order_by(
@@ -566,7 +646,7 @@ GROUP BY 2, 3, 4, 6
         )
 
 
-class BillableResourceConsumptionRateSample(Base):
+class BillableResourceConsumptionRateSample(SQLModel, table=True):
     """
     A consumption rate sample is a point-in-time sample of the rate at which a user is consuming a
     billed-for resources, typically storage but it could be any other resource where the time it's
@@ -582,21 +662,23 @@ class BillableResourceConsumptionRateSample(Base):
 
     __tablename__ = "billing_resource_consumption_rate_sample"
 
-    uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
 
     # Typically this is the end of the sampling process, although we pretend here that it was
     # instantaneous.
-    sample_time: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), index=True)
+    sample_time: datetime = aware_timestamp(index=True)
 
-    item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
-    item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
+    item_id: UUID = SQLModelField(foreign_key="billing_item.uuid")
 
-    user: Mapped[UUID | None]  # This is None for, for example, workspace storage.
-    workspace: Mapped[str]
+    # This is None for, for example, workspace storage.
+    user: UUID | None = SQLModelField(default=None)
+    workspace: str
 
     # The units of this are defined in the BillingItem and divided by seconds.
     # eg, storage consumption is measured in GB-seconds, so this is in GB.
-    rate: Mapped[float]
+    rate: float
+
+    item: BillingItem = Relationship()
 
     @property
     def sample_time_utc(self) -> datetime:

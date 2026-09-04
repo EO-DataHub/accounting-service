@@ -5,6 +5,7 @@ from uuid import UUID
 
 from pydantic import (
     AfterValidator,
+    AliasPath,
     BaseModel,
     ConfigDict,
     Field,
@@ -13,8 +14,7 @@ from pydantic import (
 )
 
 from accounting_service.models import (
-    BillingEvent,
-    BillingItem,
+    BillingItemBase,
     BillingItemPrice,
     TimeAggregation,
 )
@@ -122,6 +122,10 @@ class UsageQuery(BaseModel):
         return datetime_default_to_utc(value)
 
 
+# No shared base with BillingEvent: the response exposes `item` as a SKU string where the
+# table has a relationship, so the two shapes genuinely differ. The mapping is expressed as a
+# validation alias rather than a constructor, and the timestamps are converted by the
+# UtcTimestamp validator instead of by reading the *_utc properties by hand.
 class BillingEventAPIResult(BaseModel):
     """
     Billing events represent the consumption of a chargeable resource, often over some time
@@ -132,6 +136,8 @@ class BillingEventAPIResult(BaseModel):
     a single workspace.
     """
 
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
     uuid: UUID
     event_start: Annotated[
         UtcTimestamp,
@@ -141,7 +147,14 @@ class BillingEventAPIResult(BaseModel):
         UtcTimestamp,
         Field(description="End time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
     ]
-    item: Annotated[str, Field(description="Item (SKU) consumed", examples=["wfcpu"])]
+    item: Annotated[
+        str,
+        Field(
+            validation_alias=AliasPath("item", "sku"),
+            description="Item (SKU) consumed",
+            examples=["wfcpu"],
+        ),
+    ]
     workspace: Annotated[str, Field(description="Workspace which consumed the resource", examples=["my-workspace"])]
     quantity: Annotated[
         float,
@@ -151,46 +164,24 @@ class BillingEventAPIResult(BaseModel):
         ),
     ]
 
-    @classmethod
-    def from_billing_event(cls, event: BillingEvent) -> Self:
-        """Build the response from a stored event.
 
-        Reads the *_utc properties rather than the columns, so the Z suffix on the way out
-        is earned rather than asserted. The API reported the connection's local time as UTC
-        while this mapping used the columns directly.
-        """
-        return cls(
-            uuid=event.uuid,
-            event_start=event.event_start_utc,
-            event_end=event.event_end_utc,
-            item=event.item.sku,
-            workspace=event.workspace,
-            quantity=event.quantity,
-        )
-
-
-class BillingItemAPIResult(BaseModel):
+# Every field comes from BillingItemBase, which the table shares, so the two cannot drift.
+# Built with model_validate rather than a hand-written constructor: the shapes are identical,
+# so there is nothing to map.
+#
+# `uuid` is redeclared to drop the base's default_factory. A generated default makes the field
+# optional in the response schema, and the server always sends one.
+class BillingItemAPIResult(BillingItemBase):
     """
     A billing item is a product you can buy from EO DataHub, like CPU time.
     """
 
-    uuid: UUID
-    sku: Annotated[
-        str,
-        Field(
-            description="Human-readable codename (SKU/stock-keeping unit) for the item",
-            examples=["wfcpu"],
-        ),
-    ]
-    name: Annotated[
-        str,
-        Field(description="Human-readable name for the item", examples=["Workflow CPU seconds"]),
-    ]
-    unit: Annotated[str, Field(description="Unit the item is priced in", examples=["GB-months"])]
-
-    @classmethod
-    def from_billing_item(cls, item: BillingItem) -> Self:
-        return cls(uuid=item.uuid, sku=item.sku, name=item.name, unit=item.unit)
+    # No from_attributes config needed: SQLModel's own model_validate reads objects.
+    #
+    # uuid is redeclared to drop the base's default_factory, because a generated default makes
+    # the field optional in the response schema and the server always sends one. Pyright
+    # objects to an override without a default; at runtime this is exactly the intent.
+    uuid: UUID  # pyright: ignore[reportGeneralTypeIssues]
 
 
 class BillingItemPriceAPIResult(BaseModel):
