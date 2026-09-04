@@ -10,7 +10,7 @@ from accounting_service.ingester.messager import (
     AccountingIngesterMessager,
     WorkspaceSettingsIngesterMessager,
 )
-from tests.conftest import (
+from tests.integration.conftest import (
     bemsg_to_pulsar_msg,
     fake_event_known_times,
     wsmsg_to_pulsar_msg,

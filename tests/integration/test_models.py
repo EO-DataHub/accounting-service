@@ -9,30 +9,16 @@ from faker import Faker
 from sqlalchemy.orm.session import Session
 
 from accounting_service import models
-from tests.conftest import fake_event_known_times
-
-
-def test_round_trip_billingevent_insertfrommessage_retrieve(db_session: Session) -> None:
-    ############# Setup
-    bemsg, start, end = fake_event_known_times()
-    db_session.add(models.BillingItem(sku=bemsg.sku, name="test", unit="GB-h"))
-
-    ############# Test
-    beuuid = models.BillingEvent.insert_from_message(db_session, bemsg)
-
-    ############# Behaviour check
-    beobj = db_session.get(models.BillingEvent, beuuid)
-    assert beobj is not None
-    assert str(beobj.uuid) == bemsg.uuid
-    assert beobj.event_start_utc == start
-    assert beobj.event_end_utc == end
-    assert str(beobj.user) == bemsg.user
-    assert beobj.workspace == bemsg.workspace
-    assert beobj.quantity == bemsg.quantity
-    assert beobj.item.sku == bemsg.sku
+from tests.integration.conftest import fake_event_known_times
 
 
 def test_dup_billingevent_uuid_only_added_once(db_session: Session) -> None:
+    """A redelivered message is ignored, and insert_from_message says so by returning None.
+
+    Kept rather than folded into the messager tests, which assert the row is not overwritten
+    but never see the return value. That None is how AccountingIngesterMessager tells a
+    recorded event from a duplicate, so it is a contract worth its own test.
+    """
     ############# Setup
     bemsg, _start, _end = fake_event_known_times()
     db_session.add(models.BillingItem(sku=bemsg.sku, name="test", unit="GB-h"))
@@ -296,27 +282,6 @@ def fake_rate_samples(db_session: Session) -> list[messages.BillingResourceConsu
     ]
 
 
-def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retrieve(
-    db_session: Session,
-) -> None:
-    ############# Setup
-    msg = messages.BillingResourceConsumptionRateSample.get_fake()
-    db_session.add(models.BillingItem(sku=msg.sku, name="test", unit="GB-h"))
-
-    ############# Test
-    bruuid = models.BillableResourceConsumptionRateSample.insert_from_message(db_session, msg)
-
-    ############# Behaviour check
-    brobj = db_session.get(models.BillableResourceConsumptionRateSample, bruuid)
-    assert brobj is not None
-    assert str(brobj.uuid) == msg.uuid
-    assert brobj.sample_time_utc.isoformat() == msg.sample_time
-    assert str(brobj.user) == msg.user
-    assert brobj.workspace == msg.workspace
-    assert brobj.rate == msg.rate
-    assert brobj.item.sku == msg.sku
-
-
 def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retrieve_interval(
     db_session: Session, fake_rate_samples: list[messages.BillingResourceConsumptionRateSample]
 ) -> None:
@@ -349,87 +314,41 @@ def test_round_trip_billingresourceconsumptionratesample_insertfrommessage_retri
     assert found_samples[4].rate == 1
 
 
-@pytest.mark.parametrize(
-    ("start", "end", "expected_consumption"),
-    [
-        # Samples for this 10 min window should be:
-        #   * 1:15: 3 (exact start)
-        #   * 1:25: 4 (exact end)
-        # Consumption estimate is (3+4)/2 * 600
-        pytest.param(
-            datetime(2025, 1, 1, 1, 15, 0, tzinfo=UTC),
-            datetime(2025, 1, 1, 1, 25, 0, tzinfo=UTC),
-            3.5 * 600,
-        ),
-        # Samples for this 1h window should be:
-        #   * 1:00: 2.25 (interpolated between 2 and 3)
-        #   * 1:15: 3
-        #   * 1:25: 4
-        #   * 1:50: 2
-        #   * 2:00: 1.3333 (interpolated between 2 and 1)
-        # Consumption estimate is 900*(2.25+3)/2 + 600*(3+4)/2 + 1500*(4+2)/2 + 600*(2+1.3333)/2
-        #  = 9962.5
-        pytest.param(
-            datetime(2025, 1, 1, 1, 0, 0, tzinfo=UTC),
-            datetime(2025, 1, 1, 2, 0, 0, tzinfo=UTC),
-            9962.5,
-        ),
-        # Samples for this 2 min window should be:
-        #   * 1:15: 3 (before window)
-        #   * 1:19: 3.4 (interpolated window start)
-        #   * 1:21: 3.6 (interpolated window end)
-        #   * 1:25: 4 (after window)
-        # Consumption estimate is 120 * (3.6+3.4)/2
-        pytest.param(
-            datetime(2025, 1, 1, 1, 19, 0, tzinfo=UTC),
-            datetime(2025, 1, 1, 1, 21, 0, tzinfo=UTC),
-            420.0,
-        ),
-        # Samples for this 50m window should be:
-        #   * 0:00: No samples
-        #   * 0:45: 1
-        #   * 0:50: 1.5 (interpolated at window end)
-        #   * 0:55: 2 (after window)
-        #
-        # Consumption estimate is 300*(1+1.5)/2 = 375
-        # Note: counted as zero up to first sample
-        pytest.param(
-            datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC),
-            datetime(2025, 1, 1, 0, 50, 0, tzinfo=UTC),
-            375,
-        ),
-        # Samples for this 1h window should be:
-        #   * 2:05: 1 (before window)
-        #   * 2:30: 45.5 (interpolated)
-        #   * 2:55: 90
-        #   * 2:55: 0 (resource assumed destroyed - no later samples)
-        #   * 3:30: 0 (window end)
-        #   * no later samples
-        # Consumption estimate is 25*60*(45.5+90)/2 = 101625.0
-        pytest.param(
-            datetime(2025, 1, 1, 2, 30, 0, tzinfo=UTC),
-            datetime(2025, 1, 1, 3, 30, 0, tzinfo=UTC),
-            101625.0,
-        ),
-    ],
-)
-def test_consumption_estimation_from_billingresourceconsumptionratesamples(
+def test_consumption_estimation_reads_the_samples_and_hands_them_to_the_estimator(
     db_session: Session,
     fake_rate_samples: list[messages.BillingResourceConsumptionRateSample],
-    start: datetime,
-    end: datetime,
-    expected_consumption: float,
 ) -> None:
+    """calculate_consumption_for_interval joins the query to the arithmetic correctly.
+
+    Reduced from five parametrised windows, which were all verifying the arithmetic:
+    interpolation at the window edges, a resource appearing part-way through, a resource
+    destroyed before the end. Every one of those now has a test in tests/test_consumption.py
+    that needs no database, against estimate_consumption directly.
+
+    Which samples the query selects is covered by the test above, which asserts the exact
+    five it returns for this same window. What is left, and what needs both halves present,
+    is that the two are wired together.
+
+    The expected figure is the same 1:00-2:00 window: interpolated 2.25 at the start, then
+    3, 4, 2 at 1:15, 1:25, 1:50, then interpolated 1.3333 at the end.
+
+        900*(2.25+3)/2 + 600*(3+4)/2 + 1500*(4+2)/2 + 600*(2+1.3333)/2 = 9962.5
+
+    It also stands in for the filtering: workspace2 and nottestsku each hold a sample with a
+    rate of 900, so a leak would not be a near miss.
+    """
     ############# Setup
-    # This creates several samples around our window of interest, 1am-2am 2025-01-01, to send to
-    # the data store.
     for sample in fake_rate_samples:
         models.BillableResourceConsumptionRateSample.insert_from_message(db_session, sample)
 
     ############# Test
     consumption = models.BillableResourceConsumptionRateSample.calculate_consumption_for_interval(
-        db_session, "workspace1", "testsku", start, end
+        db_session,
+        "workspace1",
+        "testsku",
+        datetime(2025, 1, 1, 1, 0, 0, tzinfo=UTC),
+        datetime(2025, 1, 1, 2, 0, 0, tzinfo=UTC),
     )
 
     ############# Behaviour check
-    assert consumption == expected_consumption
+    assert consumption == 9962.5

@@ -7,7 +7,7 @@ from sqlalchemy.orm.session import Session
 
 from accounting_service import models
 from accounting_service.ingester.messager import ConsumptionSampleRateIngesterMessager
-from tests.conftest import msg_to_pulsar_msg
+from tests.integration.conftest import msg_to_pulsar_msg
 
 
 def test_message_results_in_sample_in_db(db_session: Session, db_session_factory: sessionmaker[Session]) -> None:

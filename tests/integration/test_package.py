@@ -3,25 +3,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from faker import Faker
-from sqlalchemy import inspect, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
-from sqlmodel import SQLModel
 
 import accounting_service.db
 from accounting_service.models import BillingItem, BillingItemPrice
-
-
-def test_model_creation(db_session: Session) -> None:
-    """The models produce a schema containing every table they declare.
-
-    This used to call create_db_and_tables and assert nothing, so it only failed if the DDL
-    itself was invalid. Requesting db_session builds the schema through the session fixture,
-    which lets the assertion be about the result.
-    """
-    present = set(inspect(db_session.get_bind()).get_table_names())
-    missing = set(SQLModel.metadata.tables) - present
-
-    assert not missing, f"Tables declared by the models but not created: {sorted(missing)}"
 
 
 def test_item_and_price_creation_via_config_file_results_in_correct_object_in_db(

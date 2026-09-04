@@ -1,4 +1,3 @@
-import pprint
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager
@@ -13,15 +12,10 @@ from sqlalchemy.orm.session import Session
 
 from accounting_service import models
 from tests.conftest import (
-    TOKEN_ADMIN,
-    TOKEN_HUB_ADMIN,
     TOKEN_MEMBER,
-    TOKEN_NO_REALM_ACCESS,
-    TOKEN_OWNER,
-    TOKEN_SCALAR_CLAIM,
     TOKEN_STRANGER,
 )
-from tests.test_models import gen_billingitem_data
+from tests.integration.test_models import gen_billingitem_data
 
 # The `client` fixture authenticates as a hub_admin, which satisfies every tier
 # check. Tests below that care about authorisation use `authenticate_as`.
@@ -366,46 +360,38 @@ def test_account_usage_data_returns_correct_items_from_db(db_session: Session, c
     ]
 
 
-def test_skus_list_api_returns_items_correctly(db_session: Session, client: TestClient) -> None:
+def test_skus_list_api_returns_items_in_sku_order(db_session: Session, client: TestClient) -> None:
+    """The endpoint queries, orders by SKU, and serialises through BillingItemAPIResult.
+
+    Which fields the model maps is tested in tests/test_api_models.py against in-memory
+    objects. What only a database can show is the ordering, and that the handler's return
+    value passes response validation.
+    """
     ############# Setup
-
-    uuid_sku1 = uuid.uuid4()
-    uuid_sku2 = uuid.uuid4()
-
-    db_session.add(models.BillingItem(uuid=uuid_sku1, sku="sku1", name="Item 1", unit="GBh"))
-    db_session.add(models.BillingItem(uuid=uuid_sku2, sku="sku2", name="Item 2", unit="S"))
+    db_session.add(models.BillingItem(uuid=uuid.uuid4(), sku="sku2", name="Item 2", unit="S"))
+    db_session.add(models.BillingItem(uuid=uuid.uuid4(), sku="sku1", name="Item 1", unit="GBh"))
 
     ############# Test
     response = client.get("/accounting/skus")
 
     ############# Behaviour check
-    # Should get a list of all billing items in SKU order.
-    pprint.pprint(response.json())
     assert response.status_code == 200
-    assert response.json() == [
-        {"uuid": str(uuid_sku1), "sku": "sku1", "name": "Item 1", "unit": "GBh"},
-        {"uuid": str(uuid_sku2), "sku": "sku2", "name": "Item 2", "unit": "S"},
-    ]
+    assert [item["sku"] for item in response.json()] == ["sku1", "sku2"]
 
 
-def test_skus_api_returns_item_correctly(db_session: Session, client: TestClient) -> None:
+def test_skus_api_returns_the_requested_item(db_session: Session, client: TestClient) -> None:
+    """Lookup by SKU reaches the right row. Field mapping is covered elsewhere."""
     ############# Setup
-
-    uuid_sku1 = uuid.uuid4()
-
-    db_session.add(models.BillingItem(uuid=uuid_sku1, sku="sku1", name="Item 1", unit="GBh"))
+    wanted = uuid.uuid4()
+    db_session.add(models.BillingItem(uuid=wanted, sku="sku1", name="Item 1", unit="GBh"))
+    db_session.add(models.BillingItem(uuid=uuid.uuid4(), sku="sku2", name="Item 2", unit="S"))
 
     ############# Test
     response = client.get("/accounting/skus/sku1")
 
     ############# Behaviour check
     assert response.status_code == 200
-    assert response.json() == {
-        "uuid": str(uuid_sku1),
-        "sku": "sku1",
-        "name": "Item 1",
-        "unit": "GBh",
-    }
+    assert response.json()["uuid"] == str(wanted)
 
 
 def test_skus_api_returns_404_for_unknown_item(db_session: Session, client: TestClient) -> None:
@@ -418,113 +404,72 @@ def test_skus_api_returns_404_for_unknown_item(db_session: Session, client: Test
 
 
 @pytest.mark.parametrize(
-    ("claims", "workspace", "expected_status"),
+    ("claims", "expected_status"),
     [
-        # hub_admin overrides every tier, including for a workspace it holds no
-        # claim for at all.
-        pytest.param(TOKEN_HUB_ADMIN, "workspace1", 200, id="hub-admin"),
-        pytest.param(TOKEN_HUB_ADMIN, "never-heard-of-it", 200, id="hub-admin-unknown-workspace"),
-        # A plain member reaches its own workspace and no others.
-        pytest.param(TOKEN_MEMBER, "workspace1", 200, id="member-own-workspace"),
-        pytest.param(TOKEN_MEMBER, "workspace2", 401, id="member-other-workspace"),
-        # Tier ordering: neither of these tokens lists the workspace under
-        # 'workspaces', so both rely on outranking the MEMBER minimum.
-        pytest.param(TOKEN_OWNER, "workspace2", 200, id="owner-outranks-member"),
-        pytest.param(TOKEN_ADMIN, "workspace1", 200, id="admin-outranks-member"),
-        pytest.param(TOKEN_STRANGER, "workspace1", 401, id="stranger"),
-        # 'workspace1' is a substring of the scalar claim 'workspace1-prod'. A
-        # bare `in` test against a string would grant owner access here.
-        pytest.param(TOKEN_SCALAR_CLAIM, "workspace1", 401, id="scalar-claim-is-not-substring-matched"),
-        # A missing realm_access must deny, not raise.
-        pytest.param(TOKEN_NO_REALM_ACCESS, "workspace1", 200, id="no-realm-access-still-a-member"),
-        pytest.param(TOKEN_NO_REALM_ACCESS, "workspace2", 401, id="no-realm-access-non-member"),
+        pytest.param(TOKEN_MEMBER, 200, id="a-member-gets-through"),
+        pytest.param(TOKEN_STRANGER, 401, id="a-stranger-does-not"),
     ],
 )
-def test_workspace_usage_data_enforces_minimum_tier(
+def test_usage_data_is_behind_the_workspace_dependency(
     client: TestClient,
     authenticate_as: Callable[[dict[str, Any]], None],
     claims: dict[str, Any],
-    workspace: str,
     expected_status: int,
 ) -> None:
-    """The usage-data endpoint requires MEMBER, so every tier at or above it passes.
+    """The route actually has require_workspace attached, and it both grants and denies.
 
-    These assert status codes only. An authorised request against a workspace
-    with no billing events is a 200 with an empty list, so no fixture data is
-    needed and the test stays about authorisation.
+    Which tier grants what is tested in tests/test_authz.py, against the functions
+    directly, with no database. This pair exists only to show the dependency is wired to
+    the route - a decorator that was never added would leave those tests passing and the
+    endpoint open.
     """
     authenticate_as(claims)
 
-    response = client.get(
-        f"/workspaces/{workspace}/accounting/usage-data",
-        headers=AUTH_HEADERS,
-    )
+    response = client.get("/workspaces/workspace1/accounting/usage-data", headers=AUTH_HEADERS)
 
     assert response.status_code == expected_status
 
 
-def test_account_usage_data_denies_unrelated_account(
+def test_account_usage_data_is_behind_the_account_dependency(
     client: TestClient,
     authenticate_as: Callable[[dict[str, Any]], None],
 ) -> None:
-    """Account access comes from the billing-accounts claim, not workspace tiers."""
+    """require_account is attached to the account route. See the note above."""
     authenticate_as(TOKEN_MEMBER)
 
-    response = client.get(
-        f"/accounts/{uuid.uuid4()}/accounting/usage-data",
-        headers=AUTH_HEADERS,
-    )
+    response = client.get(f"/accounts/{uuid.uuid4()}/accounting/usage-data", headers=AUTH_HEADERS)
 
     assert response.status_code == 401
 
 
-def test_account_usage_data_allows_listed_account(
-    client: TestClient,
-    authenticate_as: Callable[[dict[str, Any]], None],
-) -> None:
-    account_uuid = uuid.uuid4()
+def test_prices_api_returns_only_the_currently_valid_prices(db_session: Session, client: TestClient) -> None:
+    """find_prices excludes a price whose validity has ended, and orders by SKU.
 
-    authenticate_as(
-        {
-            "workspaces": [],
-            "billing-accounts": [str(account_uuid)],
-            "realm_access": {"roles": ["user"]},
-        }
-    )
-
-    response = client.get(
-        f"/accounts/{account_uuid}/accounting/usage-data",
-        headers=AUTH_HEADERS,
-    )
-
-    assert response.status_code == 200
-
-
-def test_prices_api_returns_current_prices_correctly(db_session: Session, client: TestClient) -> None:
+    The decimal formatting and the null valid_until are covered in
+    tests/test_api_models.py; the filter and the ordering need a query.
+    """
     ############# Setup
-
     uuid_item_a = uuid.uuid4()
     uuid_item_b = uuid.uuid4()
     db_session.add(models.BillingItem(uuid=uuid_item_a, sku="sku1", name="Item a", unit="GBh"))
     db_session.add(models.BillingItem(uuid=uuid_item_b, sku="sku2", name="Item b", unit="GBh"))
 
-    uuid_price1 = uuid.uuid4()
-    uuid_price2 = uuid.uuid4()
-    uuid_price3 = uuid.uuid4()
+    current_a = uuid.uuid4()
+    superseded_a = uuid.uuid4()
+    current_b = uuid.uuid4()
 
     db_session.add(
         models.BillingItemPrice(
-            uuid=uuid_price1,
+            uuid=current_a,
             price=Decimal("2.34"),
             valid_from=datetime(2024, 1, 16, 0, 0, 0),
             configured_at=datetime(2024, 1, 16, 0, 0, 0),
             item_id=uuid_item_a,
         )
     )
-
     db_session.add(
         models.BillingItemPrice(
-            uuid=uuid_price2,
+            uuid=superseded_a,
             price=Decimal("2.30"),
             valid_from=datetime(2023, 1, 16, 0, 0, 0),
             valid_until=datetime(2024, 1, 16, 0, 0, 0),
@@ -532,10 +477,9 @@ def test_prices_api_returns_current_prices_correctly(db_session: Session, client
             item_id=uuid_item_a,
         )
     )
-
     db_session.add(
         models.BillingItemPrice(
-            uuid=uuid_price3,
+            uuid=current_b,
             price=Decimal("0.000000412"),
             valid_from=datetime(2023, 1, 16, 0, 0, 0),
             configured_at=datetime(2023, 1, 17, 0, 0, 0),
@@ -547,26 +491,10 @@ def test_prices_api_returns_current_prices_correctly(db_session: Session, client
     response = client.get("/accounting/prices")
 
     ############# Behaviour check
-    # Should return current prices in SKU order.
     assert response.status_code == 200
-    assert response.json() == [
-        {
-            "uuid": str(uuid_price1),
-            # An exact decimal string, not a float: the back end keeps the precision and the
-            # UI decides how to display it.
-            "price": "2.34",
-            "valid_from": "2024-01-16T00:00:00Z",
-            "valid_until": None,
-            "sku": "sku1",
-        },
-        {
-            "uuid": str(uuid_price3),
-            # Never scientific notation, which is what Pydantic's own Decimal output gives.
-            "price": "0.000000412",
-            "valid_from": "2023-01-16T00:00:00Z",
-            "valid_until": None,
-            "sku": "sku2",
-        },
+    assert [(p["uuid"], p["sku"]) for p in response.json()] == [
+        (str(current_a), "sku1"),
+        (str(current_b), "sku2"),
     ]
 
 

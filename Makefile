@@ -28,6 +28,16 @@ test:
 testonce:
 	${uv-run} pytest
 
+# The tests that need no database. Under two seconds, no container, so this is the one
+# to run on every change. tests/integration holds the rest.
+.PHONY: test-unit
+test-unit:
+	${uv-run} pytest tests --ignore=tests/integration
+
+.PHONY: test-integration
+test-integration:
+	${uv-run} pytest tests/integration
+
 .git/hooks/pre-commit:
 	${uv-run} pre-commit install
 	curl -o .pre-commit-config.yaml https://raw.githubusercontent.com/EO-DataHub/github-actions/main/.pre-commit-config-python.yaml
