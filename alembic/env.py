@@ -12,9 +12,14 @@ from logging.config import fileConfig
 from typing import Any
 
 from sqlalchemy import create_engine, pool
-from sqlmodel import SQLModel
 
 from accounting_service import db_settings
+
+# Imported from models rather than from sqlmodel directly. It is the same object, but taking it
+# from here means this module is imported, and importing it is what defines the table classes
+# that populate the metadata. Read it off SQLModel instead and the import is unused, an import
+# cleanup removes it, and autogenerate then sees an empty schema and offers to drop every table.
+from accounting_service.models import metadata
 from alembic import context
 
 config = context.config
@@ -22,7 +27,7 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-target_metadata = SQLModel.metadata
+target_metadata = metadata
 
 # PostgreSQL rewrites index expressions when it stores them, adding explicit
 # casts and parentheses: date_trunc('day', event_start AT TIME ZONE 'UTC')

@@ -70,6 +70,14 @@ SQLModel.metadata = MetaData(
 )
 
 
+# Re-exported so that alembic/env.py depends on importing this module rather than on someone
+# remembering to. Defining the table classes below is what populates the metadata, so
+# `target_metadata = SQLModel.metadata` in env.py left the import of this module unused - and
+# an automated import cleanup then emptied it. Autogenerate reported every table as removed and
+# would have generated a revision dropping the whole schema.
+metadata = SQLModel.metadata
+
+
 def aware_timestamp(
     *,
     default: object = PydanticUndefined,

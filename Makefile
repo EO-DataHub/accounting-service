@@ -43,12 +43,20 @@ pre-commit:
 pre-commit-all:
 	${uv-run} pre-commit run --all-files
 
+# Needs Docker. Starts a throwaway PostgreSQL, migrates it from empty, and runs `alembic
+# check` against it - both as subprocesses, which is what makes an empty target_metadata
+# visible. See the docstring in dev/check_migrations.py.
+.PHONY: check-migrations
+check-migrations:
+	${uv-run} python dev/check_migrations.py
+
 .PHONY: check
 check:
 	${uv-run} ruff check
 	${uv-run} ruff format --check --diff
 	${uv-run} pyright
 	${uv-run} validate-pyproject pyproject.toml
+	$(MAKE) check-migrations
 
 .PHONY: format
 format:
