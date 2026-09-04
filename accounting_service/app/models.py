@@ -6,7 +6,6 @@ from uuid import UUID
 from pydantic import (
     AfterValidator,
     BaseModel,
-    BeforeValidator,
     ConfigDict,
     Field,
     PlainSerializer,
@@ -18,9 +17,8 @@ from accounting_service.models import (
     BillingItem,
     BillingItemPrice,
     TimeAggregation,
-    as_utc,
-    datetime_default_to_utc,
 )
+from accounting_service.timestamps import as_utc, datetime_default_to_utc
 
 
 def _plain_decimal(value: Decimal) -> str:
@@ -42,16 +40,6 @@ ExactDecimal = Annotated[Decimal, PlainSerializer(_plain_decimal, return_type=st
 # otherwise serialise with no offset at all, which is a silently different wire format. The
 # *_utc properties on the stored models already convert, so this normally changes nothing.
 UtcTimestamp = Annotated[datetime, AfterValidator(as_utc)]
-
-
-def _blank_to_none(value: object) -> object:
-    """Treat an empty query parameter as absent.
-
-    A client building a query string from unset state sends `?time-aggregation=` rather than
-    omitting the parameter, and that means "no aggregation" rather than "an invalid period".
-    Anything else is still rejected, which is the point of the enum.
-    """
-    return None if value == "" else value
 
 
 class UsageQuery(BaseModel):
@@ -110,14 +98,14 @@ class UsageQuery(BaseModel):
     ]
     time_aggregation: Annotated[
         TimeAggregation | None,
-        BeforeValidator(_blank_to_none),
         Field(
             default=None,
             alias="time-aggregation",
             title="Time aggregation of results",
             description=(
                 "Optionally aggregate usage information into totals for the given time periods - "
-                "'day' or 'month'. Any other value is rejected."
+                "'day' or 'month'. Omit the parameter for no aggregation; any other value, "
+                "including an empty one, is rejected."
             ),
             examples=["day", "month"],
         ),

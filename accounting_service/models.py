@@ -1,12 +1,10 @@
-import itertools
 import logging
 import uuid
-from collections import namedtuple
 from collections.abc import Iterator, Sequence
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Self, cast
+from typing import Any, Self
 from uuid import UUID, uuid4
 
 import eodhp_utils.pulsar.messages
@@ -37,6 +35,10 @@ from sqlalchemy.orm import (
     relationship,
 )
 
+from accounting_service.consumption import ConsumptionWindow, RateSample, estimate_consumption
+from accounting_service.pricing import ConfiguredPrice, PriceAction, plan_price_change
+from accounting_service.timestamps import as_utc, datetime_default_to_utc
+
 
 class Base(DeclarativeBase):
     metadata = MetaData(
@@ -48,21 +50,6 @@ class Base(DeclarativeBase):
             "pk": "pk_%(table_name)s",
         }
     )
-
-
-def as_utc(dt: datetime) -> datetime:
-    """
-        Return `dt` in UTC, treating a naive value as already being UTC.
-
-    PostgreSQL returns an aware datetime in the connection's timezone, which is not necessarily
-        UTC, so the conversion is real. A naive value reaches here when an object was built in
-        Python and read back before any round trip.
-
-        Do not use astimezone on its own. Given a naive datetime it assumes local time, so on a
-        machine which is not on UTC it shifts the value by the local offset. That made the
-        consumption-sample tests fail during British Summer Time and pass in winter.
-    """
-    return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).astimezone(UTC)
 
 
 class WorkspaceAccount(Base):
@@ -251,57 +238,53 @@ class BillingItemPrice(Base):
         return session.execute(query)
 
     @classmethod
+    def _configured_valid_froms(cls, session: Session, item: BillingItem) -> Sequence[datetime]:
+        """Every instant a price is already configured to start at, for one item."""
+        return session.execute(select(cls.valid_from).where(cls.item_id == item.uuid)).scalars().all()
+
+    @classmethod
     def upsert_configured_price(cls, session: Session, price: dict[str, Any]) -> None:
         """
-        This aimed at inserting or updating prices based on a database-independent source
-        such as a YAML configuration file. 'price' must contain 'sku', 'price' and 'valid_from'.
+        This inserts or updates a price based on a database-independent source such as a YAML
+        configuration file. 'price' must contain 'sku', 'price' and 'valid_from'.
 
         'valid_from' must either be newer than the current price, in which case the new price
-        will replace it at that time, or must exactly match an existing configured price, in
-        which case its price will be updated.
+        replaces it at that time, or must exactly match an existing configured price, in which
+        case its amount is updated.
+
+        The rules live in accounting_service.pricing, which decides from values. This reads what
+        is stored, asks for a decision, and carries it out.
         """
-        item_obj = BillingItem.find_billing_item(session, price["sku"])
+        entry = ConfiguredPrice.model_validate(price)
+
+        item_obj = BillingItem.find_billing_item(session, entry.sku)
         if not item_obj:
-            logging.error("Failed to find item %s when configuring price", price["sku"])
-            raise ValueError(f"Attempt to add price for unknown SKU {price['sku']}")
+            logging.error("Failed to find item %s when configuring price", entry.sku)
+            raise ValueError(f"Attempt to add price for unknown SKU {entry.sku}")
 
-        valid_from = datetime.fromisoformat(price["valid_from"]).astimezone(UTC)
+        plan = plan_price_change(entry.valid_from, cls._configured_valid_froms(session, item_obj))
 
-        existing_prices_updated = session.execute(
-            update(cls).where(cls.item == item_obj).where(cls.valid_from == valid_from).values(price=price["price"])
-        )
-
-        if cast(CursorResult, existing_prices_updated).rowcount > 0:
+        if plan.action is PriceAction.AMEND:
+            session.execute(
+                update(cls)
+                .where(cls.item_id == item_obj.uuid)
+                .where(cls.valid_from == entry.valid_from)
+                .values(price=entry.price)
+            )
             return
 
-        latest_price = (
-            session.execute(select(cls).where(cls.item == item_obj).order_by(cls.valid_from.desc()).limit(1))
-            .scalars()
-            .one_or_none()
-        )
+        if plan.action is PriceAction.SUPERSEDE:
+            # Close the period this price takes over from. Targeted by valid_from rather than
+            # by a null valid_until, so a row that was somehow left open does not get closed
+            # by accident.
+            session.execute(
+                update(cls)
+                .where(cls.item_id == item_obj.uuid)
+                .where(cls.valid_from == plan.supersedes_valid_from)
+                .values(valid_until=entry.valid_from)
+            )
 
-        if latest_price:
-            if latest_price.valid_from.astimezone(UTC) > valid_from:
-                raise ValueError(
-                    f"Attempt to add price {price['sku']} where valid_from is earlier "
-                    + f"than the latest existing price, {latest_price.valid_from}."
-                )
-
-            latest_price.valid_until = valid_from
-
-        price_obj = cls(
-            item=item_obj,
-            valid_from=valid_from,
-            price=price["price"],
-        )
-        session.add(price_obj)
-
-
-def datetime_default_to_utc(dt: datetime | None) -> datetime | None:
-    if dt and not dt.tzinfo:
-        return dt.replace(tzinfo=UTC)
-
-    return dt
+        session.add(cls(item=item_obj, valid_from=entry.valid_from, price=entry.price))
 
 
 class TimeAggregation(StrEnum):
@@ -694,65 +677,16 @@ class BillableResourceConsumptionRateSample(Base):
         until sample collection has got as far as at least one sample after the end of the
         interval. If no sample exists after the end of the interval then, if one is later
         collected, the answer given by this method will change.
+
+        This reads the samples and hands the arithmetic to accounting_service.consumption, which
+        owns no database and is tested without one.
         """
-        rate_samples = list(cls.find_data_for_interval(session, workspace, sku, start, end))
+        samples = cls.find_data_for_interval(session, workspace, sku, start, end)
 
-        if not rate_samples or len(rate_samples) <= 1:
-            # No record of any consumption at all.
-            #
-            # If there is one sample then this is equivalent to no consumption. THis is because
-            # we assume that the resource didn't exist until the first sample and didn't exist
-            # after the last one, so we act as if it existed for zero time.
-            return None
-
-        # We need an estimate of consumption rate at the start and end of the interval.
-        # We use interpolation.
-        def interpolate(at: datetime, t0: Self, t1: Self) -> float:
-            assert at >= t0.sample_time_utc
-            assert at <= t1.sample_time_utc
-
-            proportion: float = (at - t0.sample_time_utc) / (t1.sample_time_utc - t0.sample_time_utc)
-
-            return t0.rate + proportion * (t1.rate - t0.rate)
-
-        RateTime = namedtuple("RateTime", ["at", "rate"])
-
-        starting_ratetime = (
-            # If no samples exist before the window then it may not have existed yet.
-            # To avoid awkward questions, we treat consumption as zero up until the first
-            # sample.
-            RateTime(at=rate_samples[0].seconds_after(start), rate=0)
-            if rate_samples[0].sample_time_utc > start
-            else RateTime(at=0, rate=interpolate(start, rate_samples[0], rate_samples[1]))
+        return estimate_consumption(
+            [RateSample(at=sample.sample_time_utc, rate=sample.rate) for sample in samples],
+            ConsumptionWindow(start=start, end=end),
         )
-
-        ending_ratetime = (
-            # If there are no samples after the window we assume the resource was destroyed
-            # sometime after the last sample. Again, to avoid awkward questions we assume
-            # this happened exactly at the last sample.
-            RateTime(at=rate_samples[-1].seconds_after(start), rate=0)
-            if rate_samples[-1].sample_time_utc < end
-            else RateTime(at=(end - start).seconds, rate=interpolate(end, rate_samples[-2], rate_samples[-1]))
-        )
-
-        mid_samples = filter(lambda s: s.after(start) and not s.after(end), rate_samples)
-        mid_ratetimes = map(lambda s: RateTime(at=s.seconds_after(start), rate=s.rate), mid_samples)
-
-        # Form a list of RateTimes tuples covering exactly the window, clipped to a shorter period
-        # only if we've assumed the resource was created/destroyed during the window.
-        ratelist: list[RateTime] = [starting_ratetime, *mid_ratetimes, ending_ratetime]
-
-        # Now imagine a linear interpolation between the points in ratelist being integrated to
-        # produce our answer.
-        total_consumption: float = 0.0
-        for s0, s1 in itertools.pairwise(ratelist):
-            assert s1.at >= s0.at
-
-            duration = s1.at - s0.at
-            rate = (s0.rate + s1.rate) / 2.0
-            total_consumption += duration * rate
-
-        return total_consumption
 
     @classmethod
     def find_earliest(
@@ -773,12 +707,6 @@ class BillableResourceConsumptionRateSample(Base):
             query = query.where(cls.item_id == item_id)
 
         return session.execute(query).scalar_one_or_none()
-
-    def seconds_after(self, after: datetime) -> float:
-        return (self.sample_time_utc - after).seconds
-
-    def after(self, t: datetime) -> bool:
-        return self.sample_time_utc > t
 
     def __repr__(self) -> str:
         return (

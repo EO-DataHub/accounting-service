@@ -268,9 +268,13 @@ def test_workspace_usage_data_correctly_time_aggregated(
     db_session.flush()
 
     ############# Test
+    # Omitted rather than sent empty. The parameter is a closed enum, so "" is rejected like
+    # any other value that is not a period.
+    aggregation_param = f"&time-aggregation={aggregation}" if aggregation else ""
+
     response_pages = [
         client.get(
-            f"/workspaces/workspace1/accounting/usage-data?limit={page_size}&time-aggregation={aggregation}",
+            f"/workspaces/workspace1/accounting/usage-data?limit={page_size}{aggregation_param}",
             headers=AUTH_HEADERS,
         )
     ]
@@ -278,7 +282,7 @@ def test_workspace_usage_data_correctly_time_aggregated(
     after = response_pages[0].json()[-1]["uuid"]
     response_pages.append(
         client.get(
-            f"/workspaces/workspace1/accounting/usage-data?limit={page_size}&after={after}&time-aggregation={aggregation}",
+            f"/workspaces/workspace1/accounting/usage-data?limit={page_size}&after={after}{aggregation_param}",
             headers=AUTH_HEADERS,
         )
     )

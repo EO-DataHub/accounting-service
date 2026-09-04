@@ -19,9 +19,11 @@ were taken deliberately while it is being reworked.
 
 Also in this release, and not breaking:
 
-- An invalid `time-aggregation` value is rejected with 422 instead of being ignored. Asking
-  for `week` previously returned unaggregated rows and a 200. An empty value still means no
-  aggregation.
+- **`time-aggregation` is a closed set, strictly enforced.** `day` and `month` are accepted
+  and the parameter may be omitted. Everything else is a 422, including an empty value:
+  `?time-aggregation=` no longer means "no aggregation". Previously any unrecognised value,
+  `week` included, was silently ignored and returned unaggregated rows with a 200, so a
+  caller asking for weekly totals got daily rows and no indication of it.
 - `limit=0` and negative limits are rejected with 422. `limit=0` previously returned 100 rows.
 - Timestamps in responses are converted to UTC rather than being labelled `Z`. The reported
   time was an hour out whenever the database connection was not on UTC. The connection

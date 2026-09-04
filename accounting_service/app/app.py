@@ -15,9 +15,9 @@ from fastapi import (
     Query,
     Request,
 )
+from fastapi.responses import JSONResponse
 
 # noinspection PyPackageRequirements
-from fastapi.responses import JSONResponse
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from sqlalchemy import Result
 from sqlalchemy.orm import Session
