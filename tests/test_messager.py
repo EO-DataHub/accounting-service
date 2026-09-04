@@ -1,8 +1,8 @@
-from unittest import mock
 from uuid import UUID
 
 from eodhp_utils.pulsar import messages
 from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm.session import Session
 
 from accounting_service import models
@@ -17,7 +17,7 @@ from tests.conftest import (
 )
 
 
-def test_message_results_in_billingevent_in_db(db_session: Session) -> None:
+def test_message_results_in_billingevent_in_db(db_session: Session, db_session_factory: sessionmaker[Session]) -> None:
     ############# Setup
     bemsg, start, end = fake_event_known_times()
     db_session.add(models.BillingItem(sku=bemsg.sku, name="test", unit="GB-h"))
@@ -25,7 +25,7 @@ def test_message_results_in_billingevent_in_db(db_session: Session) -> None:
     db_session.commit()
 
     ############# Test
-    messager = AccountingIngesterMessager()
+    messager = AccountingIngesterMessager(session_factory=db_session_factory)
     failures = messager.consume(bemsg_to_pulsar_msg(bemsg))
 
     ############# Behaviour check
@@ -44,7 +44,9 @@ def test_message_results_in_billingevent_in_db(db_session: Session) -> None:
     assert beobj.item.sku == bemsg.sku
 
 
-def test_two_messages_same_uuid_results_in_one_billingevent_in_db(db_session: Session) -> None:
+def test_two_messages_same_uuid_results_in_one_billingevent_in_db(
+    db_session: Session, db_session_factory: sessionmaker[Session]
+) -> None:
     ############# Setup
     bemsg, _start, _end = fake_event_known_times()
     db_session.add(models.BillingItem(sku=bemsg.sku, name="test", unit="GB-h"))
@@ -52,7 +54,7 @@ def test_two_messages_same_uuid_results_in_one_billingevent_in_db(db_session: Se
     db_session.commit()
 
     ############# Test
-    messager = AccountingIngesterMessager()
+    messager = AccountingIngesterMessager(session_factory=db_session_factory)
 
     bemsg.quantity = float(1)
     failures1 = messager.consume(bemsg_to_pulsar_msg(bemsg))
@@ -72,7 +74,9 @@ def test_two_messages_same_uuid_results_in_one_billingevent_in_db(db_session: Se
     assert beobj.quantity == 1
 
 
-def test_message_with_no_user_results_in_billingevent_in_db(db_session: Session) -> None:
+def test_message_with_no_user_results_in_billingevent_in_db(
+    db_session: Session, db_session_factory: sessionmaker[Session]
+) -> None:
     ############# Setup
     bemsg = messages.BillingEvent.get_fake()
     bemsg.user = None
@@ -82,7 +86,7 @@ def test_message_with_no_user_results_in_billingevent_in_db(db_session: Session)
     db_session.commit()
 
     ############# Test
-    messager = AccountingIngesterMessager()
+    messager = AccountingIngesterMessager(session_factory=db_session_factory)
     failures = messager.consume(bemsg_to_pulsar_msg(bemsg))
 
     ############# Behaviour check
@@ -95,12 +99,14 @@ def test_message_with_no_user_results_in_billingevent_in_db(db_session: Session)
     assert beobj.user is None
 
 
-def test_message_with_unknown_sku_creates_billingitem(db_session: Session) -> None:
+def test_message_with_unknown_sku_creates_billingitem(
+    db_session: Session, db_session_factory: sessionmaker[Session]
+) -> None:
     ############# Setup
     bemsg = messages.BillingEvent.get_fake()
 
     ############# Test
-    messager = AccountingIngesterMessager()
+    messager = AccountingIngesterMessager(session_factory=db_session_factory)
     failures = messager.consume(bemsg_to_pulsar_msg(bemsg))
 
     ############# Behaviour check
@@ -112,13 +118,13 @@ def test_message_with_unknown_sku_creates_billingitem(db_session: Session) -> No
     assert beobj.item.sku == bemsg.sku
 
 
-def test_message_with_invalid_uuid_produces_permanent_failure() -> None:
+def test_message_with_invalid_uuid_produces_permanent_failure(db_session_factory: sessionmaker[Session]) -> None:
     ############# Setup
     bemsg = messages.BillingEvent.get_fake()
     bemsg.uuid = "abc"
 
     ############# Test
-    messager = AccountingIngesterMessager()
+    messager = AccountingIngesterMessager(session_factory=db_session_factory)
     failures = messager.consume(bemsg_to_pulsar_msg(bemsg))
 
     ############# Behaviour check
@@ -126,29 +132,31 @@ def test_message_with_invalid_uuid_produces_permanent_failure() -> None:
 
 
 def test_db_operational_error_produces_temporary_failure() -> None:
-    engine = create_engine("postgresql+psycopg://localhost:1/nonexistent")
-    with mock.patch("accounting_service.ingester.messager.db.engine", engine):
-        # session = scoped_session(sessionmaker(bind=engine))
-        ############# Setup
-        bemsg = messages.BillingEvent.get_fake()
+    """A database that cannot be reached is a temporary failure, so the message is retried."""
+    ############# Setup
+    unreachable = sessionmaker(bind=create_engine("postgresql+psycopg://localhost:1/nonexistent"))
+    bemsg = messages.BillingEvent.get_fake()
 
-        ############# Test
-        messager = AccountingIngesterMessager()
-        failures = messager.consume(bemsg_to_pulsar_msg(bemsg))
+    ############# Test
+    # Injected rather than patched. DBIngester takes a session factory precisely so a test
+    # does not have to reach into the module and swap a global engine.
+    messager = AccountingIngesterMessager(session_factory=unreachable)
+    failures = messager.consume(bemsg_to_pulsar_msg(bemsg))
 
-        ############# Behaviour check
-        assert not failures.any_permanent()
-        assert failures.any_temporary()
+    ############# Behaviour check
+    assert not failures.any_permanent()
+    assert failures.any_temporary()
 
 
 def test_message_with_new_workspace_settings_results_in_workspace_account_relationship_recorded(
     db_session: Session,
+    db_session_factory: sessionmaker[Session],
 ) -> None:
     ############# Setup
     msg = messages.WorkspaceSettings.get_fake()
 
     ############# Test
-    messager = WorkspaceSettingsIngesterMessager()
+    messager = WorkspaceSettingsIngesterMessager(session_factory=db_session_factory)
     failures = messager.consume(wsmsg_to_pulsar_msg(msg))
 
     ############# Behaviour check
@@ -160,12 +168,14 @@ def test_message_with_new_workspace_settings_results_in_workspace_account_relati
     assert wa.account == UUID(str(msg.account))
 
 
-def test_message_with_existing_workspace_changes_nothing(db_session: Session) -> None:
+def test_message_with_existing_workspace_changes_nothing(
+    db_session: Session, db_session_factory: sessionmaker[Session]
+) -> None:
     ############# Setup
     msg = messages.WorkspaceSettings.get_fake()
 
     ############# Test
-    messager = WorkspaceSettingsIngesterMessager()
+    messager = WorkspaceSettingsIngesterMessager(session_factory=db_session_factory)
     failures1 = messager.consume(wsmsg_to_pulsar_msg(msg))
     failures2 = messager.consume(wsmsg_to_pulsar_msg(msg))
 

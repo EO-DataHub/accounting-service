@@ -6,7 +6,6 @@ from typing import Any
 import pytest
 from eodhp_utils.pulsar import messages
 from faker import Faker
-from sqlalchemy import delete
 from sqlalchemy.orm.session import Session
 
 from accounting_service import models
@@ -190,7 +189,6 @@ def test_finding_billing_events_for_workspace(db_session: Session) -> None:
 
 def test_paging_billing_events_produces_all_events_once(db_session: Session) -> None:
     ############# Setup
-    db_session.execute(delete(models.BillingEvent))
     event_uuids, _account_uuids, _item_uuids = gen_billingitem_data(
         db_session,
         [

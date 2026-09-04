@@ -14,8 +14,9 @@ from accounting_service.ingester.messager import (
 
 def load_config_file(filename: str = "/etc/eodh/accounting.conf") -> None:
     try:
-        with open(filename) as f:
-            db.insert_configuration(f)
+        with open(filename) as f, db.get_sessionmaker()() as session:
+            db.insert_configuration(session, f)
+            session.commit()
     except FileNotFoundError:
         logging.warning("Configuration file %s not found - not loading item or price data", filename)
 

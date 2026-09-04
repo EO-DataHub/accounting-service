@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from typing import Any
@@ -10,9 +11,11 @@ from fastapi.testclient import TestClient
 
 # noinspection PyPackageRequirements
 from pulsar import Message
-from sqlalchemy.orm import Session, scoped_session, sessionmaker
+from sqlalchemy import Connection
+from sqlalchemy.orm import Session, sessionmaker
+from testcontainers.community.postgres import PostgresContainer
 
-from accounting_service import db
+from accounting_service import db, db_settings, models
 from accounting_service.app.app import app as fastapi_app
 from accounting_service.app.authz import decode_jwt_token
 from accounting_service.ingester.messager import (
@@ -76,22 +79,84 @@ TOKEN_NO_REALM_ACCESS: dict[str, Any] = {
 
 
 @pytest.fixture(scope="session")
-def db_session_factory() -> scoped_session[Session]:
-    """returns a SQLAlchemy scoped session factory"""
-    db.drop_tables()
-    db.create_db_and_tables()
-    return scoped_session(sessionmaker(bind=db.engine))
+def postgres_container() -> Iterator[PostgresContainer]:
+    """A throwaway PostgreSQL for the whole test session.
+
+    A real PostgreSQL rather than SQLite, because models.py writes different SQL for each -
+    date_trunc against datetime(), plus expression indexes SQLite cannot express - so testing
+    the SQLite path proved nothing about production.
+
+    A container rather than a shared instance, because the suite creates the schema and must
+    not be able to reach anything real. That replaces the earlier name-matching guard: the
+    tests cannot destroy a real database because they never learn how to reach one.
+    """
+    with PostgresContainer("postgres:17", driver="psycopg") as container:
+        os.environ["SQL_DRIVER"] = "postgresql+psycopg"
+        os.environ["SQL_HOST"] = container.get_container_host_ip()
+        os.environ["SQL_PORT"] = str(container.get_exposed_port(5432))
+        os.environ["SQL_USER"] = container.username
+        os.environ["SQL_PASSWORD"] = container.password
+        os.environ["SQL_DATABASE"] = container.dbname
+        os.environ["SQL_SCHEMA"] = "public"
+
+        # Nothing has read the settings or built the engine yet, because both are cached
+        # functions rather than module-level values. This is where the container's address
+        # takes effect.
+        db_settings.get_settings.cache_clear()
+        db.get_engine.cache_clear()
+        db.get_sessionmaker.cache_clear()
+
+        yield container
+
+
+@pytest.fixture(scope="session")
+def db_schema(postgres_container: PostgresContainer) -> None:
+    """Create the schema once. The container starts empty, so nothing is dropped."""
+    with db.get_engine().begin() as conn:
+        models.Base.metadata.create_all(conn)
 
 
 @pytest.fixture
-def db_session(db_session_factory: scoped_session[Session]) -> Iterator[Session]:
-    """yields a SQLAlchemy connection which is rollbacked after the test"""
-    session_ = db_session_factory()
+def db_connection(db_schema: None) -> Iterator[Connection]:
+    """A connection with an open transaction that is rolled back when the test ends.
 
-    yield session_
+    This is SQLAlchemy's documented recipe for test suites. Everything a test does - through
+    the fixture session, through the API, or through the ingester - happens inside this one
+    transaction, and rolling it back returns the database to an empty schema.
 
-    session_.rollback()
-    session_.close()
+    It is why tests no longer begin by deleting rows left behind by their predecessors.
+    """
+    connection = db.get_engine().connect()
+    transaction = connection.begin()
+
+    try:
+        yield connection
+    finally:
+        transaction.rollback()
+        connection.close()
+
+
+@pytest.fixture
+def db_session_factory(db_connection: Connection) -> sessionmaker[Session]:
+    """A session factory whose sessions join the test's transaction.
+
+    Pass this to DBIngester. Without it the ingester opens sessions on the process-wide
+    engine, outside the test's transaction, and its commits survive the test.
+    """
+    return sessionmaker(bind=db_connection, join_transaction_mode="create_savepoint")
+
+
+@pytest.fixture
+def db_session(db_session_factory: sessionmaker[Session]) -> Iterator[Session]:
+    """A session joined to the test's transaction.
+
+    join_transaction_mode="create_savepoint" turns the session's own commits into savepoint
+    releases, so code under test can call commit() freely and the outer rollback still
+    discards everything. A plain session.rollback() in teardown could not do that, which is
+    why state used to leak between tests.
+    """
+    with db_session_factory() as session:
+        yield session
 
 
 def fake_event_known_times() -> tuple[messages.BillingEvent, datetime, datetime]:

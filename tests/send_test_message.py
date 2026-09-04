@@ -10,8 +10,6 @@ Run `sudo -u postgres psql` and then use SQL:
   alter user accounting with password 'changeme';
 
 Edit .env:
-    #SQL_DRIVER="sqlite+pysqlite"
-
     # Example for PostgreSQL
     SQL_DRIVER="postgresql+psycopg"
     SQL_USER="accounting"

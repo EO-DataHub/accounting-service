@@ -7,12 +7,34 @@ from uuid import UUID
 from eodhp_utils.messagers import Messager, PulsarJSONMessager
 from eodhp_utils.pulsar import messages
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from accounting_service import db, models
 
 
 class DBIngester:
+    """
+    Shared database handling for the ingester messagers.
+
+    `session_factory` exists so a caller can supply the sessions this ingester opens. The
+    ingester is not built by FastAPI, so it has no dependency injection of its own, and
+    without this seam a test can only redirect it by patching a module global. Left unset,
+    it uses the process-wide factory.
+    """
+
+    def __init__(self, session_factory: sessionmaker[Session] | None = None) -> None:
+        # Messager's own arguments (s3_client, output_bucket, producer) all default and none
+        # of these messagers use them, so there is nothing to forward. Add a parameter here
+        # if that changes.
+        super().__init__()
+        self._session_factory = session_factory
+
+    def _session(self) -> Session:
+        # Resolved per call rather than in __init__, so constructing a messager needs no
+        # database configuration.
+        factory = self._session_factory or db.get_sessionmaker()
+        return factory()
+
     def is_temporary_error(self, e: Exception) -> bool:
         if isinstance(e, OperationalError):
             return True
@@ -20,7 +42,7 @@ class DBIngester:
         return False
 
     def _add_observed_sku(self, msg: messages.BillingEvent | messages.BillingResourceConsumptionRateSample) -> None:
-        with Session(db.engine) as session:
+        with self._session() as session:
             models.BillingItem.ensure_sku_exists(session, str(msg.sku))
             session.commit()
 
@@ -59,7 +81,7 @@ class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.Billing
         return []
 
     def _try_record_event(self, bemsg: messages.BillingEvent) -> UUID | None:
-        with Session(db.engine) as session:
+        with self._session() as session:
             uuid_ = models.BillingEvent.insert_from_message(session, bemsg)
             session.commit()
 
@@ -68,7 +90,7 @@ class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.Billing
 
 class WorkspaceSettingsIngesterMessager(DBIngester, PulsarJSONMessager[messages.WorkspaceSettings, bytes]):
     def process_payload(self, obj: messages.WorkspaceSettings) -> Sequence[Messager.Action]:
-        with Session(db.engine) as session:
+        with self._session() as session:
             recorded = models.WorkspaceAccount.record_mapping(session, UUID(str(obj.account)), str(obj.name))
             session.commit()
 
@@ -127,14 +149,13 @@ class ConsumptionSampleRateIngesterMessager(
             logging.info("Received duplicate %s uuid %s", type(msg), msg.uuid)
 
     def _try_record_event(self, msg: messages.BillingResourceConsumptionRateSample) -> UUID | None:
-        with Session(db.engine) as session:
+        with self._session() as session:
             uuid_ = models.BillableResourceConsumptionRateSample.insert_from_message(session, msg)
             session.commit()
 
         return uuid_
 
-    @staticmethod
-    def _generate_new_estimates(workspace: str, sku: str, upto: datetime) -> None:
+    def _generate_new_estimates(self, workspace: str, sku: str, upto: datetime) -> None:
         """
         This generates BillingEvents with estimated resource consumption for one hour windows, each
         starting on the hour. The first will begin at the end time of the last generated
@@ -150,7 +171,7 @@ class ConsumptionSampleRateIngesterMessager(
             upto,
         )
 
-        with Session(db.engine) as session:
+        with self._session() as session:
             item = models.BillingItem.find_billing_item(session, sku=sku)
             assert item is not None  # _record_event would have failed without it
 

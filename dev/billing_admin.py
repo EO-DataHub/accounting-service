@@ -39,7 +39,7 @@ def cli(ctx: click.Context) -> None:
     """
     Manage billing items and prices directly against the database.
     """
-    ctx.obj = session = Session(db.engine)
+    ctx.obj = session = Session(db.get_engine())
 
     @ctx.call_on_close
     def close_client() -> None:
@@ -138,11 +138,12 @@ def _list_all_items(session: Session) -> None:
 
 # noinspection unresolved-references,argument-list
 @cli.command("set-price")
+@click.pass_obj
 @click.option("-s", "--sku", help="SKU to set price for", required=True)
 @click.option("-p", "--price", help="The set price in credits per unit", type=float, required=True)
 @click.option("--valid", help="The date and time from which the price is valid", type=click.DateTime(), required=True)
 @handle_errors
-def set_price(sku: str, price: float, valid: datetime) -> None:
+def set_price(session: Session, sku: str, price: float, valid: datetime) -> None:
     """
     Sets a price for an existing billing item.
 
@@ -151,7 +152,8 @@ def set_price(sku: str, price: float, valid: datetime) -> None:
     """
     configuration = {"prices": [{"sku": sku, "price": price, "valid_from": valid.isoformat()}]}
     j = json.dumps(configuration)
-    db.insert_configuration(StringIO(j))
+    db.insert_configuration(session, StringIO(j))
+    session.commit()
     console.print(f"[green]Set {sku} to {price} from {valid.isoformat()}[/green]")
 
 
@@ -179,7 +181,8 @@ def add_item(session: Session, sku: str, name: str, unit: str, price: float, val
     }
     j = json.dumps(configuration)
 
-    db.insert_configuration(StringIO(j))
+    db.insert_configuration(session, StringIO(j))
+    session.commit()
     console.print(f"[green]Added {sku} ({name}, {unit}) with price {price} from {valid.isoformat()}[/green]")
 
 
@@ -213,7 +216,8 @@ def update_item(session: Session, sku: str, name: str | None, unit: str | None) 
     }
     j = json.dumps(configuration)
 
-    db.insert_configuration(StringIO(j))
+    db.insert_configuration(session, StringIO(j))
+    session.commit()
     console.print(f"[green]Updated {sku}[/green]")
 
 

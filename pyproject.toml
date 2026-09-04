@@ -49,6 +49,7 @@ dev = [
     "validate-pyproject",
     "faker",
     "httpx2",
+    "testcontainers[postgres]",
 ]
 
 [project.urls]
@@ -79,7 +80,6 @@ eodhp-utils = { git = "https://github.com/UKEODHP/eodhp-utils", tag = "v0.1.15" 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib"]
 markers = [
-    "integrationtest: Integration test"
 ]
 
 [tool.ruff]

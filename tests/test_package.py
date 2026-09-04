@@ -3,15 +3,24 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from faker import Faker
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 from sqlalchemy.orm import Session
 
 import accounting_service.db
-from accounting_service.models import BillingItem, BillingItemPrice
+from accounting_service.models import Base, BillingItem, BillingItemPrice
 
 
-def test_model_creation() -> None:
-    accounting_service.db.create_db_and_tables()
+def test_model_creation(db_session: Session) -> None:
+    """The models produce a schema containing every table they declare.
+
+    This used to call create_db_and_tables and assert nothing, so it only failed if the DDL
+    itself was invalid. Requesting db_session builds the schema through the session fixture,
+    which lets the assertion be about the result.
+    """
+    present = set(inspect(db_session.get_bind()).get_table_names())
+    missing = set(Base.metadata.tables) - present
+
+    assert not missing, f"Tables declared by the models but not created: {sorted(missing)}"
 
 
 def test_item_and_price_creation_via_config_file_results_in_correct_object_in_db(
@@ -31,7 +40,7 @@ prices:
     price: 12.34
 """
 
-    accounting_service.db.insert_configuration(io.StringIO(test_config))
+    accounting_service.db.insert_configuration(db_session, io.StringIO(test_config))
 
     bi = BillingItem.find_billing_item(db_session, test_sku)
     assert bi is not None
@@ -80,8 +89,8 @@ prices:
     price: 11.0
 """
 
-    accounting_service.db.insert_configuration(io.StringIO(test_config))
-    accounting_service.db.insert_configuration(io.StringIO(test_config_update))
+    accounting_service.db.insert_configuration(db_session, io.StringIO(test_config))
+    accounting_service.db.insert_configuration(db_session, io.StringIO(test_config_update))
 
     bi = BillingItem.find_billing_item(db_session, test_sku)
     assert bi is not None

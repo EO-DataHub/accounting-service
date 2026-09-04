@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from eodhp_utils.pulsar import messages
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm.session import Session
 
 from accounting_service import models
@@ -9,7 +10,7 @@ from accounting_service.ingester.messager import ConsumptionSampleRateIngesterMe
 from tests.conftest import msg_to_pulsar_msg
 
 
-def test_message_results_in_sample_in_db(db_session: Session) -> None:
+def test_message_results_in_sample_in_db(db_session: Session, db_session_factory: sessionmaker[Session]) -> None:
     ############# Setup
     crs = messages.BillingResourceConsumptionRateSample.get_fake()
     msg = msg_to_pulsar_msg(ConsumptionSampleRateIngesterMessager, crs)
@@ -19,7 +20,7 @@ def test_message_results_in_sample_in_db(db_session: Session) -> None:
     db_session.commit()
 
     ############# Test
-    messager = ConsumptionSampleRateIngesterMessager()
+    messager = ConsumptionSampleRateIngesterMessager(session_factory=db_session_factory)
     failures = messager.consume(msg)
 
     ############# Behaviour check
@@ -36,7 +37,9 @@ def test_message_results_in_sample_in_db(db_session: Session) -> None:
     assert obj.item.sku == crs.sku
 
 
-def test_messages_across_two_hours_generates_appropriate_billing_events(db_session: Session) -> None:
+def test_messages_across_two_hours_generates_appropriate_billing_events(
+    db_session: Session, db_session_factory: sessionmaker[Session]
+) -> None:
     ############# Setup
 
     crs1 = messages.BillingResourceConsumptionRateSample.get_fake(sample_time="2025-01-01T01:30:00Z", rate=2)
@@ -52,7 +55,7 @@ def test_messages_across_two_hours_generates_appropriate_billing_events(db_sessi
     msg2 = msg_to_pulsar_msg(ConsumptionSampleRateIngesterMessager, crs2)
 
     ############# Test
-    messager = ConsumptionSampleRateIngesterMessager()
+    messager = ConsumptionSampleRateIngesterMessager(session_factory=db_session_factory)
     failures1 = messager.consume(msg1)
     failures2 = messager.consume(msg2)
 

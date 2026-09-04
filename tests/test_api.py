@@ -8,7 +8,6 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete
 from sqlalchemy.orm.session import Session
 
 from accounting_service import models
@@ -32,7 +31,6 @@ AUTH_HEADERS = {"Authorization": f"Bearer {MOCK_TOKEN}"}
 
 def test_workspace_usage_data_returns_correct_items_from_db(db_session: Session, client: TestClient) -> None:
     ############# Setup
-    db_session.execute(delete(models.BillingEvent))
     uid = uuid.uuid4()
     event_uuids, _account_uuids, _item_uuids = gen_billingitem_data(
         db_session,
@@ -74,7 +72,6 @@ def test_workspace_usage_data_returns_correct_items_from_db(db_session: Session,
 
 def test_workspace_usage_data_correctly_paged(db_session: Session, client: TestClient) -> None:
     ############# Setup
-    db_session.execute(delete(models.BillingEvent))
     _event_uuids, _account_uuids, _item_uuids = gen_billingitem_data(
         db_session,
         [
@@ -213,7 +210,6 @@ def test_workspace_usage_data_correctly_time_aggregated(
     db_session: Session, client: TestClient, aggregation: str, page_size: int, results: list[list[dict[str, Any]]]
 ) -> None:
     ############# Setup
-    db_session.execute(delete(models.BillingEvent))
     _event_uuids, _account_uuids, _item_uuids = gen_billingitem_data(
         db_session,
         [
@@ -306,7 +302,6 @@ def test_workspace_usage_data_correctly_time_aggregated(
 
 def test_account_usage_data_returns_correct_items_from_db(db_session: Session, client: TestClient) -> None:
     ############# Setup
-    db_session.execute(delete(models.BillingEvent))
 
     account_uuid = uuid.uuid4()
     db_session.add(models.WorkspaceAccount(workspace="workspace1", account=account_uuid))
@@ -368,8 +363,6 @@ def test_account_usage_data_returns_correct_items_from_db(db_session: Session, c
 
 def test_skus_list_api_returns_items_correctly(db_session: Session, client: TestClient) -> None:
     ############# Setup
-    db_session.execute(delete(models.BillingEvent))
-    db_session.execute(delete(models.BillingItem))
 
     uuid_sku1 = uuid.uuid4()
     uuid_sku2 = uuid.uuid4()
@@ -392,8 +385,6 @@ def test_skus_list_api_returns_items_correctly(db_session: Session, client: Test
 
 def test_skus_api_returns_item_correctly(db_session: Session, client: TestClient) -> None:
     ############# Setup
-    db_session.execute(delete(models.BillingEvent))
-    db_session.execute(delete(models.BillingItem))
 
     uuid_sku1 = uuid.uuid4()
 
@@ -506,7 +497,6 @@ def test_account_usage_data_allows_listed_account(
 
 def test_prices_api_returns_current_prices_correctly(db_session: Session, client: TestClient) -> None:
     ############# Setup
-    db_session.execute(delete(models.BillingItemPrice))
 
     uuid_item_a = uuid.uuid4()
     uuid_item_b = uuid.uuid4()

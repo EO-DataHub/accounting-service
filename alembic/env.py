@@ -3,11 +3,9 @@
 The database URL comes from accounting_service.db_settings rather than from
 alembic.ini, so migrations always target the same database as the application.
 
-Note that accounting_service.models chooses some indexes based on the driver in
-use (see the is_sqlite() guards in models.py). Autogenerate therefore reflects
-whichever driver SQL_DRIVER names when it runs. Generate migrations with
-SQL_DRIVER set to postgresql+psycopg, or PostgreSQL-only indexes will be
-silently missing from the revision.
+The service is PostgreSQL only. models.py used to select some indexes by driver,
+so a revision generated under SQLite silently omitted them; that is no longer
+possible.
 """
 
 from logging.config import fileConfig
@@ -33,10 +31,21 @@ target_metadata = models.Base.metadata
 #
 # They are excluded from comparison instead.
 #
-# IMPORTANT: include_object governs rendering as well as comparison, so an index
-# named here is left out of generated revisions too. These two are written by
-# hand in the baseline revision. Add any new entry to a migration yourself, and
-# do not expect alembic check to notice if one goes missing.
+# IMPORTANT, and the reason this list needs care: include_object governs rendering
+# as well as comparison, so an index named here is left out of generated revisions
+# too.
+#
+# The consequence is that `alembic check` reports CLEAN when these indexes are
+# missing from the schema. The check is not unreliable in general; it cannot see
+# these two at all, because this hook hides them from it.
+#
+# That has already happened here once. A regenerated baseline dropped both
+# indexes, `alembic check` reported no changes, and it was caught only by reading
+# the revision file and noticing it contained no date_trunc.
+#
+# So: these two are written by hand in the baseline revision. If you regenerate it,
+# re-add them by hand and confirm by reading the SQL rather than by running
+# `alembic check`. Anything added to this list inherits the same problem.
 UNCOMPARED_INDEXES = frozenset(
     {
         "billingevent_day_aggregate_index",
@@ -85,8 +94,7 @@ def run_migrations_online() -> None:
 
     A caller can inject an open connection through config.attributes, which lets
     migrations run against a database other than the one db_settings names. The
-    integration tests use this to migrate a throwaway database; the caller owns
-    the transaction in that case.
+    caller owns the transaction in that case.
     """
     injected = config.attributes.get("connection")
 
@@ -96,7 +104,6 @@ def run_migrations_online() -> None:
 
     connectable = create_engine(
         db_settings.get_db_url(),
-        connect_args=db_settings.connect_args,
         poolclass=pool.NullPool,
     )
 
