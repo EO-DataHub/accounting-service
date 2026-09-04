@@ -5,6 +5,7 @@ from collections import namedtuple
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 from typing import Any, Self, cast
 from uuid import UUID, uuid4
 
@@ -303,6 +304,20 @@ def datetime_default_to_utc(dt: datetime | None) -> datetime | None:
     return dt
 
 
+class TimeAggregation(StrEnum):
+    """
+    Periods that usage data can be totalled over.
+
+    This is a closed set for two reasons. An unrecognised value used to be ignored silently,
+    so a caller asking for weekly totals got ungrouped rows and a 200. And the value is
+    interpolated into SQL in find_billing_events, so the set of permitted values is a
+    security boundary as well as a validation rule.
+    """
+
+    DAY = "day"
+    MONTH = "month"
+
+
 class AfterBillingEventNotFound(Exception):
     """Raised when paging and specifying the page after an unknown event"""
 
@@ -386,15 +401,15 @@ class BillingEvent(Base):
         end: datetime | None = None,
         after: UUID | None = None,
         limit: int = 5_000,
-        time_aggregation: str | None = None,
+        time_aggregation: TimeAggregation | None = None,
     ) -> Iterator[Self]:
         """
         Find and return BillingEvents matching some criteria.
 
         For paging, `after` should be the UUID of the last billing event on the previous page.
 
-        time_aggregation may be 'day' or 'month' to provide daily or monthly totals for each
-        SKU+workspace pair.
+        time_aggregation gives daily or monthly totals for each SKU+workspace pair. Anything
+        outside TimeAggregation raises ValueError rather than being ignored.
         """
         # With no time aggregation we use the raw table as the source of rows to filter, sort,
         # page and return.
@@ -404,9 +419,14 @@ class BillingEvent(Base):
         # aggregated. This isn't perfect and can result in errors when fetching the last pages
         # because new BillingEvents can arrive whilst paging and change the maximum UUIDs.
         # This does not happen very often, especially with large page sizes.
-        if time_aggregation in {"day", "month"}:
-            period_start_expr = f"date_trunc('{time_aggregation}', event_start AT TIME ZONE 'UTC')"
-            period_end_expr = f"{period_start_expr} + '1 {time_aggregation}'::interval"
+        if time_aggregation is not None:
+            # Coerced rather than trusted. The value is interpolated into the SQL below, so
+            # the closed set has to be enforced at runtime and not only in the type hints.
+            # TimeAggregation(...) raises ValueError on anything else.
+            period = TimeAggregation(time_aggregation).value
+
+            period_start_expr = f"date_trunc('{period}', event_start AT TIME ZONE 'UTC')"
+            period_end_expr = f"{period_start_expr} + '1 {period}'::interval"
             uuid_expr = "CAST(MAX(CAST(uuid AS TEXT)) AS UUID)"
 
             select_aggregated_events = text(

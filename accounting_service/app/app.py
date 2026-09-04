@@ -3,7 +3,7 @@ import os
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from http import HTTPStatus
-from typing import Annotated, Any
+from typing import Annotated
 from uuid import UUID
 
 from eodhp_utils.runner import log_component_version, setup_logging
@@ -13,24 +13,35 @@ from fastapi import (
     HTTPException,
     Path,
     Query,
-    Response,
+    Request,
 )
 
 # noinspection PyPackageRequirements
+from fastapi.responses import JSONResponse
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from pydantic import BaseModel, Field
-from sqlalchemy import Result, Row
+from sqlalchemy import Result
 from sqlalchemy.orm import Session
 
 from accounting_service.app.authz import MinTier
-from accounting_service.app.dependencies import require_account, require_workspace
+from accounting_service.app.dependencies import (
+    global_data_cache,
+    require_account,
+    require_workspace,
+    usage_data_cache,
+)
 from accounting_service.db import get_session
 from accounting_service.models import (
     AfterBillingEventNotFound,
     BillingEvent,
     BillingItem,
     BillingItemPrice,
-    datetime_default_to_utc,
+)
+
+from .models import (
+    BillingEventAPIResult,
+    BillingItemAPIResult,
+    BillingItemPriceAPIResult,
+    UsageQuery,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +53,7 @@ log_component_version("accounting-service")
 root_path = os.environ.get("ROOT_PATH", "/api/")
 
 SessionDep = Annotated[Session, Depends(get_session)]
+
 
 app = FastAPI(root_path=root_path)
 
@@ -56,122 +68,23 @@ FastAPIInstrumentor.instrument_app(app)
 # The sub-paths within the first two are the same, we just filter the data differently.
 
 
-class BillingEventAPIResult(BaseModel):
+@app.exception_handler(AfterBillingEventNotFound)
+def handle_after_billing_event_not_found(_request: Request, exc: AfterBillingEventNotFound) -> JSONResponse:
+    """Paging from an event that does not exist is a 404.
+
+    Registered once rather than caught in each handler, so a query endpoint added later gets
+    this without having to remember it.
     """
-    Billing events represent the consumption of a chargeable resource, often over some time
-    period. Where consumption happens at a single timepoint, the start and end times will
-    be identical.
-
-    All consumption happens within a specific workspace and all charges are attributed to
-    a single workspace.
-    """
-
-    uuid: UUID
-    event_start: Annotated[
-        datetime,
-        Field(description="Start time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
-    ]
-    event_end: Annotated[
-        datetime,
-        Field(description="End time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
-    ]
-    item: Annotated[str, Field(description="Item (SKU) consumed", examples=["wfcpu"])]
-    workspace: Annotated[str, Field(description="Workspace which consumed the resource", examples=["my-workspace"])]
-    quantity: Annotated[
-        float,
-        Field(
-            description="Quantity consumed in the units defined in the item definition",
-            examples=["0.42"],
-        ),
-    ]
-
-
-def billingevent_to_api_object(event: BillingEvent) -> dict[str, Any]:
-    return {
-        "uuid": event.uuid,
-        "event_start": event.event_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "event_end": event.event_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "item": event.item.sku,
-        "workspace": event.workspace,
-        "quantity": event.quantity,
-    }
-
-
-class BillingItemAPIResult(BaseModel):
-    """
-    A billing item is a product you can buy from EO DataHub, like CPU time.
-    """
-
-    uuid: UUID
-    sku: Annotated[
-        str,
-        Field(
-            description="Human-readable codename (SKU/stock-keeping unit) for the item",
-            examples=["wfcpu"],
-        ),
-    ]
-    name: Annotated[
-        str,
-        Field(description="Human-readable name for the item", examples=["Workflow CPU seconds"]),
-    ]
-    unit: Annotated[str, Field(description="Unit the item is priced in", examples=["GB-months"])]
-
-
-def billingitem_to_api_object(item: BillingItem) -> dict[str, str]:
-    return {
-        "uuid": str(item.uuid),
-        "sku": item.sku,
-        "name": item.name,
-        "unit": item.unit,
-    }
-
-
-class BillingItemPriceAPIResult(BaseModel):
-    """
-    A billing item price gives the price-per-unit of a billing item which is/was in force between
-    certain dates.
-    """
-
-    uuid: UUID
-    sku: Annotated[str, Field(description="The product this applies to", examples=["wfcpu"])]
-    valid_from: datetime
-    valid_until: Annotated[datetime | None, Field(description="Price was in-force until this time")] = None
-    price: Annotated[float, Field(description="Price-per-unit in Pounds", examples=["0.001"])]
-
-
-def billingitemprice_to_api_object(price: Row[tuple[BillingItemPrice, str]]) -> dict:
-    result = {
-        "uuid": str(price[0].uuid),
-        "sku": price[1],
-        "valid_from": price[0].valid_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "price": price[0].price,
-    }
-
-    if price[0].valid_until:
-        result["valid_until"] = price[0].valid_until.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    return result
-
-
-def add_usage_data_headers(response: Response) -> None:
-    response.headers["Vary"] = "Cookie,Authorization,Accept-Encoding"
-    response.headers["Cache-Control"] = "private,max-age=5"
-
-
-def add_global_data_headers(response: Response) -> None:
-    response.headers["Vary"] = "Accept-Encoding"
-    response.headers["Cache-Control"] = "private,max-age=300"
+    return JSONResponse(status_code=HTTPStatus.NOT_FOUND, content={"detail": str(exc)})
 
 
 @app.get(
     "/workspaces/{workspace}/accounting/usage-data",
-    response_model=list[BillingEventAPIResult],
     summary="Get resource consumption data for a workspace",
-    dependencies=[Depends(require_workspace(MinTier.MEMBER))],
+    dependencies=[Depends(require_workspace(MinTier.MEMBER)), Depends(usage_data_cache)],
 )
 def get_workspace_usage_data(
     session: SessionDep,
-    response: Response,
     workspace: Annotated[
         str,
         Path(
@@ -180,53 +93,8 @@ def get_workspace_usage_data(
             examples=["my-workspace"],
         ),
     ],
-    start: Annotated[
-        datetime | None,
-        Query(
-            title="Start timestamp (RFC8601 timestamp)",
-            description="Only billing events which ended after this time are included",
-            examples=["2025-02-12T13:34:22Z"],
-        ),
-    ] = None,
-    end: Annotated[
-        datetime | None,
-        Query(
-            title="End timestamp (RFC8601 timestamp)",
-            description="Only billing events which started before this time are included",
-            examples=["2025-02-15T13:34:22Z"],
-        ),
-    ] = None,
-    limit: Annotated[
-        int | None,
-        Query(
-            title="Maximum number of results to return",
-            description=("When paging, set this to the page size and use 'after' to fetch " + "subsequent pages"),
-            examples=["200"],
-        ),
-    ] = 100,
-    after: Annotated[
-        UUID | None,
-        Query(
-            title="Paging continuation location",
-            description=(
-                "When paging with 'limit', set this to the UUID of the last billing "
-                + "event you saw to get the next page of results."
-            ),
-            examples=["456e15d1-d01b-4060-8b7b-85b93ecbf050"],
-        ),
-    ] = None,
-    time_aggregation: Annotated[
-        str | None,
-        Query(
-            alias="time-aggregation",
-            title="Time aggregation of results",
-            description=(
-                "Optionally aggregate usage information into totals for the given time periods - " + "'day' or 'month'"
-            ),
-            examples=["day", "month"],
-        ),
-    ] = None,
-) -> list[dict[str, Any]]:
+    query: Annotated[UsageQuery, Query()],
+) -> list[BillingEventAPIResult]:
     """
     This returns resource consumption data for a workspace within some given time range (or all).
     Start and end times can be given in which case all consumption which overlaps this, even
@@ -236,35 +104,26 @@ def get_workspace_usage_data(
     never be aggregated across day boundaries (midnight UTC).
     """
 
-    start = datetime_default_to_utc(start)
-    end = datetime_default_to_utc(end)
+    events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
+        session,
+        workspace=workspace,
+        start=query.start,
+        end=query.end,
+        limit=query.limit,
+        after=query.after,
+        time_aggregation=query.time_aggregation,
+    )
 
-    try:
-        events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
-            session,
-            workspace=workspace,
-            start=start,
-            end=end,
-            limit=limit or 100,
-            after=after,
-            time_aggregation=time_aggregation,
-        )
-    except AfterBillingEventNotFound as e:
-        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(e)) from e
-
-    add_usage_data_headers(response)
-    return list(map(billingevent_to_api_object, events))
+    return [BillingEventAPIResult.from_billing_event(event) for event in events]
 
 
 @app.get(
     "/accounts/{account_id}/accounting/usage-data",
-    response_model=list[BillingEventAPIResult],
     summary="Get resource consumption data for all workspaces in a billing account",
-    dependencies=[Depends(require_account)],
+    dependencies=[Depends(require_account), Depends(usage_data_cache)],
 )
 def get_account_usage_data(
     session: SessionDep,
-    response: Response,
     account_id: Annotated[
         UUID,
         Path(
@@ -276,53 +135,8 @@ def get_account_usage_data(
             examples=["4b48ebea-bdb8-4bb9-bce9-a7853ad3965d"],
         ),
     ],
-    start: Annotated[
-        datetime | None,
-        Query(
-            title="Start timestamp (RFC8601 timestamp)",
-            description="Only billing events which ended after this time are included",
-            examples=["2025-02-12T13:34:22Z"],
-        ),
-    ] = None,
-    end: Annotated[
-        datetime | None,
-        Query(
-            title="End timestamp (RFC8601 timestamp)",
-            description="Only billing events which started before this time are included",
-            examples=["2025-02-15T13:34:22Z"],
-        ),
-    ] = None,
-    limit: Annotated[
-        int | None,
-        Query(
-            title="Maximum number of results to return",
-            description=("When paging, set this to the page size and use 'after' to fetch " + "subsequent pages"),
-            examples=["200"],
-        ),
-    ] = 100,
-    after: Annotated[
-        UUID | None,
-        Query(
-            title="Paging continuation location",
-            description=(
-                "When paging with 'limit', set this to the UUID of the last billing "
-                + "event you saw to get the next page of results."
-            ),
-            examples=["456e15d1-d01b-4060-8b7b-85b93ecbf050"],
-        ),
-    ] = None,
-    time_aggregation: Annotated[
-        str | None,
-        Query(
-            alias="time-aggregation",
-            title="Time aggregation of results",
-            description=(
-                "Optionally aggregate usage information into totals for the given time periods - " + "'day' or 'month'"
-            ),
-            examples=["day", "month"],
-        ),
-    ] = None,
-) -> list[dict[str, Any]]:
+    query: Annotated[UsageQuery, Query()],
+) -> list[BillingEventAPIResult]:
     """
     This returns resource consumption data for all workspaces billed to a specified account an
     within some given time range (or all).
@@ -333,64 +147,55 @@ def get_account_usage_data(
     never be aggregated across day boundaries (midnight UTC).
     """
 
-    start = datetime_default_to_utc(start)
-    end = datetime_default_to_utc(end)
+    events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
+        session,
+        account=account_id,
+        start=query.start,
+        end=query.end,
+        limit=query.limit,
+        after=query.after,
+        time_aggregation=query.time_aggregation,
+    )
 
-    try:
-        events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
-            session,
-            account=account_id,
-            start=start,
-            end=end,
-            limit=limit or 100,
-            after=after,
-            time_aggregation=time_aggregation,
-        )
-    except AfterBillingEventNotFound as e:
-        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(e)) from e
-
-    add_usage_data_headers(response)
-    return list(map(billingevent_to_api_object, events))
+    return [BillingEventAPIResult.from_billing_event(event) for event in events]
 
 
 @app.get(
     "/accounting/skus",
     summary="Describe available billing items (products / stock-keeping units).",
-    response_model=list[BillingItemAPIResult],
+    dependencies=[Depends(global_data_cache)],
 )
-def get_item_list(session: SessionDep, response: Response) -> list[dict[str, str]]:
+def get_item_list(session: SessionDep) -> list[BillingItemAPIResult]:
     """
     This returns all available billing items in SKU order. A billing item is a single 'product'
     sold by EO DataHub, such as CPU time or object storage. Note that prices must be fetched
     separately and may vary over time.
     """
     items: Iterator[BillingItem] = BillingItem.find_billing_items(session)
-    add_global_data_headers(response)
-    return list(map(billingitem_to_api_object, items))
+    return [BillingItemAPIResult.from_billing_item(item) for item in items]
 
 
 @app.get(
     "/accounting/skus/{sku}",
     summary="Describe a single billing item",
-    response_model=BillingItemAPIResult,
+    dependencies=[Depends(global_data_cache)],
 )
-def get_item(session: SessionDep, response: Response, sku: str) -> dict[str, str]:
+def get_item(session: SessionDep, sku: str) -> BillingItemAPIResult:
     """This returns a specific billing item based on its SKU."""
     item: BillingItem | None = BillingItem.find_billing_item(session, sku)
 
     if item is None:
         raise HTTPException(status_code=404, detail="SKU not known", headers={"Cache-Control": "max-age=60"})
-    else:
-        add_global_data_headers(response)
-        return billingitem_to_api_object(item)
+
+    return BillingItemAPIResult.from_billing_item(item)
 
 
 @app.get(
     "/accounting/prices",
     summary="Return all current EO DataHub prices",
-    response_model=list[BillingItemPriceAPIResult],
+    dependencies=[Depends(global_data_cache)],
 )
-def get_prices(session: SessionDep, response: Response) -> list[dict[str, Any]]:
+def get_prices(session: SessionDep) -> list[BillingItemPriceAPIResult]:
     """
     This returns all current prices in SKU order. Prices which were only valid in the past or will
     be in the future are not returned. The cost is given in Pounds per unit, where the unit is
@@ -398,5 +203,4 @@ def get_prices(session: SessionDep, response: Response) -> list[dict[str, Any]]:
     """
     prices: Result[tuple[BillingItemPrice, str]] = BillingItemPrice.find_prices(session, datetime.now(UTC))
 
-    add_global_data_headers(response)
-    return list(map(billingitemprice_to_api_object, prices))
+    return [BillingItemPriceAPIResult.from_billing_item_price(price, sku) for price, sku in prices]

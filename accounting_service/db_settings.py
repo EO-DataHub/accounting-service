@@ -51,5 +51,8 @@ def get_db_url() -> URL:
         host=settings.SQL_HOST,
         port=settings.SQL_PORT,
         database=settings.SQL_DATABASE,
-        query={"options": f"-c search_path={settings.SQL_SCHEMA}"},
+        # timezone is pinned so that what the driver hands back does not depend on how the
+        # server happens to be configured. Values are stored as timestamptz, so the instant
+        # is never wrong, but the offset the driver applies would otherwise vary by server.
+        query={"options": f"-c search_path={settings.SQL_SCHEMA} -c timezone=UTC"},
     )

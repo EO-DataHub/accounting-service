@@ -547,14 +547,17 @@ def test_prices_api_returns_current_prices_correctly(db_session: Session, client
     assert response.json() == [
         {
             "uuid": str(uuid_price1),
-            "price": 2.34,
+            # An exact decimal string, not a float: the back end keeps the precision and the
+            # UI decides how to display it.
+            "price": "2.34",
             "valid_from": "2024-01-16T00:00:00Z",
             "valid_until": None,
             "sku": "sku1",
         },
         {
             "uuid": str(uuid_price3),
-            "price": 0.000000412,
+            # Never scientific notation, which is what Pydantic's own Decimal output gives.
+            "price": "0.000000412",
             "valid_from": "2023-01-16T00:00:00Z",
             "valid_until": None,
             "sku": "sku2",
