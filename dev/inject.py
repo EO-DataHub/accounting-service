@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.json import JSON
 from rich.logging import RichHandler
 
-from accounting_service.ingester.messager import AccountingIngesterMessager
+from accounting_service.ingester.messager import AccountingIngesterMessager, WorkspaceSettingsIngesterMessager
 
 console = Console(stderr=False)
 logging.basicConfig(handlers=[RichHandler(show_time=False, show_path=False)], level=0, force=True)
@@ -56,6 +56,28 @@ def billing_event(client: pulsar.Client, workspace: str, sku: str, quantity: flo
     console.print(JSON.from_data(bemsg.__dict__))
     producer.send(bemsg)
     console.print("[blue]billing-event[/blue] sent")
+
+    producer.close()
+
+
+@cli.command("workspace-settings")
+@click.pass_obj
+@click.option("-w", "--workspace", help="Workspace to send billing event to", required=True)
+def workspace_settings_event(client: pulsar.Client, workspace: str) -> None:
+    setup_logging(verbosity=3, enable_otel_logging=True)
+
+    console.print("Creating a [blue]workspace-settings[/blue] producer")
+    producer = client.create_producer(
+        topic="workspace-settings", schema=WorkspaceSettingsIngesterMessager.get_schema()
+    )
+
+    wsmsg = messages.WorkspaceSettings.get_fake()
+    wsmsg.name = workspace
+
+    console.print("Sending a [blue]workspace-settings[/blue]:")
+    console.print(JSON.from_data(wsmsg.__dict__))
+    producer.send(wsmsg)
+    console.print("[blue]workspace-settings[/blue] sent")
 
     producer.close()
 

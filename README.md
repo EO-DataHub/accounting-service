@@ -110,4 +110,6 @@ Send a fake billing event onto Pulsar, to exercise the ingester without a real e
 - Forward Pulsar ports: `kubectl port-forward service/pulsar-proxy -n pulsar 6650:6650` (skip this if you are running `docker compose --profile messaging up` locally).
 - `uv run inject billing-event --workspace my-workspace` (add `--sku` and `--quantity` to change what it sends; both default to a CPU-time reading).
 
-To also send a `WorkspaceSettings` message, or a message `inject` does not cover, edit and run `tests/send_test_message.py` instead - see the setup notes at the top of that file.
+To associate a workspace with an account, which the ingester needs before it will attribute usage: `uv run inject workspace-settings --workspace my-workspace`.
+
+`inject` does not yet send consumption rate samples, so the one-hour windowing in `ConsumptionSampleRateIngesterMessager` has to be exercised through the tests. Run `uv run inject --help` for what is available.
