@@ -36,6 +36,7 @@ dependencies = [
     "rich",
     "rich-click",
     "sqlmodel>=0.0.42",
+    "pyrefly>=0.60.0",
 ]
 
 [dependency-groups]

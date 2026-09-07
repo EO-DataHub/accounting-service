@@ -85,3 +85,8 @@ update:
 krestart:
 	kubectl rollout restart deployment.apps/accounting-api -n accounting
 	kubectl rollout restart deployment.apps/accounting-ingester -n accounting
+
+.PHONY: run
+run:
+	${uv-run} uvicorn accounting_service.app.app:app --reload
+

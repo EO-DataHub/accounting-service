@@ -1,14 +1,12 @@
-import logging
 from collections.abc import Iterator
 from functools import cache
 from typing import TextIO
 
-import yaml
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
-from yaml.error import YAMLError
 
 from accounting_service import models
+from accounting_service.configuration import load_configuration
 from accounting_service.db_settings import get_db_url
 
 # There is deliberately no create_all or drop_all here. Alembic owns the deployed schema, so
@@ -52,6 +50,13 @@ def insert_configuration(session: Session, config: TextIO) -> None:
     lets several configuration loads share one transaction, and lets a caller retry when two
     replicas load the same configuration at once.
 
+    The document is validated whole before any of it is applied, so a bad entry raises
+    ConfigurationError instead of leaving the earlier entries written. See
+    accounting_service.configuration.
+
+    Items are applied before prices, so a document may introduce an item and its first price
+    together.
+
     Example config (YAML format):
     items:
       - sku: "my-sku"
@@ -62,16 +67,10 @@ def insert_configuration(session: Session, config: TextIO) -> None:
         valid_from: "2025-01-01T00:00:00Z"
         price: 12.34
     """
-    try:
-        config_obj = yaml.safe_load(config)
-        if not isinstance(config_obj, dict):
-            raise YAMLError("Expected a YAML dictionary in config file - check the format")
-    except YAMLError:
-        logging.fatal("accounting-service configuration file is not valid - check the format")
-        raise
+    configuration = load_configuration(config)
 
-    for item in config_obj.get("items", []):
+    for item in configuration.items:
         models.BillingItem.upsert_configured_item(session, item)
 
-    for price in config_obj.get("prices", []):
+    for price in configuration.prices:
         models.BillingItemPrice.upsert_configured_price(session, price)

@@ -204,17 +204,16 @@ def update_item(session: Session, sku: str, name: str | None, unit: str | None) 
     if name is None and unit is None:
         raise ValueError("Provide at least one of --name or --unit")
 
-    if models.BillingItem.find_billing_item(session, sku) is None:
+    existing = models.BillingItem.find_billing_item(session, sku)
+    if existing is None:
         raise ValueError(f"SKU [blue]{sku}[/blue] doesn't exist")
 
-    # Either name or unit can be None, but the upsert functions just check for their existence in the database.
-    # So remove the None values from the items dictionary.
-    items = [{"sku": sku, "name": name, "unit": unit}]
-    clean_items = [{k: v for k, v in items[0].items() if v is not None}]
-
+    # A configuration entry describes an item completely, so the field the operator left out
+    # is filled from the stored row rather than omitted from the document. Sending a partial
+    # entry and relying on the loader to update only the keys it found is what stopped item
+    # entries being validated at all.
     configuration = {
-        "items": clean_items,
-        "prices": [],
+        "items": [{"sku": sku, "name": name or existing.name, "unit": unit or existing.unit}],
     }
     j = json.dumps(configuration)
 

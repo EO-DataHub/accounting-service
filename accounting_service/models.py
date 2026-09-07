@@ -47,6 +47,7 @@ from sqlalchemy.orm import Session, aliased, selectinload
 from sqlmodel import Field as SQLModelField
 from sqlmodel import Relationship, SQLModel
 
+from accounting_service.configuration import ConfiguredItem
 from accounting_service.consumption import ConsumptionWindow, RateSample, estimate_consumption
 from accounting_service.pricing import ConfiguredPrice, PriceAction, plan_price_change
 from accounting_service.timestamps import as_utc, datetime_default_to_utc
@@ -221,21 +222,26 @@ class BillingItem(BillingItemBase, table=True):
         )
 
     @classmethod
-    def upsert_configured_item(cls, session: Session, item: dict[str, Any]) -> None:
+    def upsert_configured_item(cls, session: Session, entry: ConfiguredItem) -> None:
         """
-        This aimed at inserting or updating BillingItems based on a database-independent source
-        such as a YAML configuration file. 'item' should have fields 'sku', 'name' and 'unit'.
-        An item will be inserted if the SKU isn't known, otherwise name and unit will be updated.
+        Insert or update a BillingItem from a validated configuration entry.
+
+        The item is inserted when its SKU is unknown, otherwise its name and unit are updated.
+        Both are written unconditionally, because an entry describes the item completely.
+
+        This used to take a bare dict and update only the keys it found, which is what let
+        `BillingItem(**item)` construct a row from unvalidated YAML: BillingItem is a table
+        class, so Pydantic validation is off and the dict was spread in unchecked. The partial
+        update that behaviour supported belongs to the admin CLI, which fills the fields the
+        operator omitted from the stored row before building a document.
         """
-        item_obj = cls.find_billing_item(session, item["sku"])
+        item_obj = cls.find_billing_item(session, entry.sku)
+
         if item_obj:
-            if "name" in item:
-                item_obj.name = item["name"]
-            if "unit" in item:
-                item_obj.unit = item["unit"]
+            item_obj.name = entry.name
+            item_obj.unit = entry.unit
         else:
-            item_obj = BillingItem(**item)
-            session.add(item_obj)
+            session.add(BillingItem(sku=entry.sku, name=entry.name, unit=entry.unit))
 
 
 class BillingItemPrice(SQLModel, table=True):
@@ -318,20 +324,19 @@ class BillingItemPrice(SQLModel, table=True):
         return session.execute(select(cls.valid_from).where(cls.item_id == item.uuid)).scalars().all()
 
     @classmethod
-    def upsert_configured_price(cls, session: Session, price: dict[str, Any]) -> None:
+    def upsert_configured_price(cls, session: Session, entry: ConfiguredPrice) -> None:
         """
-        This inserts or updates a price based on a database-independent source such as a YAML
-        configuration file. 'price' must contain 'sku', 'price' and 'valid_from'.
+        Insert or update a price from a validated configuration entry.
 
         'valid_from' must either be newer than the current price, in which case the new price
         replaces it at that time, or must exactly match an existing configured price, in which
         case its amount is updated.
 
         The rules live in accounting_service.pricing, which decides from values. This reads what
-        is stored, asks for a decision, and carries it out.
+        is stored, asks for a decision, and carries it out. The entry arrives already validated
+        from accounting_service.configuration, so the unknown-SKU check below is the only thing
+        left that needs a session to answer.
         """
-        entry = ConfiguredPrice.model_validate(price)
-
         item_obj = BillingItem.find_billing_item(session, entry.sku)
         if not item_obj:
             logging.error("Failed to find item %s when configuring price", entry.sku)
