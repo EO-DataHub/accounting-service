@@ -52,6 +52,7 @@ dev = [
     "faker",
     "httpx2",
     "testcontainers[postgres]",
+    "debugpy>=1.8.21",
 ]
 
 [project.urls]

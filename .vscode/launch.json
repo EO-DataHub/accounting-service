@@ -1,0 +1,16 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "uvicorn: accounting-service",
+      "type": "python",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["accounting_service.app.app:app", "--port", "8000"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "justMyCode": false,
+      "console": "integratedTerminal"
+    }
+  ]
+}

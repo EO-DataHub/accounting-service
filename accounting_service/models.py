@@ -34,6 +34,7 @@ from sqlalchemy import (
     Index,
     MetaData,
     Result,
+    UniqueConstraint,
     and_,
     func,
     or_,
@@ -365,6 +366,113 @@ class BillingItemPrice(SQLModel, table=True):
             )
 
         session.add(cls(item=item_obj, valid_from=entry.valid_from, price=entry.price))
+
+
+class PricingPolicy(SQLModel, table=True):
+    """
+    One calibration pass, covering every rate at once (D3).
+
+    Rows are immutable once written. A correction does not edit a policy; it adds a new one
+    pointing at the policy it corrects through `corrects_id`. That is what lets a period which
+    has already been charged be re-priced without destroying the record of what was charged at
+    the time (D8).
+
+    Bi-temporal, in the same way `BillingItemPrice` is. `valid_from` and `valid_until` say
+    which usage the policy applies to; `configured_at` says when the decision was taken.
+    Resolving a policy for a usage time selects on the validity range and orders by
+    `configured_at` descending, so a correcting policy wins over the policy it corrects (T5).
+
+    There is no index on the validity columns. A policy is one deliberate calibration pass, so
+    this table holds a handful of rows where `billing_item_price` holds one per price change
+    per SKU, and the index that table needs would only be overhead here.
+    """
+
+    __tablename__ = "pricing_policy"
+
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
+
+    # Human-usable identifier, minted as max + 1 by the loader (T4). Unique is the part a
+    # database can enforce; monotonic is a property of how the loader assigns it. The
+    # constraint matters because the loader runs on every ingester pod start, so two replicas
+    # can try to mint the same version at once and one of them has to lose.
+    version: int = SQLModelField(unique=True)
+
+    valid_from: datetime = aware_timestamp()
+    valid_until: datetime | None = aware_timestamp(default=None)
+    configured_at: datetime = aware_timestamp(default=func.now())
+
+    # Set when this policy corrects an earlier one (D8). Deliberately a bare foreign key with
+    # no relationship attribute: following it is an audit path (T19) that can query by uuid,
+    # and a self-referential relationship needs a `remote_side` that would earn its keep only
+    # once something walks the chain.
+    corrects_id: UUID | None = SQLModelField(default=None, foreign_key="pricing_policy.uuid")
+
+    # Credits per pound. Reporting and calibration only - nothing in the pricing path reads it
+    # (D2).
+    credit_to_currency_rate: Decimal
+
+    # Applied to a workspace that has no category assignment yet (D6).
+    default_category: str
+
+    # Why this calibration happened. Feeds the audit log (T19).
+    reason: str | None = None
+
+    rates: list["PricingPolicyRate"] = Relationship(back_populates="policy")
+    category_multipliers: list["PricingPolicyCategoryMultiplier"] = Relationship(back_populates="policy")
+
+    __table_args__ = (
+        CheckConstraint(
+            "valid_until IS NULL OR valid_from <= valid_until",
+            name="validity_order",
+        ),
+    )
+
+
+class PricingPolicyRate(SQLModel, table=True):
+    """
+    The credits charged per unit of one SKU under one policy.
+
+    One row per SKU per policy. T7 prices an event from this rate, the event's quantity and
+    the multiplier for the workspace's category.
+
+    The unique constraint on `(policy_id, item_id)` is what makes a policy well formed: a
+    second rate for the same SKU would make the price of an event depend on which row a query
+    happened to return first.
+    """
+
+    __tablename__ = "pricing_policy_rate"
+
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
+    policy_id: UUID = SQLModelField(foreign_key="pricing_policy.uuid")
+    item_id: UUID = SQLModelField(foreign_key="billing_item.uuid")
+    credits_per_unit: Decimal
+
+    policy: PricingPolicy = Relationship(back_populates="rates")
+    item: BillingItem = Relationship()
+
+    __table_args__ = (UniqueConstraint("policy_id", "item_id"),)
+
+
+class PricingPolicyCategoryMultiplier(SQLModel, table=True):
+    """
+    The multiplier applied to every rate in one policy, for one workspace category.
+
+    A category is a plain string rather than an enum, because the set is defined by the
+    configuration document and by whatever the workspace service sends, not by this service.
+    An unknown category resolves to the policy's `default_category` (D6), so a value nobody
+    has configured is a pricing decision rather than a validation failure.
+    """
+
+    __tablename__ = "pricing_policy_category_multiplier"
+
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
+    policy_id: UUID = SQLModelField(foreign_key="pricing_policy.uuid")
+    category: str
+    multiplier: Decimal
+
+    policy: PricingPolicy = Relationship(back_populates="category_multipliers")
+
+    __table_args__ = (UniqueConstraint("policy_id", "category"),)
 
 
 class TimeAggregation(StrEnum):

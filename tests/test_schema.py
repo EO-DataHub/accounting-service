@@ -152,3 +152,31 @@ def test_the_hand_managed_expression_indexes_are_declared(expected: str) -> None
     declared = {str(index.name) for index in SQLModel.metadata.tables["billing_event"].indexes if index.name}
 
     assert expected in declared, f"{expected} is not declared; declared indexes are {sorted(declared)}"
+
+
+@pytest.mark.parametrize(
+    ("table_name", "columns"),
+    [
+        ("pricing_policy", {"version"}),
+        ("pricing_policy_rate", {"policy_id", "item_id"}),
+        ("pricing_policy_category_multiplier", {"policy_id", "category"}),
+    ],
+)
+def test_the_policy_uniqueness_rules_are_declared(table_name: str, columns: set[str]) -> None:
+    """These three constraints are the ones that make a policy well formed.
+
+    A second rate for the same SKU in one policy would make an event's price depend on which
+    row a query returned first, and a repeated version would let two ingester replicas each
+    believe they had minted the current policy. Nothing in the read paths checks for either,
+    because the database is supposed to refuse them.
+
+    Declared here as well as enforced in tests/integration/test_pricing_policy.py: this test
+    says the rule exists, that one says it reaches the database.
+    """
+    declared = {
+        frozenset(column.name for column in constraint.columns)
+        for constraint in SQLModel.metadata.tables[table_name].constraints
+        if constraint.__class__.__name__ == "UniqueConstraint"
+    }
+
+    assert frozenset(columns) in declared, f"{table_name} declares unique constraints on {declared}"
