@@ -8,6 +8,8 @@ Nothing reads these tables yet. T4 loads policies, T5 resolves one for a usage t
 prices from them, so these tests describe the shape those tasks will rely on.
 """
 
+import io
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -16,15 +18,19 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlmodel import col
 
+from accounting_service import db, models
 from accounting_service.models import (
     BillingItem,
     PricingPolicy,
     PricingPolicyCategoryMultiplier,
     PricingPolicyRate,
 )
+from accounting_service.pricing import ConfiguredPolicy
 
 JANUARY = datetime(2025, 1, 1, tzinfo=UTC)
+SKU = "cpu-seconds"
 
 
 def a_policy(
@@ -33,7 +39,6 @@ def a_policy(
     valid_from: datetime = JANUARY,
     valid_until: datetime | None = None,
     corrects_id: UUID | None = None,
-    credit_to_currency_rate: Decimal = Decimal(100),
     default_category: str = "standard",
     reason: str | None = None,
 ) -> PricingPolicy:
@@ -48,7 +53,6 @@ def a_policy(
         valid_from=valid_from,
         valid_until=valid_until,
         corrects_id=corrects_id,
-        credit_to_currency_rate=credit_to_currency_rate,
         default_category=default_category,
         reason=reason,
     )
@@ -77,7 +81,7 @@ def a_multiplier(category: str, multiplier: str) -> PricingPolicyCategoryMultipl
 
 @pytest.fixture
 def item(db_session: Session) -> BillingItem:
-    billing_item = BillingItem(sku="cpu-seconds", name="CPU time", unit="s")
+    billing_item = BillingItem(sku=SKU, name="CPU time", unit="s")
     db_session.add(billing_item)
     db_session.flush()
 
@@ -97,7 +101,7 @@ class TestAPolicyRoundTrip:
         db_session.commit()
         db_session.expire_all()
 
-        stored = db_session.execute(select(PricingPolicy).where(PricingPolicy.version == 1)).scalars().one()
+        stored = db_session.execute(select(PricingPolicy).where(col(PricingPolicy.version) == 1)).scalars().one()
 
         assert stored.rates[0].credits_per_unit == Decimal("0.25")
         assert {m.category: m.multiplier for m in stored.category_multipliers} == {
@@ -210,3 +214,193 @@ class TestTheDatabaseRefusesAMalformedPolicy:
 
         with pytest.raises(IntegrityError):
             db_session.flush()
+
+
+def a_document(
+    *,
+    valid_from: str = "2025-01-01T00:00:00Z",
+    rate: str = "0.5",
+    default_category: str = "standard",
+    reason: str = "initial calibration",
+    sku: str = SKU,
+    include_item: bool = True,
+) -> io.StringIO:
+    items = f'items:\n  - {{sku: "{sku}", name: "n", unit: "u"}}\n' if include_item else ""
+
+    return io.StringIO(
+        f"""---
+{items}pricing_policy:
+  valid_from: "{valid_from}"
+  default_category: {default_category}
+  reason: "{reason}"
+  rates:
+    - sku: {sku}
+      credits_per_unit: {rate}
+  category_multipliers:
+    - category: standard
+      multiplier: 1
+    - category: academic
+      multiplier: 0.5
+"""
+    )
+
+
+def stored_versions(session: Session) -> list[int]:
+    # col() because `version` is a plain `int` annotation under SQLModel, so selecting the
+    # bare attribute looks to a type checker like `select(int)`.
+    return sorted(session.execute(select(col(PricingPolicy.version))).scalars().all())
+
+
+class TestMintOrMatch:
+    """The loader runs on every ingester pod start, so not minting is the common case."""
+
+    def test_the_first_load_mints_version_one(self, db_session: Session) -> None:
+        db.insert_configuration(db_session, a_document())
+
+        policy = PricingPolicy.current(db_session)
+        assert policy is not None
+        assert policy.version == 1
+        assert policy.rates[0].credits_per_unit == Decimal("0.5")
+        assert {m.category for m in policy.category_multipliers} == {"standard", "academic"}
+
+    def test_loading_the_same_document_again_mints_nothing(self, db_session: Session) -> None:
+        """Every pod start reloads the file. A restart is not a calibration."""
+        db.insert_configuration(db_session, a_document())
+        db.insert_configuration(db_session, a_document())
+
+        assert stored_versions(db_session) == [1]
+
+    def test_rewording_the_reason_mints_nothing(self, db_session: Session) -> None:
+        db.insert_configuration(db_session, a_document(reason="first pass"))
+        db.insert_configuration(db_session, a_document(reason="same numbers, better words"))
+
+        assert stored_versions(db_session) == [1]
+
+    @pytest.mark.parametrize(
+        "changed",
+        [
+            lambda: a_document(rate="0.9"),
+            lambda: a_document(default_category="academic"),
+            lambda: a_document(valid_from="2025-06-01T00:00:00Z"),
+        ],
+        ids=["a-rate", "the-default-category", "valid-from"],
+    )
+    def test_changing_the_numbers_mints_a_version(
+        self, db_session: Session, changed: Callable[[], io.StringIO]
+    ) -> None:
+        """A callable rather than a dict of overrides, so a misspelled keyword is a type
+        error here instead of a silently ignored argument."""
+        db.insert_configuration(db_session, a_document())
+        db.insert_configuration(db_session, changed())
+
+        assert stored_versions(db_session) == [1, 2]
+
+    def test_the_new_version_is_the_one_in_force(self, db_session: Session) -> None:
+        db.insert_configuration(db_session, a_document(rate="0.5"))
+        db.insert_configuration(db_session, a_document(rate="0.9"))
+
+        policy = PricingPolicy.current(db_session)
+        assert policy is not None
+        assert policy.version == 2
+        assert policy.rates[0].credits_per_unit == Decimal("0.9")
+
+    def test_nothing_is_written_to_the_earlier_policy(self, db_session: Session) -> None:
+        """The loader appends. A stored policy keeps its open range, which is what lets a
+        correction be backdated without rewriting what it corrects."""
+        db.insert_configuration(db_session, a_document())
+        db.insert_configuration(db_session, a_document(rate="0.9"))
+
+        first = db_session.execute(select(PricingPolicy).where(col(PricingPolicy.version) == 1)).scalars().one()
+        assert first.valid_until is None
+        assert first.rates[0].credits_per_unit == Decimal("0.5")
+
+    def test_a_policy_may_rate_an_item_the_same_document_introduces(self, db_session: Session) -> None:
+        """Items load before the policy, so the SKU exists by the time the rate needs it."""
+        db.insert_configuration(db_session, a_document(sku="brand-new-sku"))
+
+        assert stored_versions(db_session) == [1]
+
+    def test_a_rate_for_an_unknown_sku_is_refused(self, db_session: Session) -> None:
+        with pytest.raises(ValueError, match="do not exist"):
+            db.insert_configuration(db_session, a_document(sku="never-configured", include_item=False))
+
+    def test_a_document_with_no_policy_leaves_the_policy_alone(self, db_session: Session) -> None:
+        db.insert_configuration(db_session, a_document())
+        db.insert_configuration(db_session, io.StringIO('items:\n  - {sku: "other", name: "n", unit: "u"}\n'))
+
+        assert stored_versions(db_session) == [1]
+
+
+class TestWhichPolicyIsInForce:
+    def test_the_most_recently_configured_wins_not_the_latest_valid_from(self, db_session: Session) -> None:
+        """A correction is configured after the policy it corrects and backdated over it
+        (D8). It has to win, so resolution cannot order on valid_from.
+
+        Both are minted in one transaction here, so `configured_at` is identical and the
+        tie-break on version descending is what decides it - which is the same situation two
+        loads in one pod start produce.
+        """
+        db.insert_configuration(db_session, a_document(valid_from="2025-06-01T00:00:00Z", rate="0.5"))
+        db.insert_configuration(db_session, a_document(valid_from="2025-01-01T00:00:00Z", rate="0.9"))
+
+        policy = PricingPolicy.current(db_session)
+        assert policy is not None
+        assert policy.version == 2
+        assert policy.valid_from == datetime(2025, 1, 1, tzinfo=UTC)
+
+    def test_no_policy_at_all_is_not_an_error(self, db_session: Session) -> None:
+        assert PricingPolicy.current(db_session) is None
+
+
+class TestTwoReplicasRacing:
+    """Both pods start together, both see the same current policy, both mint the same
+    version. The unique constraint refuses the second and the loader recovers.
+
+    `_next_version` is patched to return a version already taken, because a single
+    connection cannot otherwise be made to lose the race.
+    """
+
+    def test_the_loser_retries_and_mints(self, db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+        db.insert_configuration(db_session, a_document(rate="0.5"))
+
+        versions = iter([1, 2])
+        monkeypatch.setattr(models, "_next_version", lambda _session: next(versions))
+
+        db.insert_configuration(db_session, a_document(rate="0.9"))
+
+        assert stored_versions(db_session) == [1, 2]
+
+    def test_the_loser_stops_when_the_winner_minted_the_same_policy(
+        self, db_session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The document is already in force by the time the loser looks again, so there is
+        nothing left to mint and the pod carries on."""
+        db.insert_configuration(db_session, a_document(rate="0.5"))
+        monkeypatch.setattr(models, "_next_version", lambda _session: 1)
+
+        loaded = PricingPolicy.load_configured_policy(
+            db_session,
+            ConfiguredPolicy.model_validate(
+                {
+                    "valid_from": "2025-01-01T00:00:00Z",
+                    "default_category": "standard",
+                    "rates": [{"sku": SKU, "credits_per_unit": "0.5"}],
+                    "category_multipliers": [
+                        {"category": "standard", "multiplier": "1"},
+                        {"category": "academic", "multiplier": "0.5"},
+                    ],
+                }
+            ),
+        )
+
+        assert loaded is None
+        assert stored_versions(db_session) == [1]
+
+    def test_it_gives_up_rather_than_looping(self, db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A version that is always taken, and a document that never matches, has to end in
+        a raise rather than a spin."""
+        db.insert_configuration(db_session, a_document(rate="0.5"))
+        monkeypatch.setattr(models, "_next_version", lambda _session: 1)
+
+        with pytest.raises(IntegrityError):
+            db.insert_configuration(db_session, a_document(rate="0.9"))

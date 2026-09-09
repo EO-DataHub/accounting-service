@@ -43,7 +43,7 @@ import sqlalchemy as sa
 # Needed because SQLModel maps str to sqlmodel.sql.sqltypes.AutoString, which autogenerate
 # writes into revisions without importing. Unused in a revision that touches no str column;
 # ruff is told to leave it alone rather than every revision needing a decision about it.
-import sqlmodel
+import sqlmodel.sql.sqltypes
 
 from alembic import op
 

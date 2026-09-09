@@ -11,9 +11,12 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 
 # Needed because SQLModel maps str to sqlmodel.sql.sqltypes.AutoString, which autogenerate
-# writes into revisions without importing. Unused in a revision that touches no str column;
-# ruff is told to leave it alone rather than every revision needing a decision about it.
-import sqlmodel  # noqa: F401
+# writes into revisions without importing. The submodule is imported explicitly, not just
+# `import sqlmodel`: sqlmodel/__init__.py does not re-export `sql`, so a type checker reports
+# `"sql" is not a known attribute of module "sqlmodel"` on every column autogenerate emits.
+# Unused in a revision that touches no str column; ruff is told to leave it alone rather than
+# every revision needing a decision about it.
+import sqlmodel.sql.sqltypes  # noqa: F401
 from alembic import op
 ${imports if imports else ""}
 

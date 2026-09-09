@@ -1,8 +1,9 @@
 """Tests for the admin CLI's update-item command.
 
 Only that one, because it is the only command the strict configuration document forced a
-change on: add-item and set-price already sent complete entries. Neither of those is covered
-here, and neither was before. The commands are driven through a click Context carrying the test's session, rather than
+change on. `add-item` sends a complete entry and is not covered here, and never was.
+`set-price` is gone: a rate belongs to a policy covering every SKU at once, so there is no
+single price to set. The commands are driven through a click Context carrying the test's session, rather than
 through CliRunner: the `cli` group opens its own Session on the process-wide engine, so
 invoking through it would write outside the test's transaction and leave the rows behind.
 """
@@ -25,10 +26,6 @@ items:
   - sku: "{SKU}"
     name: "original name"
     unit: "GB-s"
-prices:
-  - sku: "{SKU}"
-    valid_from: "2025-01-01T00:00:00Z"
-    price: 1.00
 """
 
 

@@ -12,20 +12,18 @@ half-configured price list. And an item entry was never validated at all: Billin
 SQLModel table class, and `table=True` turns Pydantic validation off, so `BillingItem(**item)`
 accepted whatever the YAML held and left the complaint to the database, or to nothing.
 
-`ConfiguredPrice` is deliberately not defined here. It lives in accounting_service.pricing
-next to plan_price_change, because the question a price entry raises - whether it amends,
-supersedes or appends - is a pricing rule rather than a property of the document.
+`ConfiguredPolicy` is deliberately not defined here. It lives in accounting_service.pricing
+next to the rule that consumes it, because whether a document is a new calibration or the one
+already in force is a pricing question rather than a property of the document.
 """
 
-from collections import Counter
-from collections.abc import Iterable
 from typing import Annotated, Self, TextIO
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from yaml.error import YAMLError
 
-from accounting_service.pricing import ConfiguredPrice
+from accounting_service.pricing import ConfiguredPolicy, repeated
 
 # "" satisfies `str`, and an item's SKU is the key every price is looked up by. Rejected
 # rather than coerced to None, which is the same choice made for the API models.
@@ -64,8 +62,8 @@ class Configuration(BaseModel):
     load successfully and change nothing, because the apply loop asked for keys by name and
     defaulted each to an empty list.
 
-    Both collections default to empty. A document holding only prices is normal - it is what
-    set-price sends - and so is one holding only items.
+    Both sections are optional. A document holding only items is what the admin CLI sends,
+    and a document holding only a policy is a calibration against SKUs already defined.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -73,31 +71,19 @@ class Configuration(BaseModel):
     # Tuples rather than lists: frozen=True stops the field being reassigned, not the list
     # being appended to.
     items: tuple[ConfiguredItem, ...] = ()
-    prices: tuple[ConfiguredPrice, ...] = ()
+
+    # One calibration pass (D3). Absent in a document that only adds an item, which is what
+    # the admin CLI sends.
+    pricing_policy: ConfiguredPolicy | None = None
 
     @model_validator(mode="after")
     def _each_item_appears_once(self) -> Self:
         """A repeated SKU means the last entry wins and the earlier one is applied then
         overwritten, which nothing about the document suggests."""
-        if repeated := _repeated(entry.sku for entry in self.items):
-            raise ValueError(f"`items` names these SKUs more than once: {', '.join(repeated)}")
+        if duplicated := repeated(entry.sku for entry in self.items):
+            raise ValueError(f"`items` names these SKUs more than once: {', '.join(duplicated)}")
 
         return self
-
-    @model_validator(mode="after")
-    def _each_price_appears_once(self) -> Self:
-        """Worse than a repeated item, because it is order-dependent rather than merely
-        redundant: applying the first entry makes the second an amendment of it, so the
-        document means different things depending on which order the entries are written in.
-        """
-        if repeated := _repeated(f"{entry.sku} at {entry.valid_from.isoformat()}" for entry in self.prices):
-            raise ValueError(f"`prices` sets a price more than once for: {', '.join(repeated)}")
-
-        return self
-
-
-def _repeated(values: Iterable[str]) -> list[str]:
-    return sorted(value for value, count in Counter(values).items() if count > 1)
 
 
 def load_configuration(document: TextIO | str) -> Configuration:

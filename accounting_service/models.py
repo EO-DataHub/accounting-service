@@ -1,21 +1,33 @@
-# pyright: reportArgumentType=false, reportCallIssue=false, reportAssignmentType=false
-# pyright: reportOptionalOperand=false, reportAttributeAccessIssue=false
-#
-# Pyright cannot type-check SQLModel query expressions, and this is the module where they all
-# live. SQLModel declares fields as bare annotations rather than SQLAlchemy's Mapped[...], so
-# at class level pyright sees the Python value type instead of a SQL expression. The identical
-# query checks clean one way and not the other:
-#
-#     select(WithMapped).where(WithMapped.valid_until > at)      # no diagnostics
-#     select(WithSQLModel).where(WithSQLModel.valid_until > at)  # error + warning
-#
-# So `where(cls.valid_from <= at)` reports a bool where a ColumnElement is wanted, a nullable
-# column compared with > is an invalid operand, `__tablename__ = "..."` is not a declared_attr,
-# and constructing a row with `item=obj` looks like a missing item_id because the generated
-# __init__ knows nothing about relationships. All of it works; none of it is checkable.
-#
-# Suppressed here only. Every other module keeps these rules, and the rules that catch real
-# mistakes - undefined names, bad returns, unreachable code - stay on everywhere including here.
+"""The tables, and the queries over them.
+
+Every table lives here. `alembic/env.py` imports `metadata` from this module, and defining
+the classes is what populates it, so a table declared elsewhere would need its own import in
+env.py to be seen by autogenerate - which an import cleanup once removed, leaving
+autogenerate ready to drop the whole schema.
+
+Two conventions worth knowing before adding a query.
+
+**Wrap a column in `col()`.** SQLModel declares fields as plain annotations rather than
+SQLAlchemy's `Mapped[...]`, so at class level a checker sees the Python value type: `cls.sku
+== sku` is a `bool`, `select(cls.version)` is `select(int)`, and `cls.event_end.desc()` is an
+attribute error on `datetime`. `col()` hands back the column, so the expression types as the
+SQL it always was. This module used to carry a file-level suppression of five rules instead;
+`col()` replaced it, and the remaining suppressions are inline and specific.
+
+**Three things `col()` cannot fix**, each suppressed on the line it occurs:
+
+  * `__tablename__ = "..."`, because SQLModel's base declares it as a `declared_attr`. No
+    spelling avoids this - annotating it or making it a `ClassVar` trades one diagnostic for
+    another.
+  * `selectinload(...)`, which wants the attribute itself. `col()` returns `Mapped[...]`, and
+    SQLModel types a `Relationship()` attribute as the related class, so nothing satisfies
+    both the checker and SQLAlchemy. `.columns()` on a text query is the mirror image: it
+    wants a real `Column`, which the metadata can supply.
+  * Building a row through a relationship, such as `PricingPolicyRate(item_id=...)` attached
+    via `policy.rates`. The generated `__init__` knows nothing about relationships, so it
+    reports the foreign key as missing even though SQLAlchemy fills it in on flush.
+"""
+
 import logging
 import uuid
 from collections.abc import Iterator, Sequence
@@ -33,7 +45,6 @@ from sqlalchemy import (
     CursorResult,
     Index,
     MetaData,
-    Result,
     UniqueConstraint,
     and_,
     func,
@@ -41,16 +52,17 @@ from sqlalchemy import (
     select,
     text,
     union,
-    update,
 )
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased, selectinload
+from sqlalchemy.orm.strategy_options import _AbstractLoad
 from sqlmodel import Field as SQLModelField
-from sqlmodel import Relationship, SQLModel
+from sqlmodel import Relationship, SQLModel, col
 
 from accounting_service.configuration import ConfiguredItem
 from accounting_service.consumption import ConsumptionWindow, RateSample, estimate_consumption
-from accounting_service.pricing import ConfiguredPrice, PriceAction, plan_price_change
+from accounting_service.pricing import ConfiguredPolicy, PolicyFingerprint
 from accounting_service.timestamps import as_utc, datetime_default_to_utc
 
 # Every table here is a SQLModel. The naming convention is set on SQLModel's own MetaData so
@@ -79,6 +91,11 @@ SQLModel.metadata = MetaData(
 # would have generated a revision dropping the whole schema.
 metadata = SQLModel.metadata
 
+# How many times to retry a version that another replica claimed first. More than two
+# replicas racing on the same load is not a case worth designing for: the loser re-reads and
+# usually finds nothing left to do.
+_MINT_ATTEMPTS = 3
+
 
 def aware_timestamp(
     *,
@@ -99,7 +116,13 @@ def aware_timestamp(
     `default` takes a value, None, or a SQL function such as func.now(). Left unset it means
     the column has no default, which is what PydanticUndefined signals to SQLModel.
     """
-    return SQLModelField(sa_type=TIMESTAMP(timezone=True), default=default, index=index)
+    # sa_type is annotated as `type[Any]` but SQLAlchemy wants the configured instance, which
+    # is the whole point of passing TIMESTAMP(timezone=True) rather than TIMESTAMP.
+    return SQLModelField(
+        sa_type=TIMESTAMP(timezone=True),  # pyright: ignore[reportArgumentType]
+        default=default,
+        index=index,
+    )
 
 
 class WorkspaceAccount(SQLModel, table=True):
@@ -109,7 +132,7 @@ class WorkspaceAccount(SQLModel, table=True):
     This is not the authoritative data, which is held by the workspace service and sent via Pulsar.
     """
 
-    __tablename__ = "workspace_account"
+    __tablename__ = "workspace_account"  # pyright: ignore[reportAssignmentType]
 
     workspace: str = SQLModelField(index=True, primary_key=True)
     account: UUID = SQLModelField(index=True)
@@ -181,7 +204,7 @@ class BillingItem(BillingItemBase, table=True):
     we auto-create it. The name and unit will be empty.
     """
 
-    __tablename__ = "billing_item"
+    __tablename__ = "billing_item"  # pyright: ignore[reportAssignmentType]
 
     @classmethod
     def find_billing_items(cls, session: Session) -> Iterator[Self]:
@@ -196,7 +219,7 @@ class BillingItem(BillingItemBase, table=True):
         """Returns a specified BillingItem, assuming it's visible."""
         # This is currently any BillingItem but this could change if we add a 'deleted' flag
         # or some visibility rules.
-        query = select(cls).where(cls.sku == sku)
+        query = select(cls).where(col(cls.sku) == sku)
         result = session.execute(query).first()
         return result[0] if result else None
 
@@ -245,127 +268,13 @@ class BillingItem(BillingItemBase, table=True):
             session.add(BillingItem(sku=entry.sku, name=entry.name, unit=entry.unit))
 
 
-class BillingItemPrice(SQLModel, table=True):
+def _next_version(session: Session) -> int:
+    """One past the highest version stored.
+
+    A function rather than inline so a test can make it collide on purpose; there is no way
+    to provoke the race from a single connection otherwise.
     """
-    How much we charged for a particular item between a particular time range. `valid_until` will
-    be None for the current price.
-
-    To determine the price at time <x> use
-        SELECT price FROM BillingItemPrice
-            WHERE item=<item>
-              AND valid_from <= <x> and valid_until > <x>
-              ORDER BY configured_at DESC
-              LIMIT 1
-
-    Once created these must not change except for setting `valid_until` to the current time when
-    creating a new BillingItemPrice to replace it. If historical prices must be changed then this
-    is done by creating a new BillingItemPrice with an overlapping or identical time range but
-    setting `configured_at` to the time of configuration. This means we always have a record
-    of prices presented to users at any time in the past.
-
-    We support only a single price, not varying prices for different users or workspaces, tiered
-    prices, etc.
-    """
-
-    __tablename__ = "billing_item_price"
-
-    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
-    item_id: UUID = SQLModelField(foreign_key="billing_item.uuid")
-    price: Decimal  # This is in pounds.
-    valid_from: datetime = aware_timestamp()
-    # None for current price, a time in the past otherwise.
-    valid_until: datetime | None = aware_timestamp(default=None)
-    # Set to the current time at the time this row is added.
-    configured_at: datetime = aware_timestamp(default=func.now())
-
-    item: BillingItem = Relationship()
-
-    @property
-    def valid_from_utc(self) -> datetime:
-        return as_utc(self.valid_from)
-
-    @property
-    def valid_until_utc(self) -> datetime | None:
-        return as_utc(self.valid_until) if self.valid_until else None
-
-    __table_args__ = (
-        Index(
-            "billingitemprice_item_validfrom_index",
-            "item_id",
-            "valid_from",
-        ),
-        CheckConstraint(
-            "valid_until IS NULL OR valid_from <= valid_until",
-            name="validity_order",
-        ),
-    )
-
-    @classmethod
-    def find_prices(cls, session: Session, at: datetime) -> Result[tuple[Self, str]]:
-        """Returns all prices valid at the specified time. Each result is a tuple containing a
-        BillingItemPrice first and the associated SKU second."""
-        query = (
-            select(cls, BillingItem.sku)
-            .join(cls.item)
-            .where(cls.valid_from <= at)
-            .where(
-                or_(
-                    cls.valid_until == None,  # noqa: E711
-                    cls.valid_until > at,
-                )
-            )
-            .order_by(BillingItem.sku, cls.valid_from)
-        )
-
-        return session.execute(query)
-
-    @classmethod
-    def _configured_valid_froms(cls, session: Session, item: BillingItem) -> Sequence[datetime]:
-        """Every instant a price is already configured to start at, for one item."""
-        return session.execute(select(cls.valid_from).where(cls.item_id == item.uuid)).scalars().all()
-
-    @classmethod
-    def upsert_configured_price(cls, session: Session, entry: ConfiguredPrice) -> None:
-        """
-        Insert or update a price from a validated configuration entry.
-
-        'valid_from' must either be newer than the current price, in which case the new price
-        replaces it at that time, or must exactly match an existing configured price, in which
-        case its amount is updated.
-
-        The rules live in accounting_service.pricing, which decides from values. This reads what
-        is stored, asks for a decision, and carries it out. The entry arrives already validated
-        from accounting_service.configuration, so the unknown-SKU check below is the only thing
-        left that needs a session to answer.
-        """
-        item_obj = BillingItem.find_billing_item(session, entry.sku)
-        if not item_obj:
-            logging.error("Failed to find item %s when configuring price", entry.sku)
-            raise ValueError(f"Attempt to add price for unknown SKU {entry.sku}")
-
-        plan = plan_price_change(entry.valid_from, cls._configured_valid_froms(session, item_obj))
-
-        if plan.action is PriceAction.AMEND:
-            session.execute(
-                update(cls)
-                .where(cls.item_id == item_obj.uuid)
-                .where(cls.valid_from == entry.valid_from)
-                .values(price=entry.price)
-            )
-            return
-
-        if plan.action is PriceAction.SUPERSEDE:
-            # Close the period this price takes over from. Targeted by valid_from rather than
-            # by a null valid_until, so a row that was somehow left open does not get closed
-            # by accident.
-            session.execute(
-                update(cls)
-                .where(cls.item_id == item_obj.uuid)
-                .where(cls.valid_from == plan.supersedes_valid_from)
-                .values(valid_until=entry.valid_from)
-            )
-
-        session.add(cls(item=item_obj, valid_from=entry.valid_from, price=entry.price))
+    return (session.execute(select(func.max(col(PricingPolicy.version)))).scalar() or 0) + 1
 
 
 class PricingPolicy(SQLModel, table=True):
@@ -377,7 +286,7 @@ class PricingPolicy(SQLModel, table=True):
     has already been charged be re-priced without destroying the record of what was charged at
     the time (D8).
 
-    Bi-temporal, in the same way `BillingItemPrice` is. `valid_from` and `valid_until` say
+    Bi-temporal. `valid_from` and `valid_until` say
     which usage the policy applies to; `configured_at` says when the decision was taken.
     Resolving a policy for a usage time selects on the validity range and orders by
     `configured_at` descending, so a correcting policy wins over the policy it corrects (T5).
@@ -387,7 +296,7 @@ class PricingPolicy(SQLModel, table=True):
     per SKU, and the index that table needs would only be overhead here.
     """
 
-    __tablename__ = "pricing_policy"
+    __tablename__ = "pricing_policy"  # pyright: ignore[reportAssignmentType]
 
     uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
 
@@ -407,10 +316,6 @@ class PricingPolicy(SQLModel, table=True):
     # once something walks the chain.
     corrects_id: UUID | None = SQLModelField(default=None, foreign_key="pricing_policy.uuid")
 
-    # Credits per pound. Reporting and calibration only - nothing in the pricing path reads it
-    # (D2).
-    credit_to_currency_rate: Decimal
-
     # Applied to a workspace that has no category assignment yet (D6).
     default_category: str
 
@@ -427,6 +332,167 @@ class PricingPolicy(SQLModel, table=True):
         ),
     )
 
+    @classmethod
+    def current(cls, session: Session) -> Self | None:
+        """The policy in force, or None when none has been loaded yet.
+
+        The most recently configured policy, not the one with the latest `valid_from`. A
+        correction is configured after the policy it corrects but is backdated to cover the
+        same period, so `configured_at` is what decides which of two overlapping policies
+        wins (D8).
+
+        Ties are broken on `version` descending, because `configured_at` defaults to
+        `func.now()` and that is the transaction timestamp: two policies minted in one
+        transaction carry the same value.
+
+        Rates are loaded with their items, because the fingerprint is keyed on SKU and
+        walking `rate.item` per row would be a query each.
+        """
+        return (
+            session.execute(
+                select(cls)
+                .options(*_policy_load_options())
+                .order_by(col(cls.configured_at).desc(), col(cls.version).desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    def resolve(cls, session: Session, at: datetime) -> Self | None:
+        """The policy that prices usage occurring at `at`, or None when none is stored.
+
+        The most recently configured policy whose `valid_from` is at or before `at`. A
+        correction is configured after the policy it corrects and backdated over the same
+        period, so `configured_at` is what decides between two policies that both cover the
+        time (D8). Ties break on `version` descending, because `configured_at` defaults to
+        the transaction timestamp and two policies minted together share it.
+
+        When `at` predates every policy, the earliest policy prices it (D10). That happens
+        for an event backfilled from before the first calibration. The alternatives were to
+        skip the event, losing a charge silently, or to park it for retry, which needs a
+        queue and a way to notice the queue filling up.
+
+        This differs from `current()`, which ignores validity entirely and answers "what did
+        we configure last" for the loader. A policy dated next month is what we configured
+        last, and is not what prices anything today.
+        """
+        applicable = (
+            select(cls)
+            .options(*_policy_load_options())
+            .where(col(cls.valid_from) <= at)
+            .order_by(col(cls.configured_at).desc(), col(cls.version).desc())
+            .limit(1)
+        )
+
+        if policy := session.execute(applicable).scalars().first():
+            return policy
+
+        earliest = (
+            select(cls).options(*_policy_load_options()).order_by(col(cls.valid_from), col(cls.version)).limit(1)
+        )
+
+        return session.execute(earliest).scalars().first()
+
+    def fingerprint(self) -> PolicyFingerprint:
+        """What this policy would have to match for a document to leave it alone."""
+        return PolicyFingerprint.of(
+            valid_from=self.valid_from,
+            default_category=self.default_category,
+            rates=[(rate.item.sku, rate.credits_per_unit) for rate in self.rates],
+            category_multipliers=[(entry.category, entry.multiplier) for entry in self.category_multipliers],
+        )
+
+    @classmethod
+    def load_configured_policy(cls, session: Session, entry: ConfiguredPolicy) -> Self | None:
+        """Mint a new version, or return None when the document is already in force.
+
+        Called on every ingester pod start, so the common case is a document that has not
+        changed and this does nothing. Only a change to the numbers, the exchange rate, the
+        default category or `valid_from` mints a version - see PolicyFingerprint.
+
+        Two replicas starting together both see the same current policy and both try to mint
+        the same version. The unique constraint on `version` refuses the second, and this
+        recovers rather than failing the pod: the write happens inside a savepoint so the
+        caller's transaction survives, and the loser re-reads. If the winner minted what
+        this document describes, there is nothing left to do.
+
+        Raises ValueError for a rate naming a SKU that does not exist. Items load before the
+        policy, so a document may introduce an item and rate it in the same pass.
+        """
+        wanted = entry.fingerprint
+
+        current = cls.current(session)
+        if current is not None and current.fingerprint() == wanted:
+            logging.debug("Pricing policy version %s is already in force", current.version)
+            return None
+
+        items = cls._resolve_rated_items(session, entry)
+
+        for remaining in reversed(range(_MINT_ATTEMPTS)):
+            version = _next_version(session)
+
+            try:
+                with session.begin_nested():
+                    policy = cls(
+                        version=version,
+                        valid_from=entry.valid_from,
+                        default_category=entry.default_category,
+                        reason=entry.reason,
+                    )
+                    # The generated __init__ knows nothing about relationships, so it reports
+                    # policy_id as missing even though SQLAlchemy fills it in on flush.
+                    policy.rates = [
+                        PricingPolicyRate(  # pyright: ignore[reportCallIssue]
+                            item_id=items[rate.sku], credits_per_unit=rate.credits_per_unit
+                        )
+                        for rate in entry.rates
+                    ]
+                    policy.category_multipliers = [
+                        PricingPolicyCategoryMultiplier(  # pyright: ignore[reportCallIssue]
+                            category=item.category, multiplier=item.multiplier
+                        )
+                        for item in entry.category_multipliers
+                    ]
+                    session.add(policy)
+                    session.flush()
+            except IntegrityError:
+                logging.info("Pricing policy version %s was taken while loading; re-reading", version)
+                session.expire_all()
+
+                current = cls.current(session)
+                if current is not None and current.fingerprint() == wanted:
+                    return None
+
+                if not remaining:
+                    raise
+
+                continue
+
+            logging.info("Minted pricing policy version %s", version)
+
+            return policy
+
+        # Unreachable: the last attempt either returns or re-raises.
+        raise AssertionError
+
+    @classmethod
+    def _resolve_rated_items(cls, session: Session, entry: ConfiguredPolicy) -> dict[str, UUID]:
+        skus = [rate.sku for rate in entry.rates]
+
+        found = {
+            sku: uuid
+            for sku, uuid in session.execute(
+                select(col(BillingItem.sku), col(BillingItem.uuid)).where(col(BillingItem.sku).in_(skus))
+            ).all()
+        }
+
+        if missing := sorted(set(skus) - set(found)):
+            raise ValueError(f"`pricing_policy.rates` names SKUs which do not exist: {', '.join(missing)}")
+
+        return found
+
 
 class PricingPolicyRate(SQLModel, table=True):
     """
@@ -440,7 +506,7 @@ class PricingPolicyRate(SQLModel, table=True):
     happened to return first.
     """
 
-    __tablename__ = "pricing_policy_rate"
+    __tablename__ = "pricing_policy_rate"  # pyright: ignore[reportAssignmentType]
 
     uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
     policy_id: UUID = SQLModelField(foreign_key="pricing_policy.uuid")
@@ -463,7 +529,7 @@ class PricingPolicyCategoryMultiplier(SQLModel, table=True):
     has configured is a pricing decision rather than a validation failure.
     """
 
-    __tablename__ = "pricing_policy_category_multiplier"
+    __tablename__ = "pricing_policy_category_multiplier"  # pyright: ignore[reportAssignmentType]
 
     uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
     policy_id: UUID = SQLModelField(foreign_key="pricing_policy.uuid")
@@ -473,6 +539,25 @@ class PricingPolicyCategoryMultiplier(SQLModel, table=True):
     policy: PricingPolicy = Relationship(back_populates="category_multipliers")
 
     __table_args__ = (UniqueConstraint("policy_id", "category"),)
+
+
+def _policy_load_options() -> tuple[_AbstractLoad, ...]:
+    """Eager-load a policy's rates, their items, and its category multipliers.
+
+    Every read of a policy needs all three: the fingerprint is keyed on SKU, so walking
+    `rate.item` per row would be a query each.
+
+    The two suppressions live here rather than at each call site. `col()` is no help for a
+    loader option: it returns `Mapped[...]`, and `selectinload` wants the attribute itself.
+    SQLModel types a `Relationship()` attribute as the related class, so there is nothing to
+    hand it that satisfies both the checker and SQLAlchemy.
+    """
+    return (
+        selectinload(PricingPolicy.rates).selectinload(  # pyright: ignore[reportArgumentType]
+            PricingPolicyRate.item  # pyright: ignore[reportArgumentType]
+        ),
+        selectinload(PricingPolicy.category_multipliers),  # pyright: ignore[reportArgumentType]
+    )
 
 
 class TimeAggregation(StrEnum):
@@ -510,7 +595,7 @@ class BillingEvent(SQLModel, table=True):
     are received too late or not at all, we don't impose a foreign key constraint.
     """
 
-    __tablename__ = "billing_event"
+    __tablename__ = "billing_event"  # pyright: ignore[reportAssignmentType]
 
     uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
     event_start: datetime = aware_timestamp()
@@ -615,14 +700,18 @@ GROUP BY 2, 3, 4, 6
 """
             )
 
+            # The table's own columns, not the ORM attributes. `.columns()` is describing the
+            # result of the text above, so a Column is what it wants - and col() cannot supply
+            # one, because it hands back `Mapped[...]`.
+            table = SQLModel.metadata.tables[str(cls.__tablename__)]
             select_aggregated_events = select_aggregated_events.columns(
-                cls.uuid,
-                cls.event_start,
-                cls.event_end,
-                cls.item_id,
-                cls.user,
-                cls.workspace,
-                cls.quantity,
+                table.c.uuid,
+                table.c.event_start,
+                table.c.event_end,
+                table.c.item_id,
+                table.c.user,
+                table.c.workspace,
+                table.c.quantity,
             )
 
             billingevent_src = aliased(BillingEvent, select_aggregated_events.subquery())
@@ -637,73 +726,86 @@ GROUP BY 2, 3, 4, 6
         # need no second query at all, but it would then depend on a join that exists for
         # ordering and could reasonably be removed. selectinload is one extra query for the
         # whole page and is independent of the query's shape.
+        # Column handles for everything below. col() is needed because SQLModel declares fields
+        # as plain annotations, so `billingevent_src.event_start >= start` reads as a `bool` to
+        # a type checker rather than a SQL predicate. Naming them once also lets the paging
+        # comparison below read as the tuple comparison it is, instead of drowning in prefixes.
+        event_start = col(billingevent_src.event_start)
+        event_end = col(billingevent_src.event_end)
+        event_workspace = col(billingevent_src.workspace)
+        event_uuid = col(billingevent_src.uuid)
+        item_sku = col(BillingItem.sku)
+
         all_billing_events = (
             select(billingevent_src)
-            .join(BillingItem, BillingItem.uuid == billingevent_src.item_id)
-            .options(selectinload(billingevent_src.item))
+            .join(BillingItem, col(BillingItem.uuid) == col(billingevent_src.item_id))
+            # selectinload takes the attribute itself, which col() cannot supply: it hands back
+            # `Mapped[...]`, and SQLModel types a Relationship() attribute as the related class.
+            .options(selectinload(billingevent_src.item))  # pyright: ignore[reportArgumentType]
         )
 
         # We need a complete and certain order so that the 'after' parameter works.
         query = all_billing_events.order_by(
-            billingevent_src.event_start,
-            billingevent_src.event_end,
-            billingevent_src.workspace,
-            BillingItem.sku,
-            billingevent_src.uuid,
+            event_start,
+            event_end,
+            event_workspace,
+            item_sku,
+            event_uuid,
         )
 
         query = query.limit(limit)
 
         if workspace is not None:
-            query = query.where(billingevent_src.workspace == workspace)
+            query = query.where(event_workspace == workspace)
 
         if account is not None:
-            query = query.join(WorkspaceAccount, WorkspaceAccount.workspace == billingevent_src.workspace).where(
-                WorkspaceAccount.account == account
+            query = query.join(WorkspaceAccount, col(WorkspaceAccount.workspace) == event_workspace).where(
+                col(WorkspaceAccount.account) == account
             )
 
         if start is not None:
-            query = query.where(billingevent_src.event_start >= start)
+            query = query.where(event_start >= start)
 
         if end is not None:
-            query = query.where(billingevent_src.event_end < end)
+            query = query.where(event_end < end)
 
         if after is not None:
             # This is equivalent to
             #   after_be = session.get(cls, after)
             # but it works when billingevent_src is an alias rather than an ORM class.
-            after_be = session.execute(
-                select(billingevent_src).where(billingevent_src.uuid == after)
-            ).scalar_one_or_none()
+            after_be = session.execute(select(billingevent_src).where(event_uuid == after)).scalar_one_or_none()
 
             if after_be is None:
                 raise AfterBillingEventNotFound(f"No records matching after={after} found")
 
+            # Everything strictly after `after_be` in the ordering above: a lexicographic
+            # comparison over (event_start, event_end, workspace, sku, uuid), spelled out
+            # because PostgreSQL cannot use the index for a row-value comparison here.
             query = query.where(
-                billingevent_src.event_start >= after_be.event_start,
+                event_start >= after_be.event_start,
                 or_(
-                    (billingevent_src.event_start > after_be.event_start),
+                    event_start > after_be.event_start,
                     and_(
-                        billingevent_src.event_start == after_be.event_start,
-                        billingevent_src.event_end > after_be.event_end,
+                        event_start == after_be.event_start,
+                        event_end > after_be.event_end,
                     ),
                     and_(
-                        billingevent_src.event_start == after_be.event_start,
-                        billingevent_src.event_end == after_be.event_end,
-                        billingevent_src.workspace > after_be.workspace,
+                        event_start == after_be.event_start,
+                        event_end == after_be.event_end,
+                        event_workspace > after_be.workspace,
                     ),
                     and_(
-                        billingevent_src.event_start == after_be.event_start,
-                        billingevent_src.event_end == after_be.event_end,
-                        billingevent_src.workspace == after_be.workspace,
-                        BillingItem.sku > after_be.item.sku,
+                        event_start == after_be.event_start,
+                        event_end == after_be.event_end,
+                        event_workspace == after_be.workspace,
+                        item_sku > after_be.item.sku,
                     ),
                     and_(
-                        billingevent_src.event_start == after_be.event_start,
-                        billingevent_src.event_end == after_be.event_end,
-                        billingevent_src.workspace == after_be.workspace,
-                        BillingItem.sku == after_be.item.sku,
-                        billingevent_src.uuid > after,
+                        event_start == after_be.event_start,
+                        event_end == after_be.event_end,
+                        event_workspace == after_be.workspace,
+                        item_sku == after_be.item.sku,
+                        event_uuid > after,
                     ),
                 ),
             )
@@ -720,13 +822,13 @@ GROUP BY 2, 3, 4, 6
         """
         Returns the most recent BillingEvent, optionally constrained by workspace and item.
         """
-        query = select(cls).order_by(cls.event_end.desc()).limit(1)
+        query = select(cls).order_by(col(cls.event_end).desc()).limit(1)
 
         if workspace is not None:
-            query = query.where(cls.workspace == workspace)
+            query = query.where(col(cls.workspace) == workspace)
 
         if sku is not None:
-            query = query.join(BillingItem).where(BillingItem.sku == sku)
+            query = query.join(BillingItem).where(col(BillingItem.sku) == sku)
 
         return session.execute(query).scalar_one_or_none()
 
@@ -743,13 +845,13 @@ GROUP BY 2, 3, 4, 6
                 uuid=UUID(str(msg.uuid)),
                 event_start=datetime_default_to_utc(datetime.fromisoformat(str(msg.event_start))),
                 event_end=datetime_default_to_utc(datetime.fromisoformat(str(msg.event_end))),
-                item_id=select(BillingItem.uuid).where(BillingItem.sku == msg.sku).scalar_subquery(),
+                item_id=select(col(BillingItem.uuid)).where(col(BillingItem.sku) == msg.sku).scalar_subquery(),
                 user=UUID(str(msg.user)) if msg.user else None,
                 workspace=msg.workspace,
                 quantity=msg.quantity,
             )
             .on_conflict_do_nothing(index_elements=["uuid"])
-            .returning(BillingEvent.uuid)
+            .returning(col(BillingEvent.uuid))
         )
 
         return result.scalar_one_or_none()
@@ -781,7 +883,7 @@ class BillableResourceConsumptionRateSample(SQLModel, table=True):
     between samples and integrating.
     """
 
-    __tablename__ = "billing_resource_consumption_rate_sample"
+    __tablename__ = "billing_resource_consumption_rate_sample"  # pyright: ignore[reportAssignmentType]
 
     uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
 
@@ -822,13 +924,13 @@ class BillableResourceConsumptionRateSample(SQLModel, table=True):
             .values(
                 uuid=UUID(str(msg.uuid)),
                 sample_time=datetime_default_to_utc(datetime.fromisoformat(str(msg.sample_time))),
-                item_id=(select(BillingItem.uuid).where(BillingItem.sku == msg.sku).scalar_subquery()),
+                item_id=(select(col(BillingItem.uuid)).where(col(BillingItem.sku) == msg.sku).scalar_subquery()),
                 user=UUID(str(msg.user)) if msg.user else None,
                 workspace=msg.workspace,
                 rate=msg.rate,
             )
             .on_conflict_do_nothing(index_elements=["uuid"])
-            .returning(cls.uuid)
+            .returning(col(cls.uuid))
         )
 
         return result.scalar_one_or_none()
@@ -837,29 +939,29 @@ class BillableResourceConsumptionRateSample(SQLModel, table=True):
     def find_data_for_interval(
         cls, session: Session, workspace: str, sku: str, start: datetime, end: datetime
     ) -> Sequence[Self]:
-        item_subquery = select(BillingItem.uuid).where(BillingItem.sku == sku).scalar_subquery()
+        item_subquery = select(col(BillingItem.uuid)).where(col(BillingItem.sku) == sku).scalar_subquery()
         last_before_start = (
             select(cls)
-            .where(cls.item_id == item_subquery)
-            .where(cls.workspace == workspace)
-            .where(cls.sample_time <= start)
-            .order_by(cls.sample_time.desc())
+            .where(col(cls.item_id) == item_subquery)
+            .where(col(cls.workspace) == workspace)
+            .where(col(cls.sample_time) <= start)
+            .order_by(col(cls.sample_time).desc())
             .limit(1)
         )
         first_after_end = (
             select(cls)
-            .where(cls.item_id == item_subquery)
-            .where(cls.workspace == workspace)
-            .where(cls.sample_time >= end)
-            .order_by(cls.sample_time)
+            .where(col(cls.item_id) == item_subquery)
+            .where(col(cls.workspace) == workspace)
+            .where(col(cls.sample_time) >= end)
+            .order_by(col(cls.sample_time))
             .limit(1)
         )
         in_period = (
             select(cls)
-            .where(cls.item_id == item_subquery)
-            .where(cls.workspace == workspace)
-            .where(cls.sample_time > start)
-            .where(cls.sample_time < end)
+            .where(col(cls.item_id) == item_subquery)
+            .where(col(cls.workspace) == workspace)
+            .where(col(cls.sample_time) > start)
+            .where(col(cls.sample_time) < end)
         )
 
         query = select(cls).from_statement(
@@ -901,13 +1003,13 @@ class BillableResourceConsumptionRateSample(SQLModel, table=True):
         """
         Returns the first observed sample for the given constraints.
         """
-        query = select(cls).order_by(cls.sample_time).limit(1)
+        query = select(cls).order_by(col(cls.sample_time)).limit(1)
 
         if workspace is not None:
-            query = query.where(cls.workspace == workspace)
+            query = query.where(col(cls.workspace) == workspace)
 
         if item_id is not None:
-            query = query.where(cls.item_id == item_id)
+            query = query.where(col(cls.item_id) == item_id)
 
         return session.execute(query).scalar_one_or_none()
 

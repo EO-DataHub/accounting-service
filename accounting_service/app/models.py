@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, Self
+from typing import Annotated
 from uuid import UUID
 
 from pydantic import (
@@ -15,7 +15,6 @@ from pydantic import (
 
 from accounting_service.models import (
     BillingItemBase,
-    BillingItemPrice,
     TimeAggregation,
 )
 from accounting_service.timestamps import as_utc, datetime_default_to_utc
@@ -184,36 +183,34 @@ class BillingItemAPIResult(BillingItemBase):
     uuid: UUID  # pyright: ignore[reportGeneralTypeIssues]
 
 
-class BillingItemPriceAPIResult(BaseModel):
-    """
-    A billing item price gives the price-per-unit of a billing item which is/was in force between
-    certain dates.
+class BillingItemRateAPIResult(BaseModel):
+    """What one SKU costs per unit, under the policy that prices usage now.
+
+    This replaced a response carrying a price in pounds, read from `billing_item_price`.
+    Credits are the unit of account in this service and buying them is out of scope, so
+    there is nothing to convert: the number here is the number the ledger charges.
+
+    Three fields changed shape with it, and the UI reads this endpoint through
+    `InvoicesContext`:
+
+      * `price` became `credits_per_unit`, renamed rather than redefined so a client
+        displaying credits as pounds fails visibly instead of showing a wrong number.
+      * `valid_until` is gone. The loader never closes a policy, so it was always null.
+      * `uuid` is gone. It identified a price row, and a rate row's identity is an
+        implementation detail no client has a use for.
+
+    `valid_from` is unchanged in name but not in meaning. Every SKU now reports the date of
+    the calibration that set it, so all of them share one date rather than each carrying its
+    own - which is the point of versioning a policy as a bundle (D3).
     """
 
-    uuid: UUID
     sku: Annotated[str, Field(description="The product this applies to", examples=["wfcpu"])]
-    valid_from: UtcTimestamp
-    valid_until: Annotated[UtcTimestamp | None, Field(description="Price was in-force until this time")] = None
-    price: Annotated[
+    credits_per_unit: Annotated[
         ExactDecimal,
         Field(
-            description="Price-per-unit in Pounds, as an exact decimal string",
+            description="Credits charged per unit, as an exact decimal string",
             examples=["0.001"],
         ),
     ]
-
-    @classmethod
-    def from_billing_item_price(cls, price: BillingItemPrice, sku: str) -> Self:
-        """Build the response from a stored price and the SKU it belongs to.
-
-        The SKU is passed separately because find_prices returns it alongside the price
-        rather than on it. The Row that query produces is a SQLAlchemy detail, so the
-        caller unpacks it rather than this model knowing the shape.
-        """
-        return cls(
-            uuid=price.uuid,
-            sku=sku,
-            valid_from=price.valid_from_utc,
-            valid_until=price.valid_until_utc,
-            price=price.price,
-        )
+    valid_from: Annotated[UtcTimestamp, Field(description="When the calibration that set this took effect")]
+    policy_version: Annotated[int, Field(description="Which pricing policy version this rate comes from")]

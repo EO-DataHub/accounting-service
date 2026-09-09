@@ -66,16 +66,25 @@ Configured in `pyproject.toml` under `[tool.pyright]`. There was a `pyrightconfi
 alongside it, which pyright loads in preference and which made that whole section inert; it
 has been folded in and removed.
 
-`accounting_service` is held to `standard`, where a bad attribute or argument is an error.
-`reportArgumentType` and `reportAttributeAccessIssue` are downgraded to warnings for `tests`,
-`dev` and `alembic` only, through `executionEnvironments`. The package is clean under the
-strict setting, so keep it that way rather than widening the downgrade to cover it.
+`accounting_service` and `alembic` are held to `standard`, where a bad attribute or argument
+is an error, and both are clean under it. `reportArgumentType` and
+`reportAttributeAccessIssue` are off for `tests` and `dev` through `executionEnvironments`,
+because eodhp_utils declares its Pulsar message classes with field descriptors that no type
+checker can read as their value types. Keep the package and the migrations clean rather than
+widening that exemption to cover them.
 
-Pyright cannot check SQLModel query expressions: fields are plain annotations rather than
-`Mapped[...]`, so a `where(...)` clause looks like a bool and a row built with `item=obj`
-looks like a missing `item_id`. `models.py` carries a file-level suppression with the
-reasoning in its header. Put a suppression in the file that needs it, as narrowly as it will
-go — a wrapper function with one `# pyright: ignore` beats a suppression covering a file.
+Reach for `col()` from sqlmodel before reaching for a suppression. SQLModel declares fields as
+plain annotations, so `Thing.name == x` is a `bool` and `select(Thing.count)` is
+`select(int)` as far as a checker is concerned; `col(Thing.name) == x` hands back the column
+and types correctly. It works in `where`, `join`, `order_by` and `select`, and it is a fix
+rather than a silencing - `models.py`'s file-level suppression exists because its queries
+predate this habit.
+
+`models.py` used to carry a file-level suppression of five rules; it does not any more, and
+should not again. Its module docstring records the three things `col()` cannot fix -
+`__tablename__`, `selectinload`, and building a row through a relationship - each suppressed
+on the line it occurs. Keep suppressions inline and rule-specific: one line with a reason
+beats a header covering a file.
 
 ## Docker
 

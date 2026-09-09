@@ -65,7 +65,7 @@ import sqlalchemy as sa
 
 # Needed because SQLModel maps str to sqlmodel.sql.sqltypes.AutoString, which autogenerate
 # writes into revisions without importing.
-import sqlmodel  # noqa: F401
+import sqlmodel.sql.sqltypes  # noqa: F401
 
 from alembic import op
 

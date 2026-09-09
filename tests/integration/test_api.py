@@ -1,13 +1,14 @@
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from http import HTTPStatus
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm.session import Session
 
 from accounting_service import models
@@ -442,60 +443,63 @@ def test_account_usage_data_is_behind_the_account_dependency(
     assert response.status_code == 401
 
 
-def test_prices_api_returns_only_the_currently_valid_prices(db_session: Session, client: TestClient) -> None:
-    """find_prices excludes a price whose validity has ended, and orders by SKU.
+def test_prices_api_returns_the_rates_of_the_policy_in_force(db_session: Session, client: TestClient) -> None:
+    """The endpoint serves the policy that prices usage now, in SKU order.
 
-    The decimal formatting and the null valid_until are covered in
-    tests/test_api_models.py; the filter and the ordering need a query.
+    Two things need a query rather than a model test: that a calibration dated in the future
+    is not served yet, and that the rates come from the policy `resolve` picks. The decimal
+    formatting is covered in tests/test_api_models.py.
     """
     ############# Setup
-    uuid_item_a = uuid.uuid4()
-    uuid_item_b = uuid.uuid4()
-    db_session.add(models.BillingItem(uuid=uuid_item_a, sku="sku1", name="Item a", unit="GBh"))
-    db_session.add(models.BillingItem(uuid=uuid_item_b, sku="sku2", name="Item b", unit="GBh"))
+    db_session.add(models.BillingItem(uuid=uuid.uuid4(), sku="sku1", name="Item a", unit="GBh"))
+    db_session.add(models.BillingItem(uuid=uuid.uuid4(), sku="sku2", name="Item b", unit="GBh"))
+    db_session.flush()
 
-    current_a = uuid.uuid4()
-    superseded_a = uuid.uuid4()
-    current_b = uuid.uuid4()
-
-    db_session.add(
-        models.BillingItemPrice(
-            uuid=current_a,
-            price=Decimal("2.34"),
-            valid_from=datetime(2024, 1, 16, 0, 0, 0),
-            configured_at=datetime(2024, 1, 16, 0, 0, 0),
-            item_id=uuid_item_a,
-        )
-    )
-    db_session.add(
-        models.BillingItemPrice(
-            uuid=superseded_a,
-            price=Decimal("2.30"),
-            valid_from=datetime(2023, 1, 16, 0, 0, 0),
-            valid_until=datetime(2024, 1, 16, 0, 0, 0),
-            configured_at=datetime(2023, 1, 16, 0, 0, 0),
-            item_id=uuid_item_a,
-        )
-    )
-    db_session.add(
-        models.BillingItemPrice(
-            uuid=current_b,
-            price=Decimal("0.000000412"),
-            valid_from=datetime(2023, 1, 16, 0, 0, 0),
-            configured_at=datetime(2023, 1, 17, 0, 0, 0),
-            item_id=uuid_item_b,
-        )
-    )
+    in_force = _a_policy(db_session, version=1, valid_from=datetime(2024, 1, 16, tzinfo=UTC), rate="2.34")
+    _a_policy(db_session, version=2, valid_from=datetime(2999, 1, 1, tzinfo=UTC), rate="99.99")
 
     ############# Test
     response = client.get("/accounting/prices")
 
     ############# Behaviour check
     assert response.status_code == 200
-    assert [(p["uuid"], p["sku"]) for p in response.json()] == [
-        (str(current_a), "sku1"),
-        (str(current_b), "sku2"),
+    assert response.json() == [
+        {
+            "sku": "sku1",
+            "credits_per_unit": "2.34",
+            "valid_from": "2024-01-16T00:00:00Z",
+            "policy_version": in_force.version,
+        },
+        {
+            "sku": "sku2",
+            "credits_per_unit": "2.34",
+            "valid_from": "2024-01-16T00:00:00Z",
+            "policy_version": in_force.version,
+        },
     ]
+
+
+def test_prices_api_is_empty_when_no_policy_is_configured(db_session: Session, client: TestClient) -> None:
+    response = client.get("/accounting/prices")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def _a_policy(session: Session, *, version: int, valid_from: datetime, rate: str) -> models.PricingPolicy:
+    """A policy rating every stored SKU at the same rate."""
+    policy = models.PricingPolicy(version=version, valid_from=valid_from, default_category="standard")
+    policy.rates = [
+        models.PricingPolicyRate(item_id=item.uuid, credits_per_unit=Decimal(rate))  # pyright: ignore[reportCallIssue]
+        for item in session.execute(select(models.BillingItem)).scalars()
+    ]
+    policy.category_multipliers = [
+        models.PricingPolicyCategoryMultiplier(category="standard", multiplier=Decimal(1))  # pyright: ignore[reportCallIssue]
+    ]
+    session.add(policy)
+    session.flush()
+
+    return policy
 
 
 def test_usage_data_query_count_does_not_grow_with_the_page(

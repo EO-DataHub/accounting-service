@@ -11,7 +11,6 @@ of the two was written last.
 """
 
 import io
-from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -23,15 +22,21 @@ from accounting_service.configuration import (
     load_configuration,
 )
 
+POLICY_ONLY = """---
+pricing_policy:
+  valid_from: "2025-01-01T00:00:00Z"
+  default_category: standard
+  rates: []
+  category_multipliers:
+    - category: standard
+      multiplier: 1
+"""
+
 COMPLETE = """---
 items:
   - sku: "cpu-seconds"
     name: "CPU time"
     unit: "s"
-prices:
-  - sku: "cpu-seconds"
-    valid_from: "2025-01-01T00:00:00Z"
-    price: 12.34
 """
 
 
@@ -41,39 +46,17 @@ class TestAWellFormedDocument:
 
         assert configuration.items == (ConfiguredItem(sku="cpu-seconds", name="CPU time", unit="s"),)
 
-    def test_the_prices_are_parsed(self) -> None:
-        (price,) = load_configuration(COMPLETE).prices
-
-        assert price.sku == "cpu-seconds"
-        assert price.valid_from == datetime(2025, 1, 1, tzinfo=UTC)
-
-    def test_a_price_becomes_an_exact_decimal(self) -> None:
-        """YAML parses 12.34 as a float, and money that has been through a float is not the
-        figure that was written down."""
-        (price,) = load_configuration(COMPLETE).prices
-
-        assert price.price == Decimal("12.34")
-
-    def test_a_valid_from_without_an_offset_is_taken_as_utc(self) -> None:
-        """The documented rule, and the reason ConfiguredPrice has a validator: calling
-        astimezone on a naive value reads it as the host's local time instead."""
-        document = 'prices:\n  - {sku: "s", price: 1, valid_from: "2025-07-01T00:00:00"}\n'
-
-        (price,) = load_configuration(document).prices
-
-        assert price.valid_from == datetime(2025, 7, 1, tzinfo=UTC)
-
     @pytest.mark.parametrize(
         "document",
         [
             'items:\n  - {sku: "s", name: "n", unit: "u"}\n',
-            'prices:\n  - {sku: "s", price: 1, valid_from: "2025-01-01T00:00:00Z"}\n',
+            POLICY_ONLY,
         ],
-        ids=["items-only", "prices-only"],
+        ids=["items-only", "policy-only"],
     )
-    def test_either_collection_may_be_absent(self, document: str) -> None:
-        """A document holding only prices is what set-price sends, and one holding only items
-        is what update-item sends."""
+    def test_either_section_may_be_absent(self, document: str) -> None:
+        """A document holding only items is what the admin CLI sends, and one holding only a
+        policy is a calibration against SKUs already defined."""
         load_configuration(document)
 
     def test_a_stream_is_accepted_as_well_as_a_string(self) -> None:
@@ -170,39 +153,6 @@ class TestRepeatedEntries:
         with pytest.raises(ConfigurationError, match="more than once"):
             load_configuration(document)
 
-    def test_a_repeated_price_for_the_same_instant_is_rejected(self) -> None:
-        """Worse than a repeated item, because it is order-dependent: applying the first entry
-        makes the second an amendment of it, so the document means whatever was written last.
-        """
-        document = (
-            "prices:\n"
-            '  - {sku: "s", price: 1, valid_from: "2025-01-01T00:00:00Z"}\n'
-            '  - {sku: "s", price: 2, valid_from: "2025-01-01T00:00:00Z"}\n'
-        )
-
-        with pytest.raises(ConfigurationError, match="more than once"):
-            load_configuration(document)
-
-    def test_the_same_instant_written_two_ways_is_still_a_duplicate(self) -> None:
-        """Compared after parsing, so an offset and a Z form of the same instant collide."""
-        document = (
-            "prices:\n"
-            '  - {sku: "s", price: 1, valid_from: "2025-01-01T00:00:00Z"}\n'
-            '  - {sku: "s", price: 2, valid_from: "2025-01-01T01:00:00+01:00"}\n'
-        )
-
-        with pytest.raises(ConfigurationError, match="more than once"):
-            load_configuration(document)
-
-    def test_the_same_sku_at_different_times_is_a_price_history(self) -> None:
-        document = (
-            "prices:\n"
-            '  - {sku: "s", price: 1, valid_from: "2025-01-01T00:00:00Z"}\n'
-            '  - {sku: "s", price: 2, valid_from: "2025-02-01T00:00:00Z"}\n'
-        )
-
-        assert len(load_configuration(document).prices) == 2
-
     def test_the_message_names_the_offender(self) -> None:
         """Only the repeated one. Pydantic echoes the whole input alongside the message, so
         the assertion is on the sentence rather than on the absence of the other SKUs.
@@ -228,5 +178,55 @@ def test_the_development_configuration_is_valid() -> None:
 
     configuration = load_configuration(document.read_text())
 
-    priced = {price.sku for price in configuration.prices}
-    assert priced <= {item.sku for item in configuration.items}, "a price names a SKU the file does not define"
+    defined = {item.sku for item in configuration.items}
+
+    policy = configuration.pricing_policy
+    assert policy is not None, "the local config should exercise the policy loader"
+    assert {rate.sku for rate in policy.rates} <= defined, "a rate names a SKU the file does not define"
+    assert defined <= {rate.sku for rate in policy.rates}, "an item the file defines has no rate"
+
+
+POLICY = """---
+items:
+  - sku: "cpu-seconds"
+    name: "CPU time"
+    unit: "s"
+pricing_policy:
+  valid_from: "2025-01-01T00:00:00Z"
+  default_category: standard
+  reason: "initial calibration"
+  rates:
+    - sku: cpu-seconds
+      credits_per_unit: 0.5
+  category_multipliers:
+    - category: standard
+      multiplier: 1
+    - category: academic
+      multiplier: 0.5
+"""
+
+
+class TestThePolicySection:
+    def test_it_is_parsed(self) -> None:
+        policy = load_configuration(POLICY).pricing_policy
+
+        assert policy is not None
+        assert policy.rates[0].credits_per_unit == Decimal("0.5")
+        assert len(policy.category_multipliers) == 2
+
+    def test_it_is_optional(self) -> None:
+        """A document that only adds an item or corrects a price carries no policy, which is
+        what the admin CLI sends."""
+        assert load_configuration(COMPLETE).pricing_policy is None
+
+    def test_a_fault_inside_it_is_reported_as_a_configuration_error(self) -> None:
+        """Nested validation runs through the same load, so the whole document is rejected
+        rather than the policy being skipped."""
+        broken = POLICY.replace("default_category: standard", "default_category: nonexistent")
+
+        with pytest.raises(ConfigurationError, match="has no entry in category_multipliers"):
+            load_configuration(broken)
+
+    def test_an_unknown_key_inside_it_is_rejected(self) -> None:
+        with pytest.raises(ConfigurationError, match="rate"):
+            load_configuration(POLICY.replace("  rates:", "  rate:"))

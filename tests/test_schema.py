@@ -8,7 +8,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import func
+from sqlalchemy import UniqueConstraint, func
 from sqlalchemy.dialects import postgresql
 from sqlmodel import Field, SQLModel
 
@@ -173,10 +173,12 @@ def test_the_policy_uniqueness_rules_are_declared(table_name: str, columns: set[
     Declared here as well as enforced in tests/integration/test_pricing_policy.py: this test
     says the rule exists, that one says it reaches the database.
     """
+    # isinstance rather than a name comparison, so `constraint.columns` narrows: only a
+    # ColumnCollectionConstraint has that attribute, and the base Constraint does not.
     declared = {
         frozenset(column.name for column in constraint.columns)
         for constraint in SQLModel.metadata.tables[table_name].constraints
-        if constraint.__class__.__name__ == "UniqueConstraint"
+        if isinstance(constraint, UniqueConstraint)
     }
 
     assert frozenset(columns) in declared, f"{table_name} declares unique constraints on {declared}"

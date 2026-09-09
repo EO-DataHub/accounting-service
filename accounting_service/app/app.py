@@ -19,7 +19,6 @@ from fastapi.responses import JSONResponse
 
 # noinspection PyPackageRequirements
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from sqlalchemy import Result
 from sqlalchemy.orm import Session
 
 from accounting_service.app.authz import MinTier
@@ -34,13 +33,13 @@ from accounting_service.models import (
     AfterBillingEventNotFound,
     BillingEvent,
     BillingItem,
-    BillingItemPrice,
+    PricingPolicy,
 )
 
 from .models import (
     BillingEventAPIResult,
     BillingItemAPIResult,
-    BillingItemPriceAPIResult,
+    BillingItemRateAPIResult,
     UsageQuery,
 )
 
@@ -192,15 +191,31 @@ def get_item(session: SessionDep, sku: str) -> BillingItemAPIResult:
 
 @app.get(
     "/accounting/prices",
-    summary="Return all current EO DataHub prices",
+    summary="Return the current EO DataHub credit rates",
     dependencies=[Depends(global_data_cache)],
 )
-def get_prices(session: SessionDep) -> list[BillingItemPriceAPIResult]:
+def get_prices(session: SessionDep) -> list[BillingItemRateAPIResult]:
     """
-    This returns all current prices in SKU order. Prices which were only valid in the past or will
-    be in the future are not returned. The cost is given in Pounds per unit, where the unit is
-    defined in the billing item the price relates to.
-    """
-    prices: Result[tuple[BillingItemPrice, str]] = BillingItemPrice.find_prices(session, datetime.now(UTC))
+    This returns the credits charged per unit for every SKU, in SKU order. The unit is defined in
+    the billing item the rate relates to.
 
-    return [BillingItemPriceAPIResult.from_billing_item_price(price, sku) for price, sku in prices]
+    The rates are those of the pricing policy in force now, so a calibration dated in the future
+    is not returned until it takes effect. An empty list means no policy has been configured.
+    """
+    policy = PricingPolicy.resolve(session, datetime.now(UTC))
+
+    if policy is None:
+        return []
+
+    return sorted(
+        (
+            BillingItemRateAPIResult(
+                sku=rate.item.sku,
+                credits_per_unit=rate.credits_per_unit,
+                valid_from=policy.valid_from,
+                policy_version=policy.version,
+            )
+            for rate in policy.rates
+        ),
+        key=lambda rate: rate.sku,
+    )

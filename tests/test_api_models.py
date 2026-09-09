@@ -22,9 +22,9 @@ import pytest
 from accounting_service.app.models import (
     BillingEventAPIResult,
     BillingItemAPIResult,
-    BillingItemPriceAPIResult,
+    BillingItemRateAPIResult,
 )
-from accounting_service.models import BillingEvent, BillingItem, BillingItemPrice
+from accounting_service.models import BillingEvent, BillingItem
 
 
 def an_item(sku: str = "cpu-seconds") -> BillingItem:
@@ -137,27 +137,27 @@ class TestBillingEventAPIResult:
         assert result.model_dump(mode="json")["event_start"] == emitted
 
 
-class TestBillingItemPriceAPIResult:
-    """Built by a constructor, because `sku` is not on the price row.
-
-    find_prices returns it alongside the price from a join. Reaching it through
-    `price.item.sku` instead would lazy-load the relationship once per row.
-    """
+class TestBillingItemRateAPIResult:
+    """The rates response, which replaced a price in pounds read from billing_item_price."""
 
     @staticmethod
-    def a_price(amount: str) -> BillingItemPrice:
-        return BillingItemPrice(
-            uuid=uuid4(),
-            item_id=uuid4(),
-            price=Decimal(amount),
+    def a_rate(credits_per_unit: str = "2.34") -> BillingItemRateAPIResult:
+        return BillingItemRateAPIResult(
+            sku="cpu-seconds",
+            credits_per_unit=Decimal(credits_per_unit),
             valid_from=datetime(2025, 1, 1, tzinfo=UTC),
-            configured_at=datetime(2025, 1, 1, tzinfo=UTC),
+            policy_version=3,
         )
 
-    def test_the_sku_is_supplied_by_the_caller(self) -> None:
-        result = BillingItemPriceAPIResult.from_billing_item_price(self.a_price("2.34"), "cpu-seconds")
+    def test_every_field_comes_across(self) -> None:
+        emitted = self.a_rate().model_dump(mode="json")
 
-        assert result.sku == "cpu-seconds"
+        assert emitted == {
+            "sku": "cpu-seconds",
+            "credits_per_unit": "2.34",
+            "valid_from": "2025-01-01T00:00:00Z",
+            "policy_version": 3,
+        }
 
     @pytest.mark.parametrize(
         ("stored", "emitted"),
@@ -166,19 +166,19 @@ class TestBillingItemPriceAPIResult:
             # Pydantic's own Decimal output would give "4.12E-7" here, which a UI showing it
             # verbatim renders as something that looks broken.
             ("0.000000412", "0.000000412"),
-            # Scale is preserved: 0.10 is not 0.1, for anything formatting currency.
+            # Scale is preserved: 0.10 is not 0.1, for anything formatting a quantity.
             ("0.10", "0.10"),
             ("1E+2", "100"),
         ],
         ids=["ordinary", "very-small", "trailing-zero", "exponent-in-storage"],
     )
-    def test_price_is_an_exact_decimal_string(self, stored: str, emitted: str) -> None:
-        result = BillingItemPriceAPIResult.from_billing_item_price(self.a_price(stored), "sku")
+    def test_the_rate_is_an_exact_decimal_string(self, stored: str, emitted: str) -> None:
+        assert self.a_rate(stored).model_dump(mode="json")["credits_per_unit"] == emitted
 
-        assert result.model_dump(mode="json")["price"] == emitted
-
-    def test_an_open_ended_price_has_a_null_valid_until(self) -> None:
-        """The current price has no end, and the field is present rather than omitted."""
-        result = BillingItemPriceAPIResult.from_billing_item_price(self.a_price("1.00"), "sku")
-
-        assert result.model_dump(mode="json")["valid_until"] is None
+    @pytest.mark.parametrize("gone", ["price", "uuid", "valid_until"])
+    def test_the_fields_that_went_are_gone(self, gone: str) -> None:
+        """`price` was renamed rather than redefined, so a client displaying credits as
+        pounds fails visibly. `valid_until` was always null once the loader stopped closing
+        policies, and `uuid` identified a price row nothing asks about.
+        """
+        assert gone not in BillingItemRateAPIResult.model_fields

@@ -7,9 +7,10 @@ from io import StringIO
 import rich_click as click
 from rich.console import Console
 from rich.table import Table
-from sqlalchemy import and_, or_, select
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from sqlmodel import col
 
 from accounting_service import db, models
 
@@ -37,7 +38,11 @@ def handle_errors(fn: Callable) -> Callable:
 @click.rich_config(help_config=click.RichHelpConfiguration(text_markup="markdown", width=79))
 def cli(ctx: click.Context) -> None:
     """
-    Manage billing items and prices directly against the database.
+    Inspect billing items and credit rates, and create items, against the database.
+
+    Rates are not set here. A pricing policy covers every rate at once (D3) and is minted by
+    loading the configuration document, which is reviewed and versioned. `set-price` used to
+    write one price row and has no meaning against a policy.
     """
     ctx.obj = session = Session(db.get_engine())
 
@@ -49,13 +54,13 @@ def cli(ctx: click.Context) -> None:
 # noinspection unresolved-references
 @cli.command("ls")
 @click.pass_obj
-@click.argument("sku", help="Show price history for this SKU instead of listing all items", required=False)
+@click.argument("sku", help="Show this SKU's rate in every policy instead of listing all items", required=False)
 @handle_errors
 def list_items(session: Session, sku: str | None) -> None:
     """
-    Lists all billing items and their current prices.
+    Lists all billing items and their credit rate under the policy in force.
 
-    Pass a SKU to show its full price history instead.
+    Pass a SKU to show its rate in every policy instead.
     """
 
     if sku is None:
@@ -68,95 +73,66 @@ def _list_item_history(session: Session, sku: str) -> None:
     if models.BillingItem.find_billing_item(session, sku) is None:
         raise ValueError(f"SKU [blue]{sku}[/blue] doesn't exist")
 
+    # col() rather than the bare attribute. SQLModel declares fields as plain annotations, so
+    # `PricingPolicy.version` is an `int` to a type checker and `BillingItem.sku == sku` is a
+    # `bool`, neither of which is what these arguments want. col() hands back the underlying
+    # column, which is what SQLAlchemy was getting all along.
     query = (
-        select(models.BillingItemPrice)
-        .join(models.BillingItem, models.BillingItem.uuid == models.BillingItemPrice.item_id)
-        .where(models.BillingItem.sku == sku)
-        .order_by(models.BillingItemPrice.valid_from)
+        select(models.PricingPolicy, models.PricingPolicyRate)
+        .join(models.PricingPolicyRate, col(models.PricingPolicy.uuid) == col(models.PricingPolicyRate.policy_id))
+        .join(models.BillingItem, col(models.BillingItem.uuid) == col(models.PricingPolicyRate.item_id))
+        .where(col(models.BillingItem.sku) == sku)
+        .order_by(col(models.PricingPolicy.version))
     )
 
-    prices = list(session.execute(query).scalars())
+    rows = list(session.execute(query))
 
-    if not prices:
-        console.print(f"No price history for [blue]{sku}[/blue]")
+    if not rows:
+        console.print(f"No policy rates [blue]{sku}[/blue]")
+
         return
 
-    table = Table(title=f"Billing Item History for [blue]{sku}[/blue]")
-    table.add_column("Price", justify="right")
+    table = Table(title=f"Rate history for {sku}")
+    table.add_column("Policy", justify="right")
+    table.add_column("Credits/unit", justify="right")
     table.add_column("Valid From", justify="right")
-    table.add_column("Valid Until", justify="right")
-    table.add_column("Updated", justify="right")
+    table.add_column("Configured At", justify="right")
+    table.add_column("Corrects", justify="right")
 
-    for price in prices:
-        # noinspection string-conversion-without-dunder-method
+    for policy, rate in rows:
         table.add_row(
-            str(price.price),
-            price.valid_from.isoformat(),
-            price.valid_until.isoformat() if price.valid_until else None,
-            price.configured_at.isoformat(),
+            str(policy.version),
+            str(rate.credits_per_unit),
+            policy.valid_from.isoformat(),
+            policy.configured_at.isoformat(),
+            str(policy.corrects_id) if policy.corrects_id else None,
         )
 
     console.print(table)
 
 
 def _list_all_items(session: Session) -> None:
-    now = datetime.now(UTC)
+    """Every item, with its rate under the policy that prices usage now.
 
-    query = (
-        select(models.BillingItem, models.BillingItemPrice)
-        .outerjoin(
-            models.BillingItemPrice,
-            and_(
-                models.BillingItem.uuid == models.BillingItemPrice.item_id,
-                models.BillingItemPrice.valid_from <= now,
-                or_(
-                    models.BillingItemPrice.valid_until == None,  # noqa: E711
-                    # A SQL comparison, not a Python one. SQLModel declares the field as
-                    # `datetime | None`, so pyright reads this as comparing None with >.
-                    models.BillingItemPrice.valid_until > now,  # pyright: ignore[reportOptionalOperand]
-                ),
-            ),
-        )
-        .order_by(models.BillingItem.sku)
-    )
+    An item with no rate shows blank rather than being left out: a SKU nothing can charge
+    for is the interesting case, not one to hide.
+    """
+    policy = models.PricingPolicy.resolve(session, datetime.now(UTC))
+    rates = {rate.item.sku: rate.credits_per_unit for rate in policy.rates} if policy else {}
 
-    table = Table(title="Billing Items")
+    items = session.execute(select(models.BillingItem).order_by(models.BillingItem.sku)).scalars()
+
+    table = Table(title=f"Billing Items (policy v{policy.version})" if policy else "Billing Items (no policy)")
     table.add_column("SKU")
     table.add_column("Name")
     table.add_column("Unit", justify="right")
-    table.add_column("Current Price", justify="right")
-    table.add_column("Valid From", justify="right")
-    for item, price in session.execute(query):
-        table.add_row(
-            item.sku,
-            item.name,
-            item.unit,
-            str(price.price) if price else None,
-            price.valid_from.isoformat() if price and price.valid_from else None,
-        )
+    table.add_column("Credits/unit", justify="right")
+
+    for item in items:
+        rate = rates.get(item.sku)
+        table.add_row(item.sku, item.name, item.unit, str(rate) if rate is not None else None)
 
     console.print(table)
-
-
-# noinspection unresolved-references,argument-list
-@cli.command("set-price")
-@click.pass_obj
-@click.option("-s", "--sku", help="SKU to set price for", required=True)
-@click.option("-p", "--price", help="The set price in credits per unit", type=float, required=True)
-@click.option("--valid", help="The date and time from which the price is valid", type=click.DateTime(), required=True)
-@handle_errors
-def set_price(session: Session, sku: str, price: float, valid: datetime) -> None:
-    """
-    Sets a price for an existing billing item.
-
-    --valid must be later than the item's latest price, or match it exactly to correct that
-    price. The SKU must already exist; use `add-item` to create one.
-    """
-    configuration = {"prices": [{"sku": sku, "price": price, "valid_from": valid.isoformat()}]}
-    j = json.dumps(configuration)
-    db.insert_configuration(session, StringIO(j))
-    session.commit()
-    console.print(f"[green]Set {sku} to {price} from {valid.isoformat()}[/green]")
 
 
 # noinspection unresolved-references,argument-list
@@ -165,27 +141,25 @@ def set_price(session: Session, sku: str, price: float, valid: datetime) -> None
 @click.option("-s", "--sku", help="SKU to create", required=True)
 @click.option("-n", "--name", help="The SKU name", type=str, required=True)
 @click.option("-u", "--unit", help="The SKU unit", type=str, required=True)
-@click.option("-p", "--price", help="The set price in credits per unit", type=float, required=True)
-@click.option("--valid", help="The date and time from which the price is valid", type=click.DateTime(), required=True)
 @handle_errors
-def add_item(session: Session, sku: str, name: str, unit: str, price: float, valid: datetime) -> None:
+def add_item(session: Session, sku: str, name: str, unit: str) -> None:
     """
-    Creates a new billing item with its initial price.
+    Creates a new billing item.
+
+    The item has no rate until a policy rates it, which happens by loading a configuration
+    document. Until then it is a SKU nothing can be charged for.
 
     Fails if the SKU already exists; use `update-item` to change its name or unit instead.
     """
     if models.BillingItem.find_billing_item(session, sku) is not None:
         raise ValueError(f"SKU [blue]{sku}[/blue] already exists")
 
-    configuration = {
-        "items": [{"sku": sku, "name": name, "unit": unit}],
-        "prices": [{"sku": sku, "price": price, "valid_from": valid.isoformat()}],
-    }
+    configuration = {"items": [{"sku": sku, "name": name, "unit": unit}]}
     j = json.dumps(configuration)
 
     db.insert_configuration(session, StringIO(j))
     session.commit()
-    console.print(f"[green]Added {sku} ({name}, {unit}) with price {price} from {valid.isoformat()}[/green]")
+    console.print(f"[green]Added {sku} ({name}, {unit}). It has no rate until a policy is loaded.[/green]")
 
 
 # noinspection unresolved-references

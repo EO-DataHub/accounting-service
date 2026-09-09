@@ -1,7 +1,12 @@
-"""Tests for the configured-price rules.
+"""Tests for the pricing policy rules.
 
-No database. These are the decisions that used to be inferred from an UPDATE's row count,
-which is why they had none of their own.
+No database. What makes two policies the same calibration, and therefore what mints a
+version, is a comparison over values.
+
+This file used to hold the per-SKU price-period rules for `billing_item_price` - amend,
+supersede or append. Credits are the unit of account now, the policy replaced that table,
+and a policy is versioned as a bundle rather than per SKU, so those tests went with the
+rules they covered.
 """
 
 from datetime import UTC, datetime, timedelta, timezone
@@ -10,137 +15,140 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from accounting_service.pricing import (
-    BackdatedPriceError,
-    ConfiguredPrice,
-    PriceAction,
-    plan_price_change,
-)
-
-JAN1 = datetime(2025, 1, 1, tzinfo=UTC)
-JAN2 = datetime(2025, 1, 2, tzinfo=UTC)
-JAN3 = datetime(2025, 1, 3, tzinfo=UTC)
+from accounting_service.pricing import ConfiguredPolicy, PolicyFingerprint
 
 
-def test_the_first_price_for_an_item_is_appended() -> None:
-    plan = plan_price_change(JAN1, [])
+class TestConfiguredPolicy:
+    """The `pricing_policy` section, validated before anything is applied."""
 
-    assert plan.action is PriceAction.APPEND
-    assert plan.supersedes_valid_from is None
+    @staticmethod
+    def a_policy(**overrides: object) -> dict[str, object]:
+        return {
+            "valid_from": "2025-01-01T00:00:00Z",
+            "default_category": "standard",
+            "rates": [{"sku": "cpu-seconds", "credits_per_unit": "0.5"}],
+            "category_multipliers": [{"category": "standard", "multiplier": "1"}],
+        } | overrides
 
+    def test_a_complete_section_validates(self) -> None:
+        policy = ConfiguredPolicy.model_validate(self.a_policy())
 
-def test_a_later_price_supersedes_the_current_one() -> None:
-    plan = plan_price_change(JAN2, [JAN1])
+        assert policy.rates[0].sku == "cpu-seconds"
+        assert policy.category_multipliers[0].multiplier == Decimal(1)
 
-    assert plan.action is PriceAction.SUPERSEDE
-    assert plan.supersedes_valid_from == JAN1
+    def test_valid_from_without_an_offset_is_taken_as_utc(self) -> None:
+        policy = ConfiguredPolicy.model_validate(self.a_policy(valid_from="2025-07-01T00:00:00"))
 
+        assert policy.valid_from == datetime(2025, 7, 1, tzinfo=UTC)
 
-def test_the_price_superseded_is_the_latest_not_the_only() -> None:
-    """With several periods stored, the new price closes the most recent one."""
-    plan = plan_price_change(JAN3, [JAN1, JAN2])
+    def test_the_reason_is_optional(self) -> None:
+        assert ConfiguredPolicy.model_validate(self.a_policy()).reason is None
 
-    assert plan.supersedes_valid_from == JAN2
+    def test_an_unknown_field_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="valid_untill"):
+            ConfiguredPolicy.model_validate(self.a_policy(valid_untill="2026-01-01T00:00:00Z"))
 
+    def test_valid_until_is_not_a_field(self) -> None:
+        """The loader never closes a policy, so a document cannot ask it to.
 
-def test_the_order_of_the_stored_instants_does_not_matter() -> None:
-    """The caller reads them with no ORDER BY, so the decision must not depend on it."""
-    plan = plan_price_change(JAN3, [JAN2, JAN1])
-
-    assert plan.supersedes_valid_from == JAN2
-
-
-def test_an_exact_match_amends_rather_than_adding_a_period() -> None:
-    """Reloading the same configuration corrects the amount instead of splitting the period.
-
-    This is what makes the loader idempotent: the ingester runs it on every start, and an
-    unchanged configuration must not accumulate periods.
-    """
-    plan = plan_price_change(JAN1, [JAN1])
-
-    assert plan.action is PriceAction.AMEND
-    assert plan.supersedes_valid_from is None
-
-
-def test_an_exact_match_amends_even_when_it_is_not_the_latest() -> None:
-    """Correcting an older configured price leaves the later periods alone."""
-    plan = plan_price_change(JAN1, [JAN1, JAN2])
-
-    assert plan.action is PriceAction.AMEND
-
-
-def test_a_backdated_price_is_rejected() -> None:
-    with pytest.raises(BackdatedPriceError, match="cannot be added behind"):
-        plan_price_change(JAN1, [JAN2])
-
-
-def test_the_rejection_names_both_instants() -> None:
-    """The message has to be actionable: which entry, and what it collided with."""
-    with pytest.raises(BackdatedPriceError) as raised:
-        plan_price_change(JAN1, [JAN2])
-
-    assert "2025-01-01" in str(raised.value)
-    assert "2025-01-02" in str(raised.value)
-
-
-def test_instants_are_compared_in_utc_not_as_written() -> None:
-    """The same moment written with a different offset is the same period, so it amends."""
-    one_am_utc = datetime(2025, 1, 1, 1, 0, tzinfo=UTC)
-    two_am_plus_one = datetime(2025, 1, 1, 2, 0, tzinfo=timezone(timedelta(hours=1)))
-
-    plan = plan_price_change(two_am_plus_one, [one_am_utc])
-
-    assert plan.action is PriceAction.AMEND
-
-
-def test_a_naive_stored_instant_is_read_as_utc() -> None:
-    """A naive value can reach here from an object built in Python before a round trip."""
-    plan = plan_price_change(JAN1, [datetime(2025, 1, 1)])
-
-    assert plan.action is PriceAction.AMEND
-
-
-class TestConfiguredPrice:
-    """Validation of one `prices:` entry.
-
-    Built with model_validate on a dict, which is how the loader does it: the entries come
-    from YAML, so the values arrive as whatever YAML produced - a float for a price, a string
-    for a timestamp - and the coercion is the thing being tested.
-    """
-
-    def test_a_yaml_float_becomes_an_exact_decimal(self) -> None:
-        """12.34 must not arrive as the binary approximation of 12.34."""
-        entry = ConfiguredPrice.model_validate({"sku": "s", "price": 12.34, "valid_from": "2025-01-01T00:00:00Z"})
-
-        assert entry.price == Decimal("12.34")
-
-    def test_a_zoneless_timestamp_means_utc(self) -> None:
-        """Previously this was read as the host's local time.
-
-        On a host in Europe/London a summer date was stored an hour early and a winter one
-        was not, so the same configuration meant different things depending on the date.
+        Every stored policy keeps an open range and resolution orders by `configured_at`,
+        which is what lets a correction be backdated without rewriting the policies it
+        corrects.
         """
-        entry = ConfiguredPrice.model_validate({"sku": "s", "price": 1, "valid_from": "2025-07-01T00:00:00"})
+        assert "valid_until" not in ConfiguredPolicy.model_fields
 
-        assert entry.valid_from == datetime(2025, 7, 1, tzinfo=UTC)
+    def test_a_repeated_sku_is_rejected(self) -> None:
+        rates = [
+            {"sku": "cpu-seconds", "credits_per_unit": "0.5"},
+            {"sku": "cpu-seconds", "credits_per_unit": "0.9"},
+        ]
 
-    def test_an_offset_timestamp_is_converted(self) -> None:
-        entry = ConfiguredPrice.model_validate({"sku": "s", "price": 1, "valid_from": "2025-07-01T01:00:00+01:00"})
+        with pytest.raises(ValidationError, match="more than once"):
+            ConfiguredPolicy.model_validate(self.a_policy(rates=rates))
 
-        assert entry.valid_from == datetime(2025, 7, 1, tzinfo=UTC)
+    def test_a_repeated_category_is_rejected(self) -> None:
+        multipliers = [
+            {"category": "standard", "multiplier": "1"},
+            {"category": "standard", "multiplier": "2"},
+        ]
 
-    def test_a_missing_field_is_named(self) -> None:
-        """A KeyError from a dict lookup did not say which entry or which field."""
-        with pytest.raises(ValidationError, match="valid_from"):
-            ConfiguredPrice.model_validate({"sku": "s", "price": 1})
+        with pytest.raises(ValidationError, match="more than once"):
+            ConfiguredPolicy.model_validate(self.a_policy(category_multipliers=multipliers))
 
-    def test_an_unexpected_field_is_rejected(self) -> None:
-        """A misspelled key in the configuration should fail rather than being ignored."""
-        with pytest.raises(ValidationError, match="prise"):
-            ConfiguredPrice.model_validate({"sku": "s", "price": 1, "valid_from": "2025-01-01T00:00:00Z", "prise": 2})
+    def test_the_default_category_must_have_a_multiplier(self) -> None:
+        """Otherwise every workspace with no category assignment is unpriceable (D6)."""
+        with pytest.raises(ValidationError, match="has no entry in category_multipliers"):
+            ConfiguredPolicy.model_validate(self.a_policy(default_category="academic"))
 
-    def test_entries_are_immutable(self) -> None:
-        entry = ConfiguredPrice.model_validate({"sku": "s", "price": 1, "valid_from": "2025-01-01T00:00:00Z"})
 
-        with pytest.raises(ValidationError):
-            entry.price = Decimal(2)
+class TestPolicyFingerprint:
+    """What makes two policies the same calibration, and therefore what mints a version."""
+
+    @staticmethod
+    def a_fingerprint(**overrides: object) -> PolicyFingerprint:
+        parts: dict[str, object] = {
+            "valid_from": datetime(2025, 1, 1, tzinfo=UTC),
+            "default_category": "standard",
+            "rates": [("cpu-seconds", Decimal("0.5")), ("memory-gb-seconds", Decimal("0.1"))],
+            "category_multipliers": [("standard", Decimal(1))],
+        }
+
+        return PolicyFingerprint.of(**(parts | overrides))  # pyright: ignore[reportArgumentType]
+
+    def test_the_same_numbers_fingerprint_equal(self) -> None:
+        assert self.a_fingerprint() == self.a_fingerprint()
+
+    def test_the_order_rates_are_written_in_does_not_matter(self) -> None:
+        """A document listing SKUs in a different order is the same calibration."""
+        reversed_rates = [("memory-gb-seconds", Decimal("0.1")), ("cpu-seconds", Decimal("0.5"))]
+
+        assert self.a_fingerprint(rates=reversed_rates) == self.a_fingerprint()
+
+    def test_a_rewritten_decimal_scale_is_not_a_new_policy(self) -> None:
+        """0.50 credits is 0.5 credits. Decimal compares numerically, not as written."""
+        rescaled = [("cpu-seconds", Decimal("0.500")), ("memory-gb-seconds", Decimal("0.10"))]
+
+        assert self.a_fingerprint(rates=rescaled) == self.a_fingerprint()
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("default_category", "academic"),
+            ("valid_from", datetime(2025, 2, 1, tzinfo=UTC)),
+            ("rates", [("cpu-seconds", Decimal("0.6")), ("memory-gb-seconds", Decimal("0.1"))]),
+            ("category_multipliers", [("standard", Decimal("0.9"))]),
+        ],
+        ids=["default-category", "valid-from", "a-rate", "a-multiplier"],
+    )
+    def test_changing_any_of_these_is_a_new_policy(self, field: str, value: object) -> None:
+        assert self.a_fingerprint(**{field: value}) != self.a_fingerprint()
+
+    def test_removing_a_rate_is_a_new_policy(self) -> None:
+        assert self.a_fingerprint(rates=[("cpu-seconds", Decimal("0.5"))]) != self.a_fingerprint()
+
+    def test_valid_from_is_compared_as_an_instant(self) -> None:
+        """Stored timestamps come back in the connection's timezone. The same instant
+        written with a different offset is the same policy."""
+        one_am_utc = datetime(2025, 1, 1, 1, tzinfo=UTC)
+        two_am_plus_one = datetime(2025, 1, 1, 2, tzinfo=timezone(timedelta(hours=1)))
+
+        assert self.a_fingerprint(valid_from=two_am_plus_one) == self.a_fingerprint(valid_from=one_am_utc)
+
+    def test_a_naive_valid_from_is_read_as_utc(self) -> None:
+        naive = datetime(2025, 7, 1, 12, 0)
+
+        assert self.a_fingerprint(valid_from=naive) == self.a_fingerprint(
+            valid_from=datetime(2025, 7, 1, 12, tzinfo=UTC)
+        )
+
+    def test_the_reason_is_not_part_of_the_fingerprint(self) -> None:
+        """Re-wording the note explaining a calibration is not a calibration."""
+        assert "reason" not in PolicyFingerprint.model_fields
+
+    def test_a_configured_policy_fingerprints_itself(self) -> None:
+        document = TestConfiguredPolicy.a_policy(reason="first pass")
+        other = TestConfiguredPolicy.a_policy(reason="reworded, same numbers")
+
+        assert ConfiguredPolicy.model_validate(document).fingerprint == (
+            ConfiguredPolicy.model_validate(other).fingerprint
+        )

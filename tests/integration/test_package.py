@@ -1,3 +1,12 @@
+"""End-to-end config loading: a document goes in, rows come out.
+
+The document models and the mint-or-match rule are tested without a database in
+tests/test_configuration.py and tests/test_pricing.py. What needs one is the whole path -
+`insert_configuration` parsing a document, applying the items, then handing the policy to
+the loader - because the ordering between those steps is what lets a policy rate an item the
+same document introduces.
+"""
+
 import io
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -5,99 +14,65 @@ from decimal import Decimal
 from faker import Faker
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from sqlmodel import col
 
 import accounting_service.db
-from accounting_service.models import BillingItem, BillingItemPrice
+from accounting_service.models import BillingItem, PricingPolicy
 
 
-def test_item_and_price_creation_via_config_file_results_in_correct_object_in_db(
-    db_session: Session,
-) -> None:
-    faker = Faker()
-    test_sku = faker.name()
-
-    test_config = f"""---
+def a_document(sku: str, *, rate: str, valid_from: str = "2025-01-01T00:00:00Z") -> io.StringIO:
+    return io.StringIO(
+        f"""---
 items:
-  - sku: "{test_sku}"
+  - sku: "{sku}"
     name: "my product"
     unit: "GB-s"
-prices:
-  - sku: "{test_sku}"
-    valid_from: "2025-01-01T00:00:00Z"
-    price: 12.34
+pricing_policy:
+  valid_from: "{valid_from}"
+  default_category: standard
+  rates:
+    - sku: "{sku}"
+      credits_per_unit: {rate}
+  category_multipliers:
+    - category: standard
+      multiplier: 1
 """
-
-    accounting_service.db.insert_configuration(db_session, io.StringIO(test_config))
-
-    bi = BillingItem.find_billing_item(db_session, test_sku)
-    assert bi is not None
-    assert bi.name == "my product"
-    assert bi.unit == "GB-s"
-    assert bi.sku == test_sku
-
-    prices = db_session.execute(select(BillingItemPrice).where(BillingItemPrice.item == bi)).scalars().all()
-    prices = list(prices)
-
-    assert len(prices) == 1
-
-    price = prices[0]
-    assert price.price == Decimal("12.34")
-    assert price.valid_from_utc == datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC)
-    assert price.valid_until is None
-    assert price.item_id == bi.uuid
+    )
 
 
-def test_item_and_price_update_via_config_file_results_in_correct_object_in_db(db_session: Session) -> None:
-    faker = Faker()
-    test_sku = faker.name()
+def test_a_document_creates_the_item_and_rates_it(db_session: Session) -> None:
+    test_sku = Faker().name()
 
-    test_config = f"""---
-items:
-  - sku: "{test_sku}"
-    name: "my product"
-    unit: "GB-s"
-prices:
-  - sku: "{test_sku}"
-    valid_from: "2025-01-01T00:00:00Z"
-    price: 12.34
-"""
+    accounting_service.db.insert_configuration(db_session, a_document(test_sku, rate="12.34"))
 
-    test_config_update = f"""---
-items:
-  - sku: "{test_sku}"
-    name: "my product 2"
-    unit: "GB-s 2"
-prices:
-  - sku: "{test_sku}"
-    valid_from: "2025-01-01T00:00:00Z"
-    price: 12.35
-  - sku: "{test_sku}"
-    valid_from: "2025-01-02T00:00:00Z"
-    price: 11.0
-"""
+    item = BillingItem.find_billing_item(db_session, test_sku)
+    assert item is not None
+    assert item.name == "my product"
+    assert item.unit == "GB-s"
 
-    accounting_service.db.insert_configuration(db_session, io.StringIO(test_config))
-    accounting_service.db.insert_configuration(db_session, io.StringIO(test_config_update))
+    policy = PricingPolicy.resolve(db_session, datetime(2025, 6, 1, tzinfo=UTC))
+    assert policy is not None
+    assert policy.version == 1
+    assert [(rate.item.sku, rate.credits_per_unit) for rate in policy.rates] == [(test_sku, Decimal("12.34"))]
 
-    bi = BillingItem.find_billing_item(db_session, test_sku)
-    assert bi is not None
-    assert bi.name == "my product 2"
-    assert bi.unit == "GB-s 2"
-    assert bi.sku == test_sku
 
-    prices = db_session.execute(select(BillingItemPrice).where(BillingItemPrice.item == bi)).scalars().all()
-    prices = list(prices)
+def test_reloading_a_changed_document_updates_the_item_and_mints_a_policy(db_session: Session) -> None:
+    """The item is updated in place; the policy is appended. A calibration is a new version,
+    and the one it replaces stays exactly as it was."""
+    test_sku = Faker().name()
 
-    assert len(prices) == 2
+    accounting_service.db.insert_configuration(db_session, a_document(test_sku, rate="12.34"))
 
-    price = prices[0]
-    assert price.price == Decimal("12.35")
-    assert price.valid_from_utc == datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC)
-    assert price.valid_until_utc == datetime(2025, 1, 2, 0, 0, 0, tzinfo=UTC)
-    assert price.item_id == bi.uuid
+    changed = a_document(test_sku, rate="11.00").getvalue().replace("my product", "my product 2")
+    accounting_service.db.insert_configuration(db_session, io.StringIO(changed))
 
-    price = prices[1]
-    assert price.price == Decimal("11.0")
-    assert price.valid_from_utc == datetime(2025, 1, 2, 0, 0, 0, tzinfo=UTC)
-    assert price.valid_until is None
-    assert price.item_id == bi.uuid
+    item = BillingItem.find_billing_item(db_session, test_sku)
+    assert item is not None
+    assert item.name == "my product 2"
+
+    versions = sorted(db_session.execute(select(col(PricingPolicy.version))).scalars().all())
+    assert versions == [1, 2]
+
+    in_force = PricingPolicy.resolve(db_session, datetime(2025, 6, 1, tzinfo=UTC))
+    assert in_force is not None
+    assert in_force.rates[0].credits_per_unit == Decimal("11.00")

@@ -54,23 +54,32 @@ def insert_configuration(session: Session, config: TextIO) -> None:
     ConfigurationError instead of leaving the earlier entries written. See
     accounting_service.configuration.
 
-    Items are applied before prices, so a document may introduce an item and its first price
-    together.
+    Items are applied before the policy, so a document may introduce an item and rate it in
+    the same pass.
+
+    The policy is mint-or-match: a document whose numbers are already in force writes
+    nothing. See PricingPolicy.load_configured_policy.
 
     Example config (YAML format):
     items:
       - sku: "my-sku"
         name: "my product"
         unit: "GB-s"
-    prices:
-      - sku: "my-sku"
-        valid_from: "2025-01-01T00:00:00Z"
-        price: 12.34
+    pricing_policy:
+      valid_from: "2025-01-01T00:00:00Z"
+      default_category: standard
+      rates:
+        - sku: "my-sku"
+          credits_per_unit: 12.34
+      category_multipliers:
+        - category: standard
+          multiplier: 1
     """
     configuration = load_configuration(config)
 
     for item in configuration.items:
         models.BillingItem.upsert_configured_item(session, item)
 
-    for price in configuration.prices:
-        models.BillingItemPrice.upsert_configured_price(session, price)
+    # After the items, so a policy may rate an item the same document introduces.
+    if configuration.pricing_policy is not None:
+        models.PricingPolicy.load_configured_policy(session, configuration.pricing_policy)
