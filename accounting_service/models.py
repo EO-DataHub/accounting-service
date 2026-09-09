@@ -62,7 +62,7 @@ from sqlmodel import Relationship, SQLModel, col
 
 from accounting_service.configuration import ConfiguredItem
 from accounting_service.consumption import ConsumptionWindow, RateSample, estimate_consumption
-from accounting_service.pricing import ConfiguredPolicy, PolicyFingerprint
+from accounting_service.pricing import ConfiguredPolicy, PolicyFingerprint, RateCard
 from accounting_service.timestamps import as_utc, datetime_default_to_utc
 
 # Every table here is a SQLModel. The naming convention is set on SQLModel's own MetaData so
@@ -399,6 +399,20 @@ class PricingPolicy(SQLModel, table=True):
         """What this policy would have to match for a document to leave it alone."""
         return PolicyFingerprint.of(
             valid_from=self.valid_from,
+            default_category=self.default_category,
+            rates=[(rate.item.sku, rate.credits_per_unit) for rate in self.rates],
+            category_multipliers=[(entry.category, entry.multiplier) for entry in self.category_multipliers],
+        )
+
+    def rate_card(self) -> RateCard:
+        """This policy's numbers, in the form pricing needs them (T7).
+
+        The counterpart to `fingerprint`, and the same projection: a stored policy and the
+        document that minted it price identically, because both become the same value object
+        before any arithmetic happens. `_policy_load_options` has already loaded the rates and
+        their items, so this walks no relationship that costs a query.
+        """
+        return RateCard.of(
             default_category=self.default_category,
             rates=[(rate.item.sku, rate.credits_per_unit) for rate in self.rates],
             category_multipliers=[(entry.category, entry.multiplier) for entry in self.category_multipliers],

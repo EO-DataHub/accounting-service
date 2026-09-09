@@ -4,8 +4,9 @@ These need a database because every one of them is about something only PostgreS
 answer: whether a constraint refuses a write, and whether a relationship loads. What the
 models *declare* is asserted without a database in tests/test_schema.py.
 
-Nothing reads these tables yet. T4 loads policies, T5 resolves one for a usage time and T7
-prices from them, so these tests describe the shape those tasks will rely on.
+T4 loads policies, T5 resolves one for a usage time and T7 prices from them. The pricing
+arithmetic is tested without a database in tests/test_pricing.py; what is tested here is the
+projection of a stored row into the values it works over.
 """
 
 import io
@@ -27,7 +28,7 @@ from accounting_service.models import (
     PricingPolicyCategoryMultiplier,
     PricingPolicyRate,
 )
-from accounting_service.pricing import ConfiguredPolicy
+from accounting_service.pricing import ConfiguredPolicy, price_usage
 
 JANUARY = datetime(2025, 1, 1, tzinfo=UTC)
 SKU = "cpu-seconds"
@@ -404,3 +405,48 @@ class TestTwoReplicasRacing:
 
         with pytest.raises(IntegrityError):
             db.insert_configuration(db_session, a_document(rate="0.9"))
+
+
+class TestPricingFromAStoredPolicy:
+    """That a stored row prices the same as the document that minted it (T7).
+
+    The arithmetic itself is covered without a database in tests/test_pricing.py. What needs
+    one is the projection: `rate_card` reads each rate's SKU through `rate.item`, which is a
+    relationship, so only a real row proves the card holds the SKUs a message will arrive
+    carrying rather than the item UUIDs the table stores.
+    """
+
+    def test_a_stored_policy_prices_its_own_rates(self, db_session: Session) -> None:
+        db.insert_configuration(db_session, a_document(rate="0.5"))
+
+        policy = PricingPolicy.current(db_session)
+        assert policy is not None
+
+        priced = price_usage(policy.rate_card(), sku=SKU, quantity=3600.0, category="academic")
+
+        assert priced.credits == Decimal(3600) * Decimal("0.5") * Decimal("0.5")
+        assert priced.category == "academic"
+
+    def test_a_workspace_with_no_category_prices_under_the_policy_default(self, db_session: Session) -> None:
+        """Which is every workspace until T6 populates `workspace_category` (D6)."""
+        db.insert_configuration(db_session, a_document(rate="0.5"))
+
+        policy = PricingPolicy.current(db_session)
+        assert policy is not None
+
+        priced = price_usage(policy.rate_card(), sku=SKU, quantity=2.0, category=None)
+
+        assert (priced.category, priced.multiplier) == ("standard", Decimal(1))
+
+    def test_the_policy_resolved_for_a_usage_time_is_the_one_that_prices_it(self, db_session: Session) -> None:
+        """T5 picks the policy, T7 applies it. A charge is priced by the rates in force when
+        the usage happened, not by the rates in force now."""
+        db.insert_configuration(db_session, a_document(valid_from="2025-01-01T00:00:00Z", rate="0.5"))
+        db.insert_configuration(db_session, a_document(valid_from="2025-06-01T00:00:00Z", rate="0.9"))
+
+        policy = PricingPolicy.resolve(db_session, datetime(2025, 3, 1, tzinfo=UTC))
+        assert policy is not None
+
+        priced = price_usage(policy.rate_card(), sku=SKU, quantity=1.0, category=None)
+
+        assert priced.credits_per_unit == Decimal("0.5")

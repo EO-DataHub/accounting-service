@@ -1,10 +1,15 @@
-"""Rules for the pricing policy loaded from configuration.
+"""Rules for the pricing policy: what a document is worth, and what usage costs under it.
 
 A policy is one calibration pass covering every rate at once (D3), so loading one is not a
 plain insert: it either matches the policy already in force, in which case nothing is
 written, or it mints a new version. That decision is stated here as a comparison over values
 - see `PolicyFingerprint` - so the queries carry it out rather than making it, and so the
 rule can be tested without a database.
+
+Charging usage is the same shape. `RateCard` is a policy's numbers over values and
+`price_usage` is the arithmetic over them (T7), so pricing an event needs no session and the
+part that D8's replayability rests on can be tested without one. `PricingPolicy` in models.py
+projects a stored row into a `RateCard`, exactly as it projects one into a fingerprint.
 
 Credits are the unit of account in this service and there is no conversion to money. Buying
 credits is out of scope: a hub admin grants them (T15). Whatever invoicing arrives later
@@ -15,6 +20,7 @@ or append, decided from a set of configured instants. The policy replaced that t
 policy is versioned as a bundle rather than per SKU, so those rules went with it.
 """
 
+import math
 from collections import Counter
 from collections.abc import Iterable
 from datetime import datetime
@@ -160,6 +166,162 @@ class PolicyFingerprint(BaseModel):
             rates=tuple(sorted(rates)),
             category_multipliers=tuple(sorted(category_multipliers)),
         )
+
+
+class UnratedSKUError(LookupError):
+    """A policy that has to price a SKU it holds no rate for.
+
+    A type of its own because the caller has a real choice and it differs by caller. The
+    ingester (T9) meets this when a collector emits a SKU that the last calibration pass did
+    not cover, and dropping the charge silently is the one thing it must not do. The
+    pre-execution estimate (T14) meets it for a SKU nobody can be charged for yet, where
+    answering "no price" is a fine answer. So this reports the fact and decides nothing.
+    """
+
+    def __init__(self, sku: str) -> None:
+        super().__init__(f"the pricing policy holds no rate for SKU {sku!r}")
+
+        self.sku = sku
+
+
+class RateCard(BaseModel):
+    """A policy's numbers, in the form pricing needs them.
+
+    The counterpart to `PolicyFingerprint`. Both are one policy projected over values, so a
+    stored row and a configuration document price identically and neither needs a session.
+    Where the fingerprint answers "is this the same calibration", this answers "what does
+    this cost".
+
+    `default_category` belongs here rather than beside the multipliers, because resolving a
+    workspace's category is part of pricing rather than part of looking a number up: a
+    workspace with no assignment, or with one this service has never been configured for,
+    prices under the default (D6).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    default_category: str
+
+    # Credits per unit, by SKU, and the multiplier applied to all of them, by category.
+    rates: dict[str, Decimal]
+    category_multipliers: dict[str, Decimal]
+
+    @classmethod
+    def of(
+        cls,
+        *,
+        default_category: str,
+        rates: Iterable[tuple[str, Decimal]],
+        category_multipliers: Iterable[tuple[str, Decimal]],
+    ) -> Self:
+        """Build a rate card from the parts, whether they came from a document or a row."""
+        return cls(
+            default_category=default_category,
+            rates=dict(rates),
+            category_multipliers=dict(category_multipliers),
+        )
+
+    def multiplier_for(self, category: str | None) -> tuple[str, Decimal]:
+        """The category this usage is priced under, and the multiplier that applies.
+
+        Both, because they travel together: the category returned is the one the charge was
+        actually computed under, and that is what goes on the ledger row so a recategorised
+        workspace does not rewrite the past.
+
+        `None` is a workspace with no assignment. A category with no multiplier is one this
+        service has not been configured for, which D6 treats the same way rather than as a
+        validation failure, because the set of categories is defined by the workspace service
+        and the configuration document, not here.
+        """
+        if category is not None and (multiplier := self.category_multipliers.get(category)) is not None:
+            return category, multiplier
+
+        # `ConfiguredPolicy` refuses a document whose `default_category` has no multiplier, so
+        # for any policy that came through the loader this always lands. A card built by hand
+        # without one is a programming error and the KeyError says so.
+        return self.default_category, self.category_multipliers[self.default_category]
+
+
+class PricedUsage(BaseModel):
+    """One metered quantity, and how it came to cost what it cost.
+
+    Every input to the arithmetic, not the result alone. The ledger stores these fields on
+    each row so the charge can be recomputed from first principles months later, which is what
+    the explainable-pricing endpoint (T13), the audit log (T19) and historical re-pricing (T18)
+    all read.
+
+    `category` is the resolved one, which is not necessarily the one that was asked for.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    sku: str
+    quantity: float
+    credits_per_unit: Decimal
+    category: str
+    multiplier: Decimal
+    credits: Decimal
+
+
+def price_usage(card: RateCard, *, sku: str, quantity: float, category: str | None) -> PricedUsage:
+    """Price `quantity` units of `sku` for a workspace in `category` (T7).
+
+    The charge is `quantity x credits_per_unit x multiplier`, and it is positive. The ledger
+    signs it: a debit is stored negative so a balance is a plain SUM, and that is the ledger's
+    business rather than the price's.
+
+    Raises `UnratedSKUError` when the policy holds no rate for the SKU. Raises `ValueError` for
+    a quantity that is negative or not finite: a NaN would multiply out to a NaN credit that
+    every later sum inherits, and a negative quantity would make a debit into a silent grant.
+    Neither is a measurement, so neither is priced.
+
+    **Nothing is rounded here.** The product is exact and is stored as it comes out. Read paths
+    round for display, which `ExactDecimal` in `app/models.py` already does without dropping
+    scale or falling into exponent notation. Rounding at this point would round every event
+    separately, so a great many small charges would each lose their tail and the total would
+    drift away from the quantities that produced it. It would also put D8's replay at the mercy
+    of whichever rounding rule was in force when the replay ran rather than of the policy. The
+    credits column is therefore an unconstrained NUMERIC (T8), not one with a fixed scale.
+
+    Decimal multiplication rounds to the context precision, 28 significant digits, which is far
+    beyond anything a metered quantity carries.
+    """
+    if not math.isfinite(quantity):
+        raise ValueError(f"cannot price a quantity of {quantity} of {sku!r}")
+
+    if quantity < 0:
+        raise ValueError(f"cannot price a negative quantity {quantity} of {sku!r}")
+
+    credits_per_unit = card.rates.get(sku)
+
+    if credits_per_unit is None:
+        raise UnratedSKUError(sku)
+
+    resolved, multiplier = card.multiplier_for(category)
+
+    return PricedUsage(
+        sku=sku,
+        quantity=quantity,
+        credits_per_unit=credits_per_unit,
+        category=resolved,
+        multiplier=multiplier,
+        credits=exact_decimal(quantity) * credits_per_unit * multiplier,
+    )
+
+
+def exact_decimal(quantity: float) -> Decimal:
+    """A metered quantity as the decimal number that was measured.
+
+    Through `str` rather than `Decimal(quantity)`. The latter converts the float's binary value
+    exactly, so a measured 0.1 arrives as 0.10000000000000000555111512312578270211815834045
+    and every charge derived from it carries that tail into the ledger. `str` gives the
+    shortest decimal that round trips to the same float, which is the number the collector
+    reported.
+
+    A quantity is a float and stays one - it is a measurement, and the column matching it
+    predates this work. Credits are exact, and this is the boundary between the two.
+    """
+    return Decimal(str(quantity))
 
 
 def repeated(values: Iterable[str]) -> list[str]:

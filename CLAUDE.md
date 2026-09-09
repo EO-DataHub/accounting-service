@@ -8,7 +8,7 @@ wrong.
 
 | Command | What it is for |
 |---|---|
-| `make test-unit` | 122 tests, no database, about a second. Run this on every change |
+| `make test-unit` | 145 tests, no database, about a second. Run this on every change |
 | `make test-integration` | The rest. Needs Docker; starts a throwaway PostgreSQL |
 | `make testonce` | Everything |
 | `make check` | The gate: ruff, format, pyright, validate-pyproject, check-migrations |
@@ -97,13 +97,21 @@ like a successful run. Use `docker compose run --rm migrate` for one-shot tasks.
 
 ## Design docs
 
-The design lives outside this repo, in its own git repository at
-`~/Documents/Sparkgeo/Projects/eodh/Accounting and billing/`:
+The design lives outside this repo, in the platform guide at
+`~/Projects/eodh/eodhp-guide/docs/explanation/design-decisions/`. It used to live in its own
+repository under `~/Documents/Sparkgeo/Projects/eodh/Accounting and billing/`, which has
+been deleted.
 
-- `Credits ledger scoping.md` — the task list, T1 to T21, with a Status column
-- `Credits ledger schema.md` — table specifications and the schema conventions
-- `Credits ledger design decisions.md` — D1 to D12, each decision and why
-- `ADR-001 Credit-based platform accounting.md` — the case for the credit model
+- `credits-ledger-scoping.md` — the task list, T1 to T21, with a Status column
+- `credits-ledger-schema.md` — table specifications and the schema conventions
+- `credits-ledger-design-decisions.md` — D1 to D12, each decision and why
+- `accounting-billing-backend-adr.md` — ADR-001, the case for the credit model
+
+The same directory holds the wider accounting and billing design — the UX pages and the
+proposed endpoint table — and `index.md` lists the lot. It is a mkdocs site: filenames are
+kebab-case, links between pages are relative (`credits-ledger-schema.md`), every page carries
+frontmatter with a `title` and a `doc_status`, and a new page needs a line in `index.md`. The
+guide's own `README.md` defines the frontmatter fields and the tag taxonomy.
 
 Code comments cite decisions as D-numbers and tasks as T-numbers. When a task is finished,
 mark it in the scoping doc's Status column.

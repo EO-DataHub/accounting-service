@@ -1,7 +1,11 @@
-"""Tests for the pricing policy rules.
+"""Tests for the pricing policy rules and the pricing arithmetic.
 
 No database. What makes two policies the same calibration, and therefore what mints a
-version, is a comparison over values.
+version, is a comparison over values, and so is what a metered quantity costs.
+
+`price_usage` is the highest-value target in this file. Every ledger row is its output, and
+D8 says a charge must be reproducible from the quantity, the policy and the category stored
+beside it, so a change in what this function returns is a change in what the ledger means.
 
 This file used to hold the per-SKU price-period rules for `billing_item_price` - amend,
 supersede or append. Credits are the unit of account now, the policy replaced that table,
@@ -15,7 +19,14 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from accounting_service.pricing import ConfiguredPolicy, PolicyFingerprint
+from accounting_service.pricing import (
+    ConfiguredPolicy,
+    PolicyFingerprint,
+    RateCard,
+    UnratedSKUError,
+    exact_decimal,
+    price_usage,
+)
 
 
 class TestConfiguredPolicy:
@@ -152,3 +163,129 @@ class TestPolicyFingerprint:
         assert ConfiguredPolicy.model_validate(document).fingerprint == (
             ConfiguredPolicy.model_validate(other).fingerprint
         )
+
+
+def a_rate_card(**overrides: object) -> RateCard:
+    """A two-SKU, two-category policy. `standard` is the default and multiplies by 1."""
+    parts: dict[str, object] = {
+        "default_category": "standard",
+        "rates": [("cpu-seconds", Decimal("0.5")), ("memory-gb-seconds", Decimal("0.1"))],
+        "category_multipliers": [("standard", Decimal(1)), ("academic", Decimal("0.25"))],
+    }
+
+    return RateCard.of(**(parts | overrides))  # pyright: ignore[reportArgumentType]
+
+
+class TestRateCard:
+    """Resolving the category a workspace is priced under (D6)."""
+
+    def test_a_configured_category_prices_under_itself(self) -> None:
+        assert a_rate_card().multiplier_for("academic") == ("academic", Decimal("0.25"))
+
+    def test_a_workspace_with_no_category_prices_under_the_default(self) -> None:
+        """Which is every workspace until T6 lands, and any workspace after it that nobody
+        has assigned."""
+        assert a_rate_card().multiplier_for(None) == ("standard", Decimal(1))
+
+    def test_a_category_with_no_multiplier_prices_under_the_default(self) -> None:
+        """The workspace service defines the set of categories, not this service, so a value
+        nobody has configured a multiplier for is a pricing decision rather than an error."""
+        assert a_rate_card().multiplier_for("commercial") == ("standard", Decimal(1))
+
+    def test_the_default_needs_a_multiplier_of_its_own(self) -> None:
+        """`ConfiguredPolicy` refuses a document without one, so reaching this means a card
+        was built from something that never went through the loader."""
+        card = a_rate_card(default_category="academic", category_multipliers=[("standard", Decimal(1))])
+
+        with pytest.raises(KeyError):
+            card.multiplier_for(None)
+
+
+class TestPriceUsage:
+    """The arithmetic every ledger row is the output of."""
+
+    def test_the_charge_is_quantity_times_rate_times_multiplier(self) -> None:
+        priced = price_usage(a_rate_card(), sku="cpu-seconds", quantity=3600.0, category="academic")
+
+        assert priced.credits == Decimal(3600) * Decimal("0.5") * Decimal("0.25")
+
+    def test_the_charge_is_positive(self) -> None:
+        """The ledger signs it: a debit is stored negative so a balance is a plain SUM. That
+        is the ledger's business rather than the price's."""
+        priced = price_usage(a_rate_card(), sku="cpu-seconds", quantity=10.0, category=None)
+
+        assert priced.credits > 0
+
+    def test_the_result_records_every_input(self) -> None:
+        """D8 replays a charge from what was stored beside it, so all of this goes on the row."""
+        priced = price_usage(a_rate_card(), sku="memory-gb-seconds", quantity=2.0, category="academic")
+
+        assert (priced.sku, priced.quantity) == ("memory-gb-seconds", 2.0)
+        assert (priced.credits_per_unit, priced.multiplier) == (Decimal("0.1"), Decimal("0.25"))
+
+    def test_the_resolved_category_is_reported_not_the_requested_one(self) -> None:
+        """The ledger stores this one, so a recategorised workspace does not rewrite the past."""
+        priced = price_usage(a_rate_card(), sku="cpu-seconds", quantity=1.0, category="commercial")
+
+        assert priced.category == "standard"
+
+    def test_an_unrated_sku_is_refused_and_names_itself(self) -> None:
+        """A collector emitting a SKU the last calibration did not cover. What to do about it
+        differs by caller, so this reports the fact and decides nothing."""
+        with pytest.raises(UnratedSKUError) as raised:
+            price_usage(a_rate_card(), sku="gpu-seconds", quantity=1.0, category=None)
+
+        assert raised.value.sku == "gpu-seconds"
+
+    def test_a_zero_quantity_costs_nothing(self) -> None:
+        """A measurement of nothing, which is not the same as no measurement."""
+        priced = price_usage(a_rate_card(), sku="cpu-seconds", quantity=0.0, category=None)
+
+        assert priced.credits == 0
+
+    @pytest.mark.parametrize("quantity", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"])
+    def test_a_quantity_that_is_not_finite_is_refused(self, quantity: float) -> None:
+        """A NaN would multiply out to a NaN credit that every later balance inherits."""
+        with pytest.raises(ValueError, match="cannot price a quantity"):
+            price_usage(a_rate_card(), sku="cpu-seconds", quantity=quantity, category=None)
+
+    def test_a_negative_quantity_is_refused(self) -> None:
+        """It would turn a debit into a silent grant."""
+        with pytest.raises(ValueError, match="negative quantity"):
+            price_usage(a_rate_card(), sku="cpu-seconds", quantity=-1.0, category=None)
+
+    def test_nothing_is_rounded(self) -> None:
+        """Read paths round for display. Rounding here would round every event separately, so
+        a great many small charges would drift away from the quantities that produced them."""
+        card = a_rate_card(rates=[("cpu-seconds", Decimal("0.333333"))])
+
+        priced = price_usage(card, sku="cpu-seconds", quantity=3.0, category=None)
+
+        assert priced.credits == Decimal("0.999999")
+
+    def test_a_measured_quantity_does_not_bring_a_binary_tail_with_it(self) -> None:
+        """`Decimal(0.1)` is 0.1000000000000000055511151231257827..., and unrounded credits
+        would carry that into the ledger for every event."""
+        card = a_rate_card(rates=[("cpu-seconds", Decimal(1))])
+
+        priced = price_usage(card, sku="cpu-seconds", quantity=0.1, category=None)
+
+        assert priced.credits == Decimal("0.1")
+
+
+class TestExactDecimal:
+    """The boundary between a float measurement and exact credits."""
+
+    def test_a_quantity_becomes_the_number_that_was_measured(self) -> None:
+        assert exact_decimal(0.1) == Decimal("0.1")
+
+    def test_not_the_float_binary_value(self) -> None:
+        """This is what `Decimal(quantity)` would produce: the float's binary value, exactly,
+        tail and all. Spelled out rather than computed, because ruff rejects both ways of
+        writing it and because the tail is the whole point."""
+        binary_value = Decimal("0.1000000000000000055511151231257827021181583404541015625")
+
+        assert exact_decimal(0.1) != binary_value
+
+    def test_a_whole_quantity_survives_unchanged(self) -> None:
+        assert exact_decimal(3600.0) == Decimal(3600)
