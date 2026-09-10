@@ -1,14 +1,10 @@
 """Fixtures for the tests that need a real database.
 
-These live here rather than in tests/conftest.py so that the tests above cannot reach
-them. Nothing under tests/ outside this directory can request `db_session` or `client`,
-which means the fast suite has no way to start a container even by accident - the same
-reasoning as the old name-matching guard on the database URL, enforced by where the
-fixture is defined instead of by a check at runtime.
+These live here rather than in tests/conftest.py so nothing under tests/ outside this
+directory can request `db_session` or `client`. The fast suite therefore has no way to start
+a container, enforced by where the fixture is defined rather than by a runtime check.
 
-What is left in tests/conftest.py is the token claim sets, which both halves need:
-tests/test_authz.py resolves tiers from them directly, and test_api.py sends them over
-HTTP.
+tests/conftest.py keeps the token claim sets, which both halves need.
 """
 
 import os
@@ -30,7 +26,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlmodel import SQLModel
 from testcontainers.community.postgres import PostgresContainer
 
-from accounting_service import db, db_settings
+from accounting_service import db, settings
 from accounting_service.app.app import app as fastapi_app
 from accounting_service.app.authz import decode_jwt_token
 from accounting_service.ingester.messager import (
@@ -44,13 +40,11 @@ from tests.conftest import TOKEN_HUB_ADMIN
 def postgres_container() -> Iterator[PostgresContainer]:
     """A throwaway PostgreSQL for the whole test session.
 
-    A real PostgreSQL rather than SQLite, because models.py writes different SQL for each -
-    date_trunc against datetime(), plus expression indexes SQLite cannot express - so testing
-    the SQLite path proved nothing about production.
+    A real PostgreSQL because the schema cannot be expressed in SQLite: date_trunc expression
+    indexes have no equivalent.
 
-    A container rather than a shared instance, because the suite creates the schema and must
-    not be able to reach anything real. That replaces the earlier name-matching guard: the
-    tests cannot destroy a real database because they never learn how to reach one.
+    A container rather than a shared instance because the suite creates the schema, so the
+    tests cannot destroy a real database - they never learn how to reach one.
     """
     with PostgresContainer("postgres:17", driver="psycopg") as container:
         os.environ["SQL_DRIVER"] = "postgresql+psycopg"
@@ -64,7 +58,7 @@ def postgres_container() -> Iterator[PostgresContainer]:
         # Nothing has read the settings or built the engine yet, because both are cached
         # functions rather than module-level values. This is where the container's address
         # takes effect.
-        db_settings.get_settings.cache_clear()
+        settings.get_settings.cache_clear()
         db.get_engine.cache_clear()
         db.get_sessionmaker.cache_clear()
 
@@ -82,11 +76,9 @@ def db_schema(postgres_container: PostgresContainer) -> None:
 def db_connection(db_schema: None) -> Iterator[Connection]:
     """A connection with an open transaction that is rolled back when the test ends.
 
-    This is SQLAlchemy's documented recipe for test suites. Everything a test does - through
-    the fixture session, through the API, or through the ingester - happens inside this one
-    transaction, and rolling it back returns the database to an empty schema.
-
-    It is why tests no longer begin by deleting rows left behind by their predecessors.
+    SQLAlchemy's documented recipe for test suites. Everything a test does - through the
+    fixture session, the API, or the ingester - happens inside this one transaction, so
+    rolling it back returns the database to an empty schema and no test has to clean up.
     """
     connection = db.get_engine().connect()
     transaction = connection.begin()
@@ -114,8 +106,7 @@ def db_session(db_session_factory: sessionmaker[Session]) -> Iterator[Session]:
 
     join_transaction_mode="create_savepoint" turns the session's own commits into savepoint
     releases, so code under test can call commit() freely and the outer rollback still
-    discards everything. A plain session.rollback() in teardown could not do that, which is
-    why state used to leak between tests.
+    discards everything.
     """
     with db_session_factory() as session:
         yield session
@@ -160,13 +151,11 @@ def wsmsg_to_pulsar_msg(bemsg: messages.WorkspaceSettings) -> Message:
 def client(db_session: Session) -> Iterator[TestClient]:
     """A FastAPI test HTTP client, authenticated as a hub_admin.
 
-    hub_admin is the default because it short-circuits every tier check, which is
-    what the tests predating the tier work assume. Use the `authenticate_as`
-    fixture to swap in a different token.
+    hub_admin by default because it short-circuits every tier check. Use the
+    `authenticate_as` fixture to swap in a different token.
 
-    The overrides are cleared on teardown. They live on the application object,
-    which is shared by every test, so a token left installed here would leak into
-    whichever test ran next.
+    The overrides are cleared on teardown: they live on the shared application object, so a
+    token left installed would leak into whichever test ran next.
     """
 
     def override_get_db() -> Iterator[Session]:
@@ -188,7 +177,7 @@ def counting_selects() -> Callable[[], AbstractContextManager[list[str]]]:
     """Record the SELECT statements issued inside a block.
 
     For asserting what a read path costs. A query per row is invisible to every other kind of
-    test: the response is correct, the suite is green, and the cost only shows up under load.
+    test: the response is correct and the suite is green.
 
         with counting_selects() as statements:
             client.get(...)

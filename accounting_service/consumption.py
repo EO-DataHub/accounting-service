@@ -1,14 +1,9 @@
 """Estimating resource consumption from rate samples.
 
-This is the arithmetic behind storage-style billing, separated from the database. A collector
-reports the rate at which a resource is being consumed at a point in time - 8GB of storage
-held is "8 GB-seconds per second" - and consumption over a period is the integral of that
-rate. Samples are sparse, so the rate between them is interpolated linearly.
-
-Nothing here touches a session. The queries stay on
-`BillableResourceConsumptionRateSample`, which reads the samples and hands them over as
-values. That is what lets the interesting part be tested without a database: the failure
-modes worth worrying about are arithmetic, not SQL.
+The arithmetic behind storage-style billing, separated from the database. A collector reports
+the rate at which a resource is being consumed at a point in time - 8GB of storage held is
+"8 GB-seconds per second" - and consumption over a period is the integral of that rate.
+Samples are sparse, so the rate between them is interpolated linearly.
 """
 
 import itertools
@@ -54,9 +49,8 @@ class ConsumptionWindow(BaseModel):
 
     @model_validator(mode="after")
     def _start_before_end(self) -> Self:
-        # Nothing checked this before. A reversed window would produce a negative duration,
-        # and the old code's use of timedelta.seconds turned that into a very large positive
-        # one rather than a negative or an error.
+        # A reversed window produces a negative duration, which timedelta.seconds silently
+        # turns into a very large positive one.
         if self.start > self.end:
             raise ValueError(f"window start {self.start.isoformat()} is after end {self.end.isoformat()}")
 

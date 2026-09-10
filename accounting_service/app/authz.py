@@ -34,8 +34,7 @@ def _claim_list(token_payload: dict[str, Any], claim: str) -> list[str]:
 
 
 def resolve_workspace_tier(workspace: str, token_payload: dict[str, Any]) -> MinTier | None:
-    """
-    Highest tier the token holds in this workspace, or None for no access.
+    """Highest tier the token holds in this workspace, or None for no access.
 
     Workspace owners are implicit admins.
     """
@@ -85,8 +84,8 @@ def account_authz(account_id: UUID, token_payload: dict[str, Any]) -> UUID:
 
 def decode_jwt_token(credentials: Annotated[HTTPAuthorizationCredentials, Depends(bearer_scheme)]) -> dict[str, Any]:
     # As this is used in dependency injection, FastAPI handles most of the failure modes.
-    # Settings `verify_signature` to False assumes that it has been verified further upstream.
-    # This must be addressed because a forged token could be used and credits could be added without purchasing them.
+    # Setting `verify_signature` to False assumes that it has been verified further upstream.
+    # TODO: This must be addressed because a forged token could be used and credits could be added without purchasing them.
     try:
         return jwt.decode(credentials.credentials, options={"verify_signature": False}, algorithms=["RS256"])
     except PyJWTError as e:

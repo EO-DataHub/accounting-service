@@ -1,28 +1,19 @@
 """rename constraints to the metadata naming convention
 
-Databases whose tables were created by Base.metadata.create_all, before Alembic
-owned the schema, carry the constraint names PostgreSQL invented for them:
-billing_event_pkey, billing_event_item_id_fkey, billing_event_check. The naming
-convention on Base.metadata expects pk_billing_event,
-fk_billing_event_item_id_billing_item and ck_billing_event_start_before_end.
+Databases created by `create_all` before Alembic owned the schema carry the constraint names
+PostgreSQL invented (billing_event_pkey), where the naming convention expects pk_billing_event.
+Alembic matches constraints by name, so until they agree autogenerate reports phantom
+differences and any later revision naming a constraint fails.
 
-Alembic matches constraints by name, so until the names agree, autogenerate
-reports phantom differences and any later migration that names a constraint
-fails against those databases.
+Reads the current name from pg_constraint rather than assuming PostgreSQL's default, and does
+nothing when the name is already right. Safe on a legacy database, on one built by the
+baseline, and on a second run.
 
-This migration brings them into line. It reads the current name from
-pg_constraint rather than assuming PostgreSQL's default, and does nothing when
-the name is already correct, so it is safe on a legacy database, on one created
-by the baseline revision, and on a second run.
-
-Indexes need no attention: SQLAlchemy's built-in default for indexes is already
-ix_%(column_0_label)s, which is the convention in use, and every other index in
-this schema is named explicitly in models.py.
+Indexes need no attention: SQLAlchemy's default is already the convention in use.
 
 Revision ID: 7c3d5e9a1f42
 Revises: 20fef2107e45
 Create Date: 2026-08-20
-
 """
 
 import logging
@@ -38,11 +29,9 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
-# (table, pg_constraint.contype, name the convention gives it)
-#   p = primary key, f = foreign key, c = check
-#
-# Every table below holds at most one constraint of each type listed, which is
-# what makes discovery by type unambiguous.
+# (table, pg_constraint.contype, name the convention gives it), where
+# p = primary key, f = foreign key, c = check. Every table below holds at most
+# one constraint of each type listed, so discovery by type is unambiguous.
 CONSTRAINTS: list[tuple[str, str, str]] = [
     ("workspace_account", "p", "pk_workspace_account"),
     ("billing_item", "p", "pk_billing_item"),
@@ -84,10 +73,9 @@ def upgrade() -> None:
             )
 
         if not found:
-            # The constraint is absent rather than misnamed, so there is nothing
-            # to rename. Left alone deliberately: failing a migration on a
-            # database that differs in some other way would block a deployment
-            # for a problem this migration cannot fix.
+            # Absent rather than misnamed, so there is nothing to rename. Left
+            # alone: failing here would block a deployment for a problem this
+            # migration cannot fix.
             logging.warning("No '%s' constraint on %s to rename to %s", contype, table, target)
             continue
 
@@ -101,7 +89,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Deliberately empty. The names this migration replaced were whatever
-    # PostgreSQL happened to invent in each environment, so there is no single
-    # earlier state to restore. Normalising names is treated as one-way.
+    # Deliberately empty. The names replaced were whatever PostgreSQL invented
+    # in each environment, so there is no single earlier state to restore.
     pass

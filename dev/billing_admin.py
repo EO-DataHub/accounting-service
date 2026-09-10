@@ -20,9 +20,11 @@ console = Console(stderr=False)
 
 
 def handle_errors(fn: Callable) -> Callable:
-    """The single place commands report a failure. Raise ValueError for a business-rule violation
-    (bad input, SKU not found, etc.) and it prints in red and exits non-zero, same as an
-    unexpected SQLAlchemyError (eg. a lost database connection) instead of a raw traceback."""
+    """The single place commands report a failure.
+
+    Raise ValueError for a business-rule violation (bad input, SKU not found) and it prints in
+    red and exits non-zero, as does an unexpected SQLAlchemyError, rather than a traceback.
+    """
 
     @wraps(fn)
     def wrapper(*args: list, **kwargs: dict) -> None:
@@ -43,12 +45,10 @@ def cli(ctx: click.Context) -> None:
     Inspect billing items and credit rates, grant credits, and read the ledger.
 
     Rates are not set here. A pricing policy covers every rate at once (D3) and is minted by
-    loading the configuration document, which is reviewed and versioned. `set-price` used to
-    write one price row and has no meaning against a policy.
+    loading the configuration document, which is reviewed and versioned.
 
-    `grant` and `set-category` are privileged writes with no HTTP endpoint yet. T15 and T6
-    move them behind the API, where they will need authorisation; here they are reachable by
-    anyone who can reach the database, which is the same footing as the rest of this tool.
+    `grant` and `set-category` are privileged writes with no HTTP endpoint yet, so they are
+    reachable by anyone who can reach the database - the same footing as the rest of this tool.
     """
     ctx.obj = session = Session(db.get_engine())
 
@@ -79,10 +79,8 @@ def _list_item_history(session: Session, sku: str) -> None:
     if models.BillingItem.find_billing_item(session, sku) is None:
         raise ValueError(f"SKU [blue]{sku}[/blue] doesn't exist")
 
-    # col() rather than the bare attribute. SQLModel declares fields as plain annotations, so
-    # `PricingPolicy.version` is an `int` to a type checker and `BillingItem.sku == sku` is a
-    # `bool`, neither of which is what these arguments want. col() hands back the underlying
-    # column, which is what SQLAlchemy was getting all along.
+    # col() because SQLModel declares fields as plain annotations, so `PricingPolicy.version`
+    # types as an `int` rather than as a column.
     query = (
         select(models.PricingPolicy, models.PricingPolicyRate)
         .join(models.PricingPolicyRate, col(models.PricingPolicy.uuid) == col(models.PricingPolicyRate.policy_id))
@@ -120,8 +118,8 @@ def _list_item_history(session: Session, sku: str) -> None:
 def _list_all_items(session: Session) -> None:
     """Every item, with its rate under the policy that prices usage now.
 
-    An item with no rate shows blank rather than being left out: a SKU nothing can charge
-    for is the interesting case, not one to hide.
+    An item with no rate shows blank rather than being left out: a SKU nothing can charge for
+    is the interesting case.
     """
     policy = models.PricingPolicy.resolve(session, datetime.now(UTC))
     rates = {rate.item.sku: rate.credits_per_unit for rate in policy.rates} if policy else {}
@@ -152,10 +150,10 @@ def add_item(session: Session, sku: str, name: str, unit: str) -> None:
     """
     Creates a new billing item.
 
-    The item has no rate until a policy rates it, which happens by loading a configuration
-    document. Until then it is a SKU nothing can be charged for.
+    The item has no rate until a configuration document rates it, so until then it is a SKU
+    nothing can be charged for.
 
-    Fails if the SKU already exists; use `update-item` to change its name or unit instead.
+    Fails if the SKU already exists; use `update-item` to change its name or unit.
     """
     if models.BillingItem.find_billing_item(session, sku) is not None:
         raise ValueError(f"SKU [blue]{sku}[/blue] already exists")
@@ -188,10 +186,8 @@ def update_item(session: Session, sku: str, name: str | None, unit: str | None) 
     if existing is None:
         raise ValueError(f"SKU [blue]{sku}[/blue] doesn't exist")
 
-    # A configuration entry describes an item completely, so the field the operator left out
-    # is filled from the stored row rather than omitted from the document. Sending a partial
-    # entry and relying on the loader to update only the keys it found is what stopped item
-    # entries being validated at all.
+    # A configuration entry describes an item completely, so the field the operator left out is
+    # filled from the stored row rather than omitted from the document.
     configuration = {
         "items": [{"sku": sku, "name": name or existing.name, "unit": unit or existing.unit}],
     }
@@ -214,14 +210,13 @@ def grant(session: Session, workspace: str, amount: str, reason: str, by: str | 
     """
     Grants credits to a workspace.
 
-    Nothing converts money into credits (D2). A user asks a hub admin, who runs this.
+    Nothing converts money into credits (D2): a user asks a hub admin, who runs this.
 
-    The amount must be positive: this command adds credits and nothing else. Taking credits
-    back is a reversal, which references the transaction it corrects and belongs to T17
-    rather than here.
+    The amount must be positive. Taking credits back is a reversal, which references the
+    transaction it corrects and belongs to T17.
 
-    A grant is not idempotent. Two identical grants are two grants, so re-running this after
-    an error you are unsure about will double the credits.
+    A grant is not idempotent, so re-running this after an error you are unsure about will
+    double the credits.
     """
     try:
         credits = Decimal(amount)
@@ -256,18 +251,15 @@ def set_category(session: Session, workspace: str, category: str, by: str | None
     """
     Sets which pricing category a workspace is charged under.
 
-    This is the local half of T6. The workspace service is the authority on a workspace's
-    category and will send it over Pulsar; until it does, nothing populates this table and
-    every workspace prices under the policy's default category.
+    The workspace service is the authority on a workspace's category and will send it over
+    Pulsar. Until it does, nothing populates this table and every workspace prices under the
+    policy's default category.
 
-    The category is not checked against the policy. An unrecognised one is not an error: a
-    workspace whose category has no multiplier prices under the default (D6), because the set
-    of categories is defined by the workspace service and the configuration document rather
-    than here. What this does check is that some policy exists to price against, so a typo
-    that silently changes nothing is at least visible.
+    An unrecognised category is not an error: a workspace whose category has no multiplier
+    prices under the default (D6). This warns when it cannot find one, so a typo that changes
+    nothing is at least visible.
 
-    Charges already written keep the category they were priced under. Recategorising changes
-    what happens next, never the past.
+    Charges already written keep the category they were priced under.
     """
     policy = models.PricingPolicy.resolve(session, datetime.now(UTC))
 
@@ -300,19 +292,17 @@ def ledger(session: Session, workspace: str, limit: int) -> None:
     Shows a workspace's most recent credit transactions and its balance.
 
     Newest first, ordered by when this service recorded them rather than by when the usage
-    happened, so a backfilled event appears at the top where it can be noticed.
+    happened, so a backfilled event appears at the top.
 
     Every row is shown, including reversals. The usage endpoints net a reversal against the
-    charge it corrects and hide the pair (D12); this is the raw ledger, which is the only
-    place a correction is visible as an event of its own.
+    charge it corrects and hide the pair (D12); this is the raw ledger.
     """
     transactions = models.CreditLedgerTransaction.recent_transactions(session, workspace, limit=limit)
     balance = models.CreditLedgerTransaction.balance(session, workspace)
 
     table = Table(title=f"{workspace} - balance {balance} credits")
-    # The transaction ID is here to be copied - into the explain endpoint, or into a
-    # correction - so it comes first and folds rather than truncating. Rich shortens whichever
-    # column it must to make the table fit, and a UUID ending in an ellipsis is no use.
+    # The transaction ID is here to be copied, so it comes first and folds rather than
+    # truncating: Rich shortens whichever column it must, and a truncated UUID is no use.
     table.add_column("Transaction", overflow="fold")
     table.add_column("Recorded", overflow="fold")
     table.add_column("Type")

@@ -33,6 +33,16 @@ A number of `make` targets are defined:
 Dependencies are specified in `pyproject.toml`. After changing them, run `uv sync` to update the lockfile and
 virtual environment.
 
+## Running the server locally
+
+Different `.env` files are supported. Set the environment variable `APP_ENV` to use a named `.i<env name>.env` file, or unset it to use the plain `.env` file.
+
+For instance, to use `.testing.env` execute:
+
+```commandline
+APP_ENV=testing uv run ...
+```
+
 ## Database migrations
 
 This service manages its schema with [Alembic](https://alembic.sqlalchemy.org/). Migrations live in `alembic/versions/`.

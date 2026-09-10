@@ -27,7 +27,7 @@ Run `make check` before reporting a change as done.
   frozen Pydantic models with no session. New logic belongs here rather than on a table
   class.
 - `timestamps.py` — `as_utc`, `datetime_default_to_utc`.
-- `db.py`, `db_settings.py` — engine and settings, cached and resolved on first use rather
+- `db.py`, `settings.py` — engine and settings, cached and resolved on first use rather
   than at import.
 - `app/` — routes, response models, authorisation, dependencies.
 - `ingester/` — Pulsar messagers.

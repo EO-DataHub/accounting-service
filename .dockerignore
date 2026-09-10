@@ -5,10 +5,11 @@
 # Virtual environments
 .venv
 
-# Local configuration. db_settings reads ./.env through pydantic-settings, so a
-# host-oriented file baked into the image would point the container at
-# localhost instead of the 'db' service.
-.env
+# Local configuration. settings.py reads .env, or .<APP_ENV>.env, through
+# pydantic-settings. A host-oriented file baked into the image would point the
+# container at localhost instead of the 'db' service, and some of these hold
+# credentials.
+*.env
 
 # Python cache and bytecode
 __pycache__

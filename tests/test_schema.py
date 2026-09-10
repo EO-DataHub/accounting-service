@@ -1,7 +1,7 @@
 """Guards on the schema the models declare.
 
 No database. These read the metadata directly, which is what `create_all` emits and what
-Alembic compares a revision against, so a fault here is caught before it reaches either.
+Alembic compares a revision against.
 """
 
 from datetime import datetime
@@ -31,14 +31,11 @@ def declared_timestamp_columns() -> list[tuple[str, str, str]]:
 def test_every_timestamp_column_is_timezone_aware() -> None:
     """No column may be TIMESTAMP WITHOUT TIME ZONE.
 
-    This is the guard for `aware_timestamp()`. SQLModel maps a bare `datetime` to a naive
-    column, which discards the offset on write and hands back a naive value on read, and
-    nothing else in the suite would notice: the value is only wrong by the connection's
-    offset, so on a UTC server the tests would pass and a differently configured server
-    would be silently an hour out.
+    The guard for `aware_timestamp()`. SQLModel maps a bare `datetime` to a naive column,
+    which discards the offset on write, and nothing else in the suite would notice: on a UTC
+    server the tests pass and a differently configured server is silently an hour out.
 
-    Three separate instances of that failure have already been fixed in this service. This
-    test needs no maintenance as the schema grows, because it finds the columns itself.
+    Finds the columns itself, so it needs no maintenance as the schema grows.
     """
     columns = declared_timestamp_columns()
 
@@ -56,8 +53,7 @@ class TestAwareTimestamp:
     """The factory behaves in every shape the models need.
 
     Declared on throwaway tables which are removed again, so the real schema is untouched.
-    An annotated type was tried first and silently lost its `sa_type` when combined with
-    `| None` or with an explicit `Field(...)`; these cases are what caught that.
+    The `| None` and explicit-`Field(...)` cases are the ones an annotated type gets wrong.
     """
 
     @staticmethod

@@ -61,22 +61,11 @@ app = FastAPI(root_path=root_path)
 
 FastAPIInstrumentor.instrument_app(app)
 
-# This server serves three areas of the API:
-#
-#   * /api/workspaces/{workspace-id}/accounting/: Data about a specific workspace
-#   * /api/accounts/{account-id}/accounting/: Data about all workspaces in a specific account
-#   * /api/accounting/: Data not specific to any account or workspace (prices and billing items)
-#
-# The sub-paths within the first two are the same, we just filter the data differently.
-
 
 @app.exception_handler(AfterBillingEventNotFound)
 def handle_after_billing_event_not_found(_request: Request, exc: AfterBillingEventNotFound) -> JSONResponse:
-    """Paging from an event that does not exist is a 404.
+    """Paging from an event that does not exist is a 404."""
 
-    Registered once rather than caught in each handler, so a query endpoint added later gets
-    this without having to remember it.
-    """
     return JSONResponse(status_code=HTTPStatus.NOT_FOUND, content={"detail": str(exc)})
 
 
@@ -97,14 +86,7 @@ def get_workspace_usage_data(
     ],
     query: Annotated[UsageQuery, Query()],
 ) -> list[BillingEventAPIResult]:
-    """
-    This returns resource consumption data for a workspace within some given time range (or all).
-    Start and end times can be given in which case all consumption which overlaps this, even
-    partially, will be returned. Each result describes consumption over some specified time period.
-
-    Consumption data may be aggregated so that the time periods used get longer, but they will
-    never be aggregated across day boundaries (midnight UTC).
-    """
+    """Returns resource consumption data for a workspace within some given time range (or all)."""
 
     events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
         session,
@@ -135,17 +117,7 @@ def get_workspace_balance(
         ),
     ],
 ) -> CreditBalanceAPIResult:
-    """
-    This returns the credits currently available to a workspace (T10).
-
-    The balance is the sum of every movement in the workspace's ledger: usage debits, which
-    are negative, and credit grants, which are positive. A workspace with no ledger entries
-    at all has a balance of zero rather than no balance.
-
-    A negative balance means the workspace has spent more than it holds. Nothing here refuses
-    or throttles work as a result - exceeding a budget publishes a notification and blocks
-    nothing.
-    """
+    """Returns the credits currently available to a workspace."""
     return CreditBalanceAPIResult(
         workspace=workspace,
         balance=CreditLedgerTransaction.balance(session, workspace),
@@ -177,20 +149,7 @@ def get_ledger_transaction(
         ),
     ],
 ) -> LedgerTransactionAPIResult:
-    """
-    This returns one credit transaction and, for a charge, the arithmetic behind it (T13).
-
-    The `pricing` object shows the quantity metered, the credits per unit that the SKU carried,
-    the workspace category resolved at the time and its multiplier, and the pricing policy
-    version all four came from. Those are recomputed from what the transaction stores, so a
-    charge explains the same way months later - after the rates have been recalibrated, and
-    after the workspace has been moved to a different category.
-
-    `pricing` is null for a credit grant, which is not priced.
-
-    A transaction belonging to another workspace is a 404 rather than a 403, so the response
-    does not confirm that the ID exists.
-    """
+    """Returns one credit transaction and, for a charge, the arithmetic behind it."""
     found = CreditLedgerTransaction.find_transaction(session, transaction, workspace=workspace)
 
     if found is None:
@@ -219,14 +178,8 @@ def get_account_usage_data(
     ],
     query: Annotated[UsageQuery, Query()],
 ) -> list[BillingEventAPIResult]:
-    """
-    This returns resource consumption data for all workspaces billed to a specified account an
+    """Returns resource consumption data for all workspaces billed to a specified account an
     within some given time range (or all).
-    Start and end times can be given in which case all consumption which overlaps this, even
-    partially, will be returned. Each result describes consumption over some specified time period.
-
-    Consumption data may be aggregated so that the time periods used get longer, but they will
-    never be aggregated across day boundaries (midnight UTC).
     """
 
     events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
@@ -248,9 +201,7 @@ def get_account_usage_data(
     dependencies=[Depends(global_data_cache)],
 )
 def get_item_list(session: SessionDep) -> list[BillingItemAPIResult]:
-    """
-    This returns all available billing items in SKU order. A billing item is a single 'product'
-    sold by EO DataHub, such as CPU time or object storage. Note that prices must be fetched
+    """Returns all available billing items in SKU order. Note that prices must be fetched
     separately and may vary over time.
     """
     items: Iterator[BillingItem] = BillingItem.find_billing_items(session)
@@ -263,7 +214,7 @@ def get_item_list(session: SessionDep) -> list[BillingItemAPIResult]:
     dependencies=[Depends(global_data_cache)],
 )
 def get_item(session: SessionDep, sku: str) -> BillingItemAPIResult:
-    """This returns a specific billing item based on its SKU."""
+    """Returns a specific billing item based on its SKU."""
     item: BillingItem | None = BillingItem.find_billing_item(session, sku)
 
     if item is None:
@@ -278,12 +229,8 @@ def get_item(session: SessionDep, sku: str) -> BillingItemAPIResult:
     dependencies=[Depends(global_data_cache)],
 )
 def get_prices(session: SessionDep) -> list[BillingItemRateAPIResult]:
-    """
-    This returns the credits charged per unit for every SKU, in SKU order. The unit is defined in
-    the billing item the rate relates to.
-
-    The rates are those of the pricing policy in force now, so a calibration dated in the future
-    is not returned until it takes effect. An empty list means no policy has been configured.
+    """Returns the credits charged per unit for every SKU, in SKU order. The unit is defined
+    in the billing item the rate relates to.
     """
     policy = PricingPolicy.resolve(session, datetime.now(UTC))
 

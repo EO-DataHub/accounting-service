@@ -1,21 +1,16 @@
 """Check the migrations against a throwaway database, in a subprocess.
 
-`make check-migrations` runs this. It starts a PostgreSQL container, migrates it from empty
-to head, and runs `alembic check` against the result. Both steps run as subprocesses, which
-is the point of the script rather than an implementation detail.
+`make check-migrations` runs this. It starts a PostgreSQL container, migrates it from empty to
+head, and runs `alembic check` against the result.
 
-Running `alembic check` in-process cannot detect an empty target_metadata, because anything
-that has already imported accounting_service.models has populated it as a side effect. That
-fault reached the remote test database: an import cleanup removed the models import from
-alembic/env.py, target_metadata was empty, and autogenerate reported every table as removed
-- it would have generated a revision dropping the whole schema. Every in-process check said
-it was fine.
+The subprocesses are the point, not an implementation detail: an in-process `alembic check`
+cannot detect an empty target_metadata, because anything that has already imported
+accounting_service.models has populated it as a side effect.
 
 Two things this does not cover. It says nothing about a deployed database, whose schema may
-predate the migrations - use `alembic check` against that directly. And the two expression
-indexes on billing_event are excluded from autogenerate by include_object in alembic/env.py,
-so a database missing them passes: `tests/test_schema.py` asserts the models declare them,
-and nothing asserts a database has them.
+predate the migrations - run `alembic check` against that directly. And the two expression
+indexes on billing_event are hidden from autogenerate by include_object in alembic/env.py, so
+a database missing them passes; `tests/test_schema.py` asserts the models declare them.
 """
 
 import os
