@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from accounting_service import db, models
+from accounting_service.pricing import UnratedSKUError, price_usage
 
 
 class DBIngester:
@@ -81,11 +82,101 @@ class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.Billing
         return []
 
     def _try_record_event(self, bemsg: messages.BillingEvent) -> UUID | None:
+        """Record the event and charge for it, in one transaction.
+
+        One transaction deliberately: an event and its debit land together or neither does.
+        The alternative leaves usage recorded but uncharged after a crash between the two,
+        which is a gap nothing would notice - the event reads back fine and the balance is
+        quietly wrong.
+        """
         with self._session() as session:
             uuid_ = models.BillingEvent.insert_from_message(session, bemsg)
+
+            if uuid_ is not None:
+                self._charge_event(session, uuid_, str(bemsg.sku))
+
             session.commit()
 
         return uuid_
+
+    def _charge_event(self, session: Session, event_id: UUID, sku: str) -> None:
+        """Price the event and write the debit (T9).
+
+        Three things stop a charge being written, and all three record the event anyway and
+        say so at error level rather than failing the message. Usage data is the thing that
+        cannot be recovered if it is dropped - a charge can always be applied later from the
+        stored quantity, which is what the re-pricing runner does (T18) - and none of the
+        three is fixed by redelivering the message, so raising would wedge the consumer on a
+        message it can never process.
+
+        This is the same bargain the unknown-SKU path above already makes: record it, and make
+        the omission loud enough to alert on.
+        """
+        event = session.get(models.BillingEvent, event_id)
+
+        if event is None:
+            # Inserted in this transaction two lines ago, so this cannot happen. Asserting it
+            # rather than letting the None flow onwards, which would fail somewhere less
+            # obvious.
+            raise AssertionError(f"billing event {event_id} vanished within its own transaction")
+
+        # Resolved per event rather than cached. The policy is the same for nearly every
+        # message, so a cache would pay off, but it would also price under a stale policy for
+        # its lifetime whenever another replica mints a new one - and pricing under the wrong
+        # policy is the one error this design exists to prevent. Revisit with a cache keyed on
+        # something that invalidates, not on a timeout.
+        policy = models.PricingPolicy.resolve(session, event.event_start_utc)
+
+        if policy is None:
+            logging.error(
+                "No pricing policy applies to BillingEvent %s at %s - recorded but not charged",
+                event_id,
+                event.event_start_utc.isoformat(),
+            )
+            return
+
+        # None where the workspace has no assignment, which the rate card resolves to the
+        # policy's default category (D6). Every workspace is in that state until the workspace
+        # service starts sending the field (T6).
+        category = models.WorkspaceCategory.category_for(session, event.workspace)
+
+        try:
+            priced = price_usage(policy.rate_card(), sku=sku, quantity=event.quantity, category=category)
+        except UnratedSKUError:
+            logging.error(
+                "Pricing policy version %s holds no rate for SKU %s - BillingEvent %s recorded but not charged",
+                policy.version,
+                sku,
+                event_id,
+            )
+            return
+        except ValueError:
+            # A quantity that is negative or not finite. A producer fault rather than a
+            # transient one, so it is logged with the value that caused it.
+            logging.exception(
+                "Cannot price quantity %r of %s - BillingEvent %s recorded but not charged",
+                event.quantity,
+                sku,
+                event_id,
+            )
+            return
+
+        debit = models.CreditLedgerTransaction.record_usage_debit(session, event, priced, policy.uuid)
+
+        if debit is None:
+            # The partial unique index refused it, so this event already carries an original
+            # debit. Reachable for an event stored before this code shipped, or one whose
+            # debit was written by a concurrent consumer.
+            logging.info("BillingEvent %s is already charged", event_id)
+        else:
+            logging.debug(
+                "Charged %s credits to %s for BillingEvent %s under policy version %s, category %s",
+                priced.credits,
+                event.workspace,
+                event_id,
+                policy.version,
+                priced.category,
+            )
 
 
 class WorkspaceSettingsIngesterMessager(DBIngester, PulsarJSONMessager[messages.WorkspaceSettings, bytes]):

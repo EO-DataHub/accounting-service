@@ -33,6 +33,7 @@ from accounting_service.models import (
     AfterBillingEventNotFound,
     BillingEvent,
     BillingItem,
+    CreditLedgerTransaction,
     PricingPolicy,
 )
 
@@ -40,6 +41,8 @@ from .models import (
     BillingEventAPIResult,
     BillingItemAPIResult,
     BillingItemRateAPIResult,
+    CreditBalanceAPIResult,
+    LedgerTransactionAPIResult,
     UsageQuery,
 )
 
@@ -114,6 +117,86 @@ def get_workspace_usage_data(
     )
 
     return [BillingEventAPIResult.model_validate(event) for event in events]
+
+
+@app.get(
+    "/workspaces/{workspace}/accounting/balance",
+    summary="Get a workspace's credit balance",
+    dependencies=[Depends(require_workspace(MinTier.MEMBER)), Depends(usage_data_cache)],
+)
+def get_workspace_balance(
+    session: SessionDep,
+    workspace: Annotated[
+        str,
+        Path(
+            title="EO DataHub workspace name",
+            description="The balance of this workspace will be returned.",
+            examples=["my-workspace"],
+        ),
+    ],
+) -> CreditBalanceAPIResult:
+    """
+    This returns the credits currently available to a workspace (T10).
+
+    The balance is the sum of every movement in the workspace's ledger: usage debits, which
+    are negative, and credit grants, which are positive. A workspace with no ledger entries
+    at all has a balance of zero rather than no balance.
+
+    A negative balance means the workspace has spent more than it holds. Nothing here refuses
+    or throttles work as a result - exceeding a budget publishes a notification and blocks
+    nothing.
+    """
+    return CreditBalanceAPIResult(
+        workspace=workspace,
+        balance=CreditLedgerTransaction.balance(session, workspace),
+        as_of=datetime.now(UTC),
+    )
+
+
+@app.get(
+    "/workspaces/{workspace}/accounting/ledger/{transaction}",
+    summary="Explain one credit transaction",
+    dependencies=[Depends(require_workspace(MinTier.MEMBER)), Depends(usage_data_cache)],
+)
+def get_ledger_transaction(
+    session: SessionDep,
+    workspace: Annotated[
+        str,
+        Path(
+            title="EO DataHub workspace name",
+            description="The workspace the transaction belongs to.",
+            examples=["my-workspace"],
+        ),
+    ],
+    transaction: Annotated[
+        UUID,
+        Path(
+            title="Credit transaction ID",
+            description="The transaction to explain.",
+            examples=["456e15d1-d01b-4060-8b7b-85b93ecbf050"],
+        ),
+    ],
+) -> LedgerTransactionAPIResult:
+    """
+    This returns one credit transaction and, for a charge, the arithmetic behind it (T13).
+
+    The `pricing` object shows the quantity metered, the credits per unit that the SKU carried,
+    the workspace category resolved at the time and its multiplier, and the pricing policy
+    version all four came from. Those are recomputed from what the transaction stores, so a
+    charge explains the same way months later - after the rates have been recalibrated, and
+    after the workspace has been moved to a different category.
+
+    `pricing` is null for a credit grant, which is not priced.
+
+    A transaction belonging to another workspace is a 404 rather than a 403, so the response
+    does not confirm that the ID exists.
+    """
+    found = CreditLedgerTransaction.find_transaction(session, transaction, workspace=workspace)
+
+    if found is None:
+        raise HTTPException(status_code=404, detail="Transaction not known")
+
+    return LedgerTransactionAPIResult.of(found)
 
 
 @app.get(

@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+Usage is now charged in credits. A billing event that arrives over Pulsar is priced against
+the pricing policy in force and written to an append-only ledger, and a workspace has a
+balance.
+
+- **New: `GET /workspaces/{workspace}/accounting/balance`.** The workspace's credit balance,
+  as an exact decimal string. Usage debits are negative and grants positive, so the balance is
+  the sum of the ledger. A workspace with no transactions has a balance of zero. Any member
+  may read it. A negative balance is reported, not refused: nothing here blocks work.
+- **New: `GET /workspaces/{workspace}/accounting/ledger/{transaction}`.** One transaction, and
+  for a charge the arithmetic behind it - the quantity metered, the credits per unit, the
+  workspace category and its multiplier, and the pricing policy version all four came from.
+  Those are recomputed from what the row stores, so a charge explains the same way months
+  later, after the rates have been recalibrated and after the workspace has been moved to
+  another category. `pricing` is null for a grant, which is not priced. A transaction in
+  another workspace is a 404.
+- **The ingester writes a debit for every billing event it records.** The event and its charge
+  land in one transaction, and a unique index permits one original debit per event, so a
+  redelivered message does not charge twice.
+- **Three things record the event but no charge, at error level rather than failing the
+  message**: no policy covers the usage time, the policy holds no rate for the SKU, or the
+  quantity is negative or not finite. None is fixed by redelivering, and a stored quantity can
+  always be charged later; a dropped quantity cannot be recovered. Worth an alert, on the same
+  footing as the existing auto-created `BillingItem`.
+- **Nothing is rounded.** A charge is stored as the product comes out, so a rate of `0.001`
+  against a quantity of `3600.0` gives `3.6000` - four decimal places, because the scale of a
+  product is the sum of its inputs' scales. Read paths preserve that scale rather than
+  trimming it, as they already do for prices. Clients should format for display.
+- **`billing-admin` gains `grant`, `set-category` and `ledger`.** `grant` adds credits to a
+  workspace and records who and why; `set-category` sets which pricing category a workspace is
+  charged under, until the workspace service starts sending it; `ledger` lists a workspace's
+  recent transactions and its balance. All three are privileged writes with no HTTP endpoint
+  yet, reachable by anyone who can reach the database - the same footing as the rest of that
+  tool.
+
+### Earlier in this release
+
 Two breaking changes to API responses. There is one client, `eodhp-workspace-ui`, and both
 were taken deliberately while it is being reworked.
 

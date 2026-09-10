@@ -1,8 +1,10 @@
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from functools import wraps
 from io import StringIO
+from uuid import UUID
 
 import rich_click as click
 from rich.console import Console
@@ -38,11 +40,15 @@ def handle_errors(fn: Callable) -> Callable:
 @click.rich_config(help_config=click.RichHelpConfiguration(text_markup="markdown", width=79))
 def cli(ctx: click.Context) -> None:
     """
-    Inspect billing items and credit rates, and create items, against the database.
+    Inspect billing items and credit rates, grant credits, and read the ledger.
 
     Rates are not set here. A pricing policy covers every rate at once (D3) and is minted by
     loading the configuration document, which is reviewed and versioned. `set-price` used to
     write one price row and has no meaning against a policy.
+
+    `grant` and `set-category` are privileged writes with no HTTP endpoint yet. T15 and T6
+    move them behind the API, where they will need authorisation; here they are reachable by
+    anyone who can reach the database, which is the same footing as the rest of this tool.
     """
     ctx.obj = session = Session(db.get_engine())
 
@@ -194,6 +200,149 @@ def update_item(session: Session, sku: str, name: str | None, unit: str | None) 
     db.insert_configuration(session, StringIO(j))
     session.commit()
     console.print(f"[green]Updated {sku}[/green]")
+
+
+# noinspection unresolved-references
+@cli.command("grant")
+@click.pass_obj
+@click.option("-w", "--workspace", help="Workspace to credit", required=True)
+@click.option("-a", "--amount", help="Credits to add. Must be positive", required=True)
+@click.option("-r", "--reason", help="Why. Recorded on the transaction for the audit log", required=True)
+@click.option("--by", help="UUID of the hub admin responsible", type=str, required=False)
+@handle_errors
+def grant(session: Session, workspace: str, amount: str, reason: str, by: str | None) -> None:
+    """
+    Grants credits to a workspace.
+
+    Nothing converts money into credits (D2). A user asks a hub admin, who runs this.
+
+    The amount must be positive: this command adds credits and nothing else. Taking credits
+    back is a reversal, which references the transaction it corrects and belongs to T17
+    rather than here.
+
+    A grant is not idempotent. Two identical grants are two grants, so re-running this after
+    an error you are unsure about will double the credits.
+    """
+    try:
+        credits = Decimal(amount)
+    except InvalidOperation:
+        raise ValueError(f"[blue]{amount}[/blue] is not a number") from None
+
+    if credits <= 0:
+        raise ValueError(f"Grant amount must be positive, not [blue]{credits}[/blue]")
+
+    transaction = models.CreditLedgerTransaction.record_grant(
+        session,
+        workspace=workspace,
+        credits=credits,
+        reason=reason,
+        created_by=UUID(by) if by else None,
+    )
+    session.commit()
+
+    balance = models.CreditLedgerTransaction.balance(session, workspace)
+    console.print(f"[green]Granted {credits} credits to {workspace}. Balance is now {balance}.[/green]")
+    console.print(f"Transaction {transaction.uuid}")
+
+
+# noinspection unresolved-references
+@cli.command("set-category")
+@click.pass_obj
+@click.option("-w", "--workspace", help="Workspace to categorise", required=True)
+@click.option("-c", "--category", help="Category name, as used in the configuration document", required=True)
+@click.option("--by", help="UUID of the hub admin responsible", type=str, required=False)
+@handle_errors
+def set_category(session: Session, workspace: str, category: str, by: str | None) -> None:
+    """
+    Sets which pricing category a workspace is charged under.
+
+    This is the local half of T6. The workspace service is the authority on a workspace's
+    category and will send it over Pulsar; until it does, nothing populates this table and
+    every workspace prices under the policy's default category.
+
+    The category is not checked against the policy. An unrecognised one is not an error: a
+    workspace whose category has no multiplier prices under the default (D6), because the set
+    of categories is defined by the workspace service and the configuration document rather
+    than here. What this does check is that some policy exists to price against, so a typo
+    that silently changes nothing is at least visible.
+
+    Charges already written keep the category they were priced under. Recategorising changes
+    what happens next, never the past.
+    """
+    policy = models.PricingPolicy.resolve(session, datetime.now(UTC))
+
+    if policy is None:
+        raise ValueError("No pricing policy is loaded, so nothing would price this workspace")
+
+    configured = {entry.category for entry in policy.category_multipliers}
+
+    models.WorkspaceCategory.assign(session, workspace, category, updated_by=UUID(by) if by else None)
+    session.commit()
+
+    console.print(f"[green]{workspace} is now priced under category {category}.[/green]")
+
+    if category not in configured:
+        console.print(
+            f"[yellow]Policy v{policy.version} has no multiplier for {category}, so usage will price "
+            f"under the default category {policy.default_category}. Configured: "
+            f"{', '.join(sorted(configured))}[/yellow]"
+        )
+
+
+# noinspection unresolved-references
+@cli.command("ledger")
+@click.pass_obj
+@click.argument("workspace", help="Workspace whose ledger to read")
+@click.option("-n", "--limit", help="How many transactions to show", type=int, default=20)
+@handle_errors
+def ledger(session: Session, workspace: str, limit: int) -> None:
+    """
+    Shows a workspace's most recent credit transactions and its balance.
+
+    Newest first, ordered by when this service recorded them rather than by when the usage
+    happened, so a backfilled event appears at the top where it can be noticed.
+
+    Every row is shown, including reversals. The usage endpoints net a reversal against the
+    charge it corrects and hide the pair (D12); this is the raw ledger, which is the only
+    place a correction is visible as an event of its own.
+    """
+    transactions = models.CreditLedgerTransaction.recent_transactions(session, workspace, limit=limit)
+    balance = models.CreditLedgerTransaction.balance(session, workspace)
+
+    table = Table(title=f"{workspace} - balance {balance} credits")
+    # The transaction ID is here to be copied - into the explain endpoint, or into a
+    # correction - so it comes first and folds rather than truncating. Rich shortens whichever
+    # column it must to make the table fit, and a UUID ending in an ellipsis is no use.
+    table.add_column("Transaction", overflow="fold")
+    table.add_column("Recorded", overflow="fold")
+    table.add_column("Type")
+    table.add_column("SKU", overflow="fold")
+    table.add_column("Quantity", justify="right")
+    table.add_column("Category")
+    table.add_column("Credits", justify="right")
+
+    for transaction in transactions:
+        credits = (
+            f"[green]+{transaction.credits}[/green]"
+            if transaction.credits > 0
+            else f"[red]{transaction.credits}[/red]"
+        )
+
+        table.add_row(
+            str(transaction.uuid),
+            # Seconds, and no offset: every timestamp this service holds is UTC.
+            transaction.recorded_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
+            transaction.transaction_type.value,
+            transaction.item.sku if transaction.item else transaction.reason,
+            str(transaction.quantity) if transaction.quantity is not None else None,
+            transaction.category,
+            credits,
+        )
+
+    console.print(table)
+
+    if not transactions:
+        console.print(f"No transactions for [blue]{workspace}[/blue]")
 
 
 if __name__ == "__main__":

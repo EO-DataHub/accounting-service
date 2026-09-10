@@ -49,7 +49,7 @@ Set `SQL_DRIVER` to `postgresql+psycopg`, even if you normally use SQLite. Some 
 
 # Management of this Component
 
-## Adding BillingItems (SKUs) and Prices
+## Adding BillingItems (SKUs) and credit rates
 
 ### Add or update a billing item
 
@@ -75,19 +75,146 @@ For a one-off fix that should not wait for a redeploy - eg. correcting a stub it
 uv run billing-admin update-item --sku my-sku --name "My product" --unit "GB-s"
 ```
 
-`billing-admin add-item` creates a brand new item with its initial price in one step. Both connect directly to the database, so point them at the right one first, eg. through a `kubectl port-forward`, the same way you would for `alembic`.
+`billing-admin add-item` creates an item with no rate. Both commands connect directly to the database, so point them at the right one first, eg. through a `kubectl port-forward`, the same way you would for `alembic`.
 
-### Add or change a price
+### Change a credit rate
 
-`accounting.conf` never sets prices in a deployed environment: the ConfigMap always ships an empty `prices` list. Use `billing-admin` instead:
+Rates are not set one at a time. A pricing policy covers every rate and every category multiplier together, and loading `accounting.conf` either matches the policy already in force or mints a new version of it. There is no `set-price` command, because a single price row has no meaning against a policy.
 
-```commandline
-uv run billing-admin set-price --sku my-sku --price 12.34 --valid 2025-01-01T00:00:00Z
+To change a rate, edit the `pricing_policy` section of the configuration document and restart the ingester:
+
+```yaml
+pricing_policy:
+  valid_from: "2025-01-01T00:00:00Z"
+  default_category: standard
+  reason: "Why this calibration happened"
+  rates:
+    - sku: my-sku
+      credits_per_unit: 0.001
+  category_multipliers:
+    - category: standard
+      multiplier: 1
 ```
 
-`--valid` must be later than the item's current price, or match it exactly to correct that price - `billing-admin` rejects anything else. Under the hood this inserts a row into `billing_item_price` and, if it is replacing a price, sets `valid_until` on the old one. It never updates a price in place, so the price history stays intact.
+Restarting with the file unchanged writes nothing. A new version is minted only when a rate, a multiplier, the default category or `valid_from` changes. Rewording `reason` is not a calibration and mints nothing.
 
-Run `uv run billing-admin ls` to see all items and their current price, or `uv run billing-admin ls my-sku` for one item's full price history.
+Nothing converts credits to money. A user who needs credits asks a hub admin, who grants them.
+
+Run `uv run billing-admin ls` to see every item with its rate under the policy in force, or `uv run billing-admin ls my-sku` for that SKU's rate in every policy.
+
+## Credits and the ledger
+
+Every billing event the ingester records is priced and written to the credit ledger as one debit. The ledger is append-only: nothing updates or deletes a row, and a correction is a new row referencing the one it corrects. Debits are negative and grants positive, so a balance is the sum of the ledger.
+
+Each debit stores the quantity metered, the pricing policy version that priced it, and the workspace category resolved at the time. That is what lets a charge be explained months later, after the rates have changed and after the workspace has moved to a different category.
+
+### Read a workspace's credits
+
+```commandline
+uv run billing-admin ledger my-workspace
+```
+
+This shows the recent transactions and the balance. Over HTTP:
+
+```commandline
+GET /workspaces/my-workspace/accounting/balance
+GET /workspaces/my-workspace/accounting/ledger/{transaction}
+```
+
+The second returns one transaction and, for a charge, the arithmetic behind it. Both need a token holding membership of the workspace.
+
+### Grant credits
+
+```commandline
+uv run billing-admin grant --workspace my-workspace --amount 1000 --reason "Pilot allocation"
+```
+
+The reason is recorded on the transaction. A grant is not idempotent, so running the command twice grants twice.
+
+### Set a workspace's pricing category
+
+```commandline
+uv run billing-admin set-category --workspace my-workspace --category commercial
+```
+
+The category selects which multiplier applies to every rate. The workspace service is the authority on it and will send it over Pulsar; until then nothing populates the table and every workspace prices under the policy's `default_category`.
+
+A category with no multiplier in the policy is not an error. Usage prices under the default instead, and the command warns when it cannot find a multiplier for what you set.
+
+Recategorising changes what happens next. Charges already written keep the category they were priced under.
+
+### Walk through the whole path locally
+
+This exercises configuration, pricing, the ledger and the read endpoints. Start the whole stack, which includes Pulsar, the ingester and the API:
+
+```commandline
+docker compose --profile messaging up
+```
+
+`billing-admin` and `inject` run on the host, so point them at the local database first. Check where they are pointing before you write anything:
+
+```commandline
+export SQL_HOST=localhost SQL_PORT=5433 SQL_USER=accounting SQL_PASSWORD=changeme
+export SQL_DATABASE=accounting SQL_SCHEMA=public
+```
+
+Environment variables take priority over `.env`, so this overrides whatever that file holds. `grant` and `set-category` write to whichever database they reach, and neither asks for confirmation.
+
+1. Grant the workspace some credits.
+
+   ```commandline
+   uv run billing-admin grant --workspace my-workspace --amount 1000 --reason "Demo"
+   ```
+
+2. Send an hour of CPU time.
+
+   ```commandline
+   uv run inject billing-event --workspace my-workspace --sku cpu-seconds --quantity 3600
+   ```
+
+3. Read the ledger. One debit, and a balance below 1000.
+
+   ```commandline
+   uv run billing-admin ledger my-workspace
+   ```
+
+4. Ask why the charge was what it was. Take the transaction ID from the table above. The endpoint needs a token; `http-client.env.json` holds an unsigned one for a hub admin, which passes every tier check.
+
+   ```commandline
+   export TOKEN=$(python3 -c "import json;print(json.load(open('http-client.env.json'))['dev']['jwt'])")
+   curl -H "Authorization: Bearer $TOKEN" \
+     localhost:8000/workspaces/my-workspace/accounting/ledger/$TRANSACTION
+   ```
+
+   The `pricing` object gives the quantity, the credits per unit, the category, the multiplier and the policy version.
+
+   The balance endpoint takes the same token:
+
+   ```commandline
+   curl -H "Authorization: Bearer $TOKEN" localhost:8000/workspaces/my-workspace/accounting/balance
+   ```
+
+5. Make the category matter. Set the workspace to `academic`, which the local configuration halves, and send the same usage again.
+
+   ```commandline
+   uv run billing-admin set-category --workspace my-workspace --category academic
+   uv run inject billing-event --workspace my-workspace --sku cpu-seconds --quantity 3600
+   uv run billing-admin ledger my-workspace
+   ```
+
+   The second charge is half the first.
+
+6. Recalibrate. Change `cpu-seconds` to `0.002` in `dev/accounting.conf` and restart the ingester, which loads the file and mints a new policy version.
+
+   ```commandline
+   docker compose restart ingester
+   uv run inject billing-event --workspace my-workspace --sku cpu-seconds --quantity 3600
+   uv run billing-admin ledger my-workspace
+   ```
+
+   The third charge uses the new rate. Run step 4 against the first transaction again: it still reports the rate and the policy version that priced it.
+
+The last step is the point of versioning a policy. The past does not move when the rates do.
 
 ## Incompatible Schema
 

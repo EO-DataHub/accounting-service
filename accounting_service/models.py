@@ -31,7 +31,7 @@ SQL it always was. This module used to carry a file-level suppression of five ru
 import logging
 import uuid
 from collections.abc import Iterator, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Self
@@ -53,6 +53,7 @@ from sqlalchemy import (
     text,
     union,
 )
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased, selectinload
@@ -62,7 +63,7 @@ from sqlmodel import Relationship, SQLModel, col
 
 from accounting_service.configuration import ConfiguredItem
 from accounting_service.consumption import ConsumptionWindow, RateSample, estimate_consumption
-from accounting_service.pricing import ConfiguredPolicy, PolicyFingerprint, RateCard
+from accounting_service.pricing import ConfiguredPolicy, PolicyFingerprint, PricedUsage, RateCard
 from accounting_service.timestamps import as_utc, datetime_default_to_utc
 
 # Every table here is a SQLModel. The naming convention is set on SQLModel's own MetaData so
@@ -125,6 +126,34 @@ def aware_timestamp(
     )
 
 
+def pg_enum(values: "type[StrEnum]", name: str) -> Any:  # noqa: ANN401 - as aware_timestamp, SQLModel's Field() returns Any
+    """Declare a native PostgreSQL enum column over a `StrEnum`.
+
+    The sibling of `aware_timestamp()`, and it exists for the same reason: the obvious
+    spelling is silently wrong. `SAEnum(SomeEnum)` persists the *member names* - DEBIT, GRANT,
+    REVERSAL - because SQLAlchemy reads `.name` off each member by default. A `StrEnum` exists
+    precisely so its values are the wire and storage form, so what reaches the database would
+    be the one spelling nothing else in the codebase uses. `values_callable` is what asks for
+    the values instead.
+
+    That fault does not present as a type error or a failed write. It presents as a check
+    constraint or a literal comparing against a label the type does not have, which
+    PostgreSQL rejects at DDL time with a message about the enum rather than about the
+    spelling. The first instance cost the ledger's `debit_is_priced` constraint.
+
+    `name` is given explicitly rather than derived from the class, so a revision has a stable
+    type name to create and drop. Renaming the class must not rename a deployed type.
+
+    Two things a revision using this must do by hand, because Alembic autogenerates neither:
+    create the type before the table that uses it, and drop it after. `create_table` creates
+    it as a side effect, but `drop_table` does not drop it, so without an explicit drop the
+    type outlives the table and a downgrade-then-upgrade cycle fails.
+    """
+    return SQLModelField(
+        sa_type=SAEnum(values, name=name, values_callable=lambda enum: [member.value for member in enum]),  # pyright: ignore[reportArgumentType]
+    )
+
+
 class WorkspaceAccount(SQLModel, table=True):
     """
     This records which account contains each workspace.
@@ -159,6 +188,57 @@ class WorkspaceAccount(SQLModel, table=True):
 
         assert isinstance(result, CursorResult)  # Makes mypy happy
         return result.rowcount > 0
+
+
+class WorkspaceCategory(SQLModel, table=True):
+    """Which pricing category a workspace is charged under (T6, D6).
+
+    A separate table from `workspace_account` rather than a column on it, because
+    `WorkspaceAccount.record_mapping` is insert-only by design and silently ignores a change.
+    That is right for the account mapping - a workspace does not move between accounts - and
+    wrong for a category, which D6 requires to be changeable.
+
+    No history is kept here. History lives on the ledger, which records the category resolved
+    at pricing time, so recategorising a workspace never rewrites what it was charged.
+
+    A row being absent is not an error. An unassigned workspace prices under the policy's
+    `default_category` (D6), and that is where every workspace sits until the workspace
+    service sends the field.
+    """
+
+    __tablename__ = "workspace_category"  # pyright: ignore[reportAssignmentType]
+
+    workspace: str = SQLModelField(primary_key=True)
+    category: str
+    updated_at: datetime = aware_timestamp(default=func.now())
+    updated_by: UUID | None = SQLModelField(default=None)
+
+    @classmethod
+    def category_for(cls, session: Session, workspace: str) -> str | None:
+        """The category assigned to this workspace, or None if it has none.
+
+        None rather than the default, because the default belongs to the policy and this
+        table does not know which policy is being applied. `RateCard.multiplier_for` takes
+        None and resolves it (D6).
+        """
+        return session.execute(select(col(cls.category)).where(col(cls.workspace) == workspace)).scalar_one_or_none()
+
+    @classmethod
+    def assign(cls, session: Session, workspace: str, category: str, updated_by: UUID | None = None) -> None:
+        """Set this workspace's category, replacing any existing assignment.
+
+        An upsert rather than an insert, which is the whole reason this is not a column on
+        `workspace_account`. Does not commit: the caller owns the transaction, as it does for
+        `insert_configuration`.
+        """
+        session.execute(
+            insert(cls)
+            .values(workspace=workspace, category=category, updated_at=func.now(), updated_by=updated_by)
+            .on_conflict_do_update(
+                index_elements=["workspace"],
+                set_={"category": category, "updated_at": func.now(), "updated_by": updated_by},
+            )
+        )
 
 
 class BillingItemBase(SQLModel):
@@ -1036,4 +1116,399 @@ class BillableResourceConsumptionRateSample(SQLModel, table=True):
             + f"{self.user=}, "
             + f"{self.workspace=}, "
             + f"{self.rate=})"
+        )
+
+
+class TransactionType(StrEnum):
+    """What kind of act a ledger row records.
+
+    Metadata, not arithmetic. The sign on `credits` carries the arithmetic, so a balance is a
+    plain SUM and nothing has to know the type to total correctly. The type is what an audit
+    surface reports (T19) and what the idempotency index keys on.
+
+    A native PostgreSQL enum rather than a string, so an invalid value fails at write time.
+    That costs something in the migrations: Alembic does not autogenerate enum changes, so a
+    revision must call `SAEnum(...).create(bind)` on upgrade and `drop()` on downgrade or the
+    type outlives the table and a downgrade-then-upgrade cycle fails. The value set is
+    therefore worth choosing deliberately - adding a value later is easy, removing or
+    renaming one needs a replacement type and a swap of every column using it.
+    """
+
+    DEBIT = "debit"
+    GRANT = "grant"
+    REVERSAL = "reversal"
+
+
+class CreditLedgerTransaction(SQLModel, table=True):
+    """One movement of credits: a usage debit, an admin grant, or a correction (T8).
+
+    Append-only. Rows are never updated or deleted; a correction is a new row referencing the
+    one it corrects (D7). Two things follow. Concurrent debits never contend for a row, so a
+    balance needs no lock and no mutable total - which is why this carries none of the risk
+    the original sizing assumed. And every row records what was actually charged at the time,
+    so a period can be re-priced without destroying the record of what it cost (D8).
+
+    A balance is `SUM(credits)`. Debits are stored negative and grants positive, so the sign
+    carries the arithmetic and `transaction_type` decides nothing about a total. Pricing
+    returns a positive charge and this is where it acquires its sign.
+
+    Every input to the charge is stored beside the result: `quantity`, `policy_id` and
+    `category`. That is what makes a row replayable months later, and it is what the
+    explainable-pricing endpoint (T13), the audit log (T19) and historical re-pricing (T18)
+    read. `category` is the one resolved at pricing time, so recategorising a workspace does
+    not rewrite its past charges.
+
+    `credits` is an unconstrained NUMERIC. Nothing is rounded on the way in - see the
+    docstring on `price_usage` - so fixing a scale here would be the same decision made in
+    the schema instead of in the code, and would make a replay reproduce the scale in force
+    when the replay ran rather than the policy.
+    """
+
+    __tablename__ = "credit_ledger_transaction"  # pyright: ignore[reportAssignmentType]
+
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
+
+    workspace: str
+
+    # Denormalised from the billing event rather than joined through it. The duplication earns
+    # its keep twice: per-user budgets (T16) and the per-user usage filter (T12) both need it,
+    # and a grant has no billing event to join through, so under a join every grant would
+    # have no user at all. Null on a grant marks it as belonging to the whole workspace pool.
+    user: UUID | None = SQLModelField(default=None)
+
+    transaction_type: TransactionType = pg_enum(TransactionType, "transaction_type")
+
+    credits: Decimal
+
+    # Set for a usage debit and for a correction of one. Null for a grant, which prices
+    # nothing and meters nothing.
+    billing_event_id: UUID | None = SQLModelField(default=None, foreign_key="billing_event.uuid")
+    item_id: UUID | None = SQLModelField(default=None, foreign_key="billing_item.uuid")
+    quantity: float | None = SQLModelField(default=None)
+
+    # How this was priced: a reference to the policy, not a copy of its numbers, so the charge
+    # can be recomputed rather than merely re-read.
+    #
+    # Nullable, where the schema note had both of these NOT NULL. A grant is not priced, so it
+    # has no policy and no category, and a non-null column would have to be filled with a
+    # policy that did not apply to it. The invariant that actually holds is the check
+    # constraint below: a debit has both.
+    policy_id: UUID | None = SQLModelField(default=None, foreign_key="pricing_policy.uuid")
+    category: str | None = SQLModelField(default=None)
+
+    # Both, because the two questions differ. Period filters want when the usage happened;
+    # audit and reconciliation want when this service learned of it. A backfilled event
+    # carries an old `occurred_at` and a recent `recorded_at`, and collapsing them into one
+    # column makes both queries wrong. Balance snapshots key on `recorded_at` for exactly
+    # this reason.
+    occurred_at: datetime = aware_timestamp()
+    recorded_at: datetime = aware_timestamp(default=func.now())
+
+    # Corrections (T17, T18). `correction_batch_id` has no foreign key yet: T17 adds the
+    # `correction_batch` table and the constraint with it. The column exists now because the
+    # idempotency index below tests it, and an index cannot reference a column that is not
+    # there.
+    reverses_id: UUID | None = SQLModelField(default=None, foreign_key="credit_ledger_transaction.uuid")
+    correction_batch_id: UUID | None = SQLModelField(default=None)
+
+    # The hub_admin responsible, for a grant or a correction. Null on a usage debit, which no
+    # person initiated.
+    created_by: UUID | None = SQLModelField(default=None)
+    reason: str | None = None
+
+    item: BillingItem | None = Relationship()
+    policy: PricingPolicy | None = Relationship()
+
+    @property
+    def occurred_at_utc(self) -> datetime:
+        return as_utc(self.occurred_at)
+
+    @property
+    def recorded_at_utc(self) -> datetime:
+        return as_utc(self.recorded_at)
+
+    __table_args__ = (
+        # One original debit per billing event, while still allowing correction rows against
+        # that same event. A plain unique constraint on billing_event_id would block
+        # re-pricing entirely (T18).
+        #
+        # The WHERE clause is load-bearing in both directions. PostgreSQL treats NULLs as
+        # distinct in a unique index, so without it grants would be unconstrained anyway,
+        # correction rows would not be constrained at all, and original debits would not be
+        # protected from each other.
+        Index(
+            "credit_ledger_original_debit_index",
+            "billing_event_id",
+            unique=True,
+            postgresql_where=text("correction_batch_id IS NULL AND transaction_type = 'debit'"),
+        ),
+        Index(
+            "credit_ledger_workspace_recorded_index",
+            "workspace",
+            "recorded_at",
+        ),
+        # Named explicitly: Alembic matches check constraints by name, so an anonymous one can
+        # never be matched against the name PostgreSQL invents for it.
+        #
+        # A debit is priced, so it has a policy and a category. A grant is not, so it has
+        # neither. Stated as a rule about debits rather than as an equivalence, because a
+        # reversal of a debit carries the original's policy (D7) while a reversal of a grant
+        # would carry none, and an equivalence would refuse the second.
+        CheckConstraint(
+            "transaction_type <> 'debit' OR (policy_id IS NOT NULL AND category IS NOT NULL)",
+            name="debit_is_priced",
+        ),
+    )
+
+    @classmethod
+    def record_usage_debit(
+        cls,
+        session: Session,
+        event: "BillingEvent",
+        priced: PricedUsage,
+        policy_id: UUID,
+    ) -> UUID | None:
+        """Charge a billing event, or return None if it has already been charged (T9).
+
+        The charge arrives positive from `price_usage` and is stored negated, because the sign
+        is the ledger's business rather than the price's.
+
+        Idempotent through the partial unique index, not through a prior SELECT. Checking
+        first and inserting second is two statements with a race between them, and the race
+        is the case that matters: this runs on a Pulsar consumer that can redeliver a message
+        and can be restarted mid-transaction. `on_conflict_do_nothing` collapses both into one
+        statement the database arbitrates.
+
+        `BillingEvent.insert_from_message` already deduplicates on the message UUID. This
+        protects a different failure: the same stored event being priced twice, after a crash
+        between writing the event and writing the debit.
+
+        Does not commit. The caller owns the transaction, and the point of not committing here
+        is that the event and its debit land together or not at all.
+        """
+        result = session.execute(
+            insert(cls)
+            .values(
+                workspace=event.workspace,
+                user=event.user,
+                transaction_type=TransactionType.DEBIT,
+                credits=-priced.credits,
+                billing_event_id=event.uuid,
+                item_id=event.item_id,
+                quantity=priced.quantity,
+                policy_id=policy_id,
+                category=priced.category,
+                occurred_at=event.event_start_utc,
+            )
+            .on_conflict_do_nothing(
+                index_elements=["billing_event_id"],
+                index_where=text("correction_batch_id IS NULL AND transaction_type = 'debit'"),
+            )
+            .returning(col(cls.uuid))
+        )
+
+        return result.scalar_one_or_none()
+
+    @classmethod
+    def record_grant(
+        cls,
+        session: Session,
+        workspace: str,
+        credits: Decimal,
+        reason: str,
+        created_by: UUID | None = None,
+        occurred_at: datetime | None = None,
+    ) -> Self:
+        """Add credits to a workspace's pool.
+
+        Positive, and carrying no policy or category: a grant is not priced, so there is
+        nothing to record about how it was priced. `user` is left null, which is what marks a
+        grant as belonging to the whole workspace rather than to one member (D5).
+
+        `reason` is required rather than optional. A grant is a privileged write with no
+        payment behind it (D2), so the audit log (T19) has nothing to show but the reason
+        somebody gave.
+
+        Not idempotent, and deliberately so. Two identical grants are two grants: unlike a
+        redelivered billing event, there is no natural key saying they are the same act.
+
+        Does not commit.
+        """
+        transaction = cls(
+            workspace=workspace,
+            transaction_type=TransactionType.GRANT,
+            credits=credits,
+            reason=reason,
+            created_by=created_by,
+            occurred_at=occurred_at or datetime.now(UTC),
+        )
+
+        session.add(transaction)
+        session.flush()
+
+        return transaction
+
+    @classmethod
+    def balance(cls, session: Session, workspace: str, user: UUID | None = None) -> Decimal:
+        """The workspace's credit balance, or one user's net spend within it (T10).
+
+        The latest snapshot plus every row recorded after it. Two statements rather than the
+        one join in the schema note, which does not survive contact with the data: reading
+        `FROM credit_balance_snapshot` returns no rows at all for a workspace with no
+        snapshot, so the balance of a workspace nobody has snapshotted comes back empty
+        instead of as the ledger sum. It also returns one row per snapshot, where only the
+        latest is wanted.
+
+        The delta is taken on `recorded_at`, never `occurred_at`. A backfilled event carries
+        an old `occurred_at`, so on that column it would fall after the snapshot's cut and
+        also outside the delta, and vanish from the balance entirely.
+
+        A snapshot is an optimisation and not a source of truth. With none stored this reads
+        the whole ledger and is still correct, which is what lets a snapshot be rebuilt or
+        discarded at any time.
+
+        Passing `user` gives that user's net spend against the shared pool rather than an
+        allowance of their own: grants carry no user, so they are not in the sum. That is what
+        a per-user threshold checks against (D5, T16).
+        """
+        snapshot = CreditBalanceSnapshot.latest(session, workspace, user)
+        opening = snapshot.balance if snapshot else Decimal(0)
+
+        delta = select(func.coalesce(func.sum(col(cls.credits)), Decimal(0))).where(col(cls.workspace) == workspace)
+
+        if snapshot:
+            delta = delta.where(col(cls.recorded_at) > snapshot.as_of_utc)
+
+        if user is not None:
+            delta = delta.where(col(cls.user) == user)
+
+        return opening + session.execute(delta).scalar_one()
+
+    @classmethod
+    def find_transaction(cls, session: Session, uuid_: UUID, workspace: str | None = None) -> Self | None:
+        """One transaction, with everything needed to explain the charge loaded (T13).
+
+        The policy comes with its rates and multipliers, because the explanation recomputes
+        the charge rather than reading it back. The row stores the quantity, the policy and the
+        resolved category but not the rate or the multiplier, so reproducing the arithmetic
+        means projecting that policy into a rate card again - which is the property the design
+        is built on (D8), and the only way to show that the stored number still follows from
+        its inputs.
+
+        `workspace` scopes the lookup where the caller has one. A transaction UUID is not a
+        capability, so an endpoint under /workspaces/{workspace}/ must not hand back a row
+        belonging to another workspace merely because the UUID was right.
+        """
+        query = (
+            select(cls)
+            .options(
+                selectinload(cls.item),  # pyright: ignore[reportArgumentType]
+                selectinload(cls.policy).options(  # pyright: ignore[reportArgumentType]
+                    *_policy_load_options()
+                ),
+            )
+            .where(col(cls.uuid) == uuid_)
+        )
+
+        if workspace is not None:
+            query = query.where(col(cls.workspace) == workspace)
+
+        return session.execute(query).scalars().first()
+
+    @classmethod
+    def recent_transactions(cls, session: Session, workspace: str, limit: int = 50) -> Sequence[Self]:
+        """The workspace's most recent transactions, newest first.
+
+        Ordered on `recorded_at`, which is the order they were written rather than the order
+        the usage happened in: this answers "what has this workspace done lately", and a
+        backfilled event is news even though its `occurred_at` is old.
+
+        For the admin CLI. The API's ledger endpoint (T12) is a different query - it groups
+        and nets rather than listing rows, because an individual reversal must not appear
+        there as an event of its own (D12).
+        """
+        return (
+            session.execute(
+                select(cls)
+                .options(selectinload(cls.item))  # pyright: ignore[reportArgumentType]
+                .where(col(cls.workspace) == workspace)
+                .order_by(col(cls.recorded_at).desc())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+
+    def __repr__(self) -> str:
+        return (
+            "CreditLedgerTransaction("
+            + f"{self.uuid=}, "
+            + f"{self.workspace=}, "
+            + f"{self.transaction_type=}, "
+            + f"{self.credits=}, "
+            + f"{self.occurred_at=})"
+        )
+
+
+class CreditBalanceSnapshot(SQLModel, table=True):
+    """A workspace's balance as at one instant, so a balance read need not sum every row.
+
+    An optimisation and not a source of truth. The ledger alone always gives the right
+    answer, so a snapshot can be rebuilt or thrown away at any time. Nothing writes one yet -
+    `CreditLedgerTransaction.balance` reads the whole ledger when there is none, and stays
+    correct doing it. What this table buys is a cheap balance for the budget checks that run
+    on every billing event (T16).
+
+    Keyed on `as_of` against `recorded_at`, never `occurred_at`. A backfilled event carries an
+    old `occurred_at`: on that column it would sort before a snapshot taken after it arrived,
+    and so be counted in neither the snapshot nor the delta.
+
+    Keyed on workspace and user the same way budgets are, because budgets are what need a
+    balance to be cheap. A null `user` is the whole-pool total that the workspace balance
+    endpoint reads; a row naming a user serves a per-user threshold check.
+
+    The schema note specified `(workspace, user, as_of)` as the primary key with `user`
+    nullable, which PostgreSQL will not have: a primary key column is NOT NULL, so the
+    whole-pool row could not exist. A surrogate key with a unique constraint instead, and the
+    constraint declares NULLS NOT DISTINCT so that the pool row stays unique - by default
+    PostgreSQL counts two null users as different values and would let the same instant be
+    snapshotted twice.
+    """
+
+    __tablename__ = "credit_balance_snapshot"  # pyright: ignore[reportAssignmentType]
+
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
+    workspace: str
+    user: UUID | None = SQLModelField(default=None)
+    as_of: datetime = aware_timestamp()
+    balance: Decimal
+
+    __table_args__ = (
+        UniqueConstraint("workspace", "user", "as_of", postgresql_nulls_not_distinct=True),
+        Index("credit_balance_snapshot_lookup_index", "workspace", "user", "as_of"),
+    )
+
+    @property
+    def as_of_utc(self) -> datetime:
+        return as_utc(self.as_of)
+
+    @classmethod
+    def latest(cls, session: Session, workspace: str, user: UUID | None = None) -> Self | None:
+        """The most recent snapshot for this workspace, or for one user within it.
+
+        `user=None` means the whole-pool row, which is a different thing from "any user", so
+        this matches IS NULL rather than leaving the filter off.
+        """
+        by_user = col(cls.user) == user if user is not None else col(cls.user).is_(None)
+
+        return (
+            session.execute(
+                select(cls)
+                .where(col(cls.workspace) == workspace)
+                .where(by_user)
+                .order_by(col(cls.as_of).desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
         )

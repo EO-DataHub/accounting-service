@@ -15,8 +15,11 @@ from pydantic import (
 
 from accounting_service.models import (
     BillingItemBase,
+    CreditLedgerTransaction,
     TimeAggregation,
+    TransactionType,
 )
+from accounting_service.pricing import price_usage
 from accounting_service.timestamps import as_utc, datetime_default_to_utc
 
 
@@ -214,3 +217,197 @@ class BillingItemRateAPIResult(BaseModel):
     ]
     valid_from: Annotated[UtcTimestamp, Field(description="When the calibration that set this took effect")]
     policy_version: Annotated[int, Field(description="Which pricing policy version this rate comes from")]
+
+
+class CreditBalanceAPIResult(BaseModel):
+    """A workspace's credit balance.
+
+    One number, and the time it was true. Credits are the unit of account and nothing
+    converts them to money (D2), so there is no currency here and no second figure.
+
+    A negative balance is a workspace that has spent more than it has been granted. It is
+    reported rather than refused: nothing in this service blocks work, and a budget breach
+    publishes a message instead of stopping anything (D4).
+    """
+
+    workspace: Annotated[str, Field(description="The workspace this balance belongs to", examples=["my-workspace"])]
+    balance: Annotated[
+        ExactDecimal,
+        Field(
+            description=(
+                "Credits available, as an exact decimal string. Negative if the workspace has "
+                "spent more than it holds."
+            ),
+            examples=["989.2"],
+        ),
+    ]
+    as_of: Annotated[
+        UtcTimestamp,
+        Field(
+            description="When this balance was computed. The ledger is append-only, so it is a value at an instant.",
+            examples=["2026-09-09T13:34:22Z"],
+        ),
+    ]
+
+
+class PricingExplanation(BaseModel):
+    """How a charge was arrived at: quantity x credits per unit x category multiplier.
+
+    Recomputed from what the ledger row stores rather than read back from it. The row keeps
+    the quantity, the policy version and the category resolved at the time, and this is that
+    policy projected over those inputs again - so the arithmetic can be reproduced months
+    later, after the rates have changed and after the workspace has been recategorised (D8).
+
+    `charge` is therefore a derived figure, and it is the check on the whole scheme: it
+    should always equal the magnitude of the `credits` recorded on the transaction. Where it
+    does not, the stored charge no longer follows from the policy that is said to have
+    produced it.
+    """
+
+    sku: Annotated[str, Field(description="The item consumed", examples=["cpu-seconds"])]
+    quantity: Annotated[float, Field(description="Units consumed, in the item's own unit", examples=[3600.0])]
+    credits_per_unit: Annotated[
+        ExactDecimal,
+        Field(description="The rate this SKU carried under the policy below", examples=["0.001"]),
+    ]
+    category: Annotated[
+        str,
+        Field(
+            description="The workspace category resolved when the charge was priced, not the category it has now",
+            examples=["academic"],
+        ),
+    ]
+    multiplier: Annotated[
+        ExactDecimal,
+        Field(description="The multiplier that category carried under the policy below", examples=["0.5"]),
+    ]
+    policy_version: Annotated[
+        int,
+        Field(description="The pricing policy version that priced this charge", examples=[3]),
+    ]
+    charge: Annotated[
+        ExactDecimal,
+        Field(
+            description=(
+                "quantity x credits_per_unit x multiplier, recomputed from the fields above. "
+                "Equals the magnitude of the transaction's `credits`."
+            ),
+            examples=["1.8"],
+        ),
+    ]
+
+
+class LedgerTransactionAPIResult(BaseModel):
+    """One movement of credits, and how it was reached.
+
+    `credits` is signed as stored: a usage debit is negative, a grant positive. That is what
+    makes a balance a plain sum, and it means the sign here is the direction of the movement
+    rather than a formatting choice.
+
+    `pricing` is null for a grant. A grant is not priced - a hub admin adds credits and
+    records why (T15) - so there is no arithmetic to show, and nesting the explanation says
+    that in the shape of the response rather than in a footnote about which fields are
+    meaningful.
+    """
+
+    uuid: UUID
+    workspace: Annotated[str, Field(description="The workspace charged or credited", examples=["my-workspace"])]
+    user: Annotated[
+        UUID | None,
+        Field(
+            description=(
+                "The user whose usage was charged. Null on a grant, which belongs to the "
+                "whole workspace pool rather than to one member."
+            ),
+        ),
+    ]
+    transaction_type: Annotated[
+        TransactionType,
+        Field(description="What kind of movement this is", examples=["debit"]),
+    ]
+    credits: Annotated[
+        ExactDecimal,
+        Field(
+            description="Credits moved, signed: negative for a usage debit, positive for a grant",
+            examples=["-1.8"],
+        ),
+    ]
+    occurred_at: Annotated[
+        UtcTimestamp,
+        Field(description="When the usage happened, or when the grant was made"),
+    ]
+    recorded_at: Annotated[
+        UtcTimestamp,
+        Field(
+            description=(
+                "When this service recorded the movement. Later than `occurred_at` for usage that was backfilled."
+            ),
+        ),
+    ]
+    reason: Annotated[
+        str | None,
+        Field(description="Why a grant or a correction was made. Null on a usage debit, which nobody initiated."),
+    ]
+    pricing: Annotated[
+        PricingExplanation | None,
+        Field(description="How the charge was computed. Null for a grant, which is not priced."),
+    ]
+
+    @classmethod
+    def of(cls, transaction: CreditLedgerTransaction) -> "LedgerTransactionAPIResult":
+        """Build the response, recomputing the pricing where there is any to recompute."""
+        return cls(
+            uuid=transaction.uuid,
+            workspace=transaction.workspace,
+            user=transaction.user,
+            transaction_type=transaction.transaction_type,
+            credits=transaction.credits,
+            occurred_at=transaction.occurred_at_utc,
+            recorded_at=transaction.recorded_at_utc,
+            reason=transaction.reason,
+            pricing=_explain(transaction),
+        )
+
+
+def _explain(transaction: CreditLedgerTransaction) -> PricingExplanation | None:
+    """Reproduce the arithmetic behind a charge, or None if there is none to reproduce.
+
+    None for a grant, which is not priced. The four fields are tested together rather than
+    trusting the transaction type, because it is their presence that decides whether the
+    arithmetic can be done - and `ck_credit_ledger_transaction_debit_is_priced` guarantees a
+    debit has them.
+
+    The charge is recomputed through `price_usage` and not by multiplying here, so the
+    explanation is produced by the same function that produced the charge. Writing the
+    multiplication out again would let the two drift, and an explanation that disagrees with
+    the ledger is worse than none.
+
+    Nothing catches `UnratedSKUError`. It would mean the policy that priced this row no longer
+    holds a rate for the SKU it priced, and a policy is immutable once written, so that is a
+    corrupted record rather than a case to report as "no explanation available".
+    """
+    policy = transaction.policy
+    item = transaction.item
+
+    if policy is None or item is None or transaction.category is None or transaction.quantity is None:
+        return None
+
+    priced = price_usage(
+        policy.rate_card(),
+        sku=item.sku,
+        quantity=transaction.quantity,
+        category=transaction.category,
+    )
+
+    return PricingExplanation(
+        sku=priced.sku,
+        quantity=priced.quantity,
+        credits_per_unit=priced.credits_per_unit,
+        # The resolved category rather than the stored one. They are the same for any row
+        # priced under this policy, and reporting the resolved one keeps the category and the
+        # multiplier beside it consistent with each other whatever happens.
+        category=priced.category,
+        multiplier=priced.multiplier,
+        policy_version=policy.version,
+        charge=priced.credits,
+    )
