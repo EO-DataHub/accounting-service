@@ -1,14 +1,5 @@
-"""The tables, and the queries over them.
-
-Every table lives here: `alembic/env.py` imports `metadata` from this module, and defining the
-classes is what populates it.
-
-Wrap a column in `col()` before reaching for a suppression. SQLModel declares fields as plain
-annotations, so `cls.sku == sku` types as a `bool` rather than as a SQL expression. Three
-things `col()` cannot fix, each suppressed on the line it occurs: `__tablename__`, which
-SQLModel declares as a `declared_attr`; `selectinload(...)`, which wants the attribute itself;
-and building a row through a relationship, where the generated `__init__` reports the foreign
-key as missing even though SQLAlchemy fills it in on flush.
+"""Wrap a column in `col()` before reaching for a suppression. SQLModel declares fields as plain
+annotations, so `cls.sku == sku` types as a `bool` rather than as a SQL expression.
 """
 
 import logging
@@ -52,9 +43,6 @@ from accounting_service.timestamps import as_utc, datetime_default_to_utc
 # The naming convention is set on SQLModel's own MetaData so that indexes, unique constraints,
 # check constraints, foreign keys and primary keys all get deterministic names. Alembic matches
 # constraints by name, so a later revision cannot reference one that was named by PostgreSQL.
-#
-# Check constraints still need naming in the model. Give the bare name; the convention adds the
-# ck_<table>_ prefix.
 SQLModel.metadata = MetaData(
     naming_convention={
         "ix": "ix_%(column_0_label)s",
@@ -66,12 +54,9 @@ SQLModel.metadata = MetaData(
 )
 
 
-# Re-exported so alembic/env.py depends on importing this module rather than on someone
-# remembering to: defining the table classes below is what populates the metadata.
 metadata = SQLModel.metadata
 
-# How many times to retry a version another replica claimed first. Two replicas racing is the
-# case worth handling; the loser re-reads and usually finds nothing left to do.
+# How many times to retry a version another replica claimed first.
 _MINT_ATTEMPTS = 3
 
 
@@ -80,20 +65,7 @@ def aware_timestamp(
     default: object = PydanticUndefined,
     index: bool = False,
 ) -> Any:  # noqa: ANN401 - SQLModel's Field() returns Any so it can be assigned to any field
-    """Declare a `timestamptz` column.
-
-    The one place the timezone decision is made. SQLModel maps a bare `datetime` to TIMESTAMP
-    WITHOUT TIME ZONE, which discards the offset on write and returns a naive value on read.
-
-    A function rather than an annotated type, because `Annotated[datetime, Field(sa_type=...)]`
-    does not compose: both `| None` and an explicit `Field(...)` discard the annotation's
-    metadata and silently revert the column.
-
-    `default` takes a value, None, or a SQL function such as func.now(). Left unset the column
-    has no default, which is what PydanticUndefined signals to SQLModel.
-    """
-    # SQLAlchemy wants the configured instance, which is why this passes
-    # TIMESTAMP(timezone=True) rather than TIMESTAMP.
+    """Declare a `timestamptz` column."""
     return SQLModelField(
         sa_type=TIMESTAMP(timezone=True),  # pyright: ignore[reportArgumentType]
         default=default,
@@ -102,19 +74,7 @@ def aware_timestamp(
 
 
 def pg_enum(values: "type[StrEnum]", name: str) -> Any:  # noqa: ANN401 - as aware_timestamp, SQLModel's Field() returns Any
-    """Declare a native PostgreSQL enum column over a `StrEnum`.
-
-    The sibling of `aware_timestamp()`, for the same reason: the obvious spelling is silently
-    wrong. `SAEnum(SomeEnum)` persists the member *names* - DEBIT, GRANT, REVERSAL - because
-    SQLAlchemy reads `.name` by default, where a `StrEnum`'s values are the storage form.
-    `values_callable` asks for the values instead.
-
-    `name` is explicit so a revision has a stable type name to create and drop. Renaming the
-    class must not rename a deployed type.
-
-    A revision using this must create the type before the table and drop it after. Alembic
-    autogenerates neither, and `drop_table` leaves the type behind.
-    """
+    """Declare a native PostgreSQL enum column over a `StrEnum`."""
     return SQLModelField(
         sa_type=SAEnum(values, name=name, values_callable=lambda enum: [member.value for member in enum]),  # pyright: ignore[reportArgumentType]
     )
@@ -157,18 +117,7 @@ class WorkspaceAccount(SQLModel, table=True):
 
 
 class WorkspaceCategory(SQLModel, table=True):
-    """Which pricing category a workspace is charged under (T6, D6).
-
-    A separate table from `workspace_account` because `record_mapping` is insert-only by design
-    and silently ignores a change. That is right for an account mapping and wrong for a
-    category, which D6 requires to be changeable.
-
-    No history is kept here. The ledger records the category resolved at pricing time, so
-    recategorising a workspace never rewrites what it was charged.
-
-    An absent row is not an error: an unassigned workspace prices under the policy's
-    `default_category` (D6).
-    """
+    """Which pricing category a workspace is charged under."""
 
     __tablename__ = "workspace_category"  # pyright: ignore[reportAssignmentType]
 
@@ -179,19 +128,12 @@ class WorkspaceCategory(SQLModel, table=True):
 
     @classmethod
     def category_for(cls, session: Session, workspace: str) -> str | None:
-        """The category assigned to this workspace, or None if it has none.
-
-        None rather than the default, because the default belongs to the policy and this table
-        does not know which policy is being applied. `RateCard.multiplier_for` resolves it.
-        """
+        """The category assigned to this workspace, or None if it has none."""
         return session.execute(select(col(cls.category)).where(col(cls.workspace) == workspace)).scalar_one_or_none()
 
     @classmethod
     def assign(cls, session: Session, workspace: str, category: str, updated_by: UUID | None = None) -> None:
-        """Set this workspace's category, replacing any existing assignment.
-
-        Does not commit: the caller owns the transaction.
-        """
+        """Set this workspace's category, replacing any existing assignment."""
         session.execute(
             insert(cls)
             .values(workspace=workspace, category=category, updated_at=func.now(), updated_by=updated_by)
@@ -207,17 +149,10 @@ class BillingItemBase(SQLModel):
     The fields a BillingItem has, shared by the table and the API response.
 
     A BillingItem is a thing we sell: a unit of CPU time, a unit of bandwidth, etc.
-
-    The Field arguments carry both concerns: `index` and `primary_key` are acted on only by the
-    table subclass, and the descriptions only by the OpenAPI schema.
-
-    `uuid` is declared here rather than on the table so that the column order matches what is
-    already deployed - base-class fields are emitted before subclass fields.
     """
 
     uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)  # Internal ID
 
-    # User-visible ID like 'cpusecs-computenodes'. 'sku' = 'stock-keeping unit'.
     sku: str = SQLModelField(
         index=True,
         description="Human-readable codename (SKU/stock-keeping unit) for the item",
@@ -234,14 +169,6 @@ class BillingItemBase(SQLModel):
 
 
 class BillingItem(BillingItemBase, table=True):
-    """
-    BillingItems should be pre-created, but if we see a BillingEvent referring to an unknown one
-    we auto-create it. The name and unit will be empty.
-
-    'User-visible' below is currently every item, and would become a filter if a deleted flag
-    or visibility rules were added.
-    """
-
     __tablename__ = "billing_item"  # pyright: ignore[reportAssignmentType]
 
     @classmethod
@@ -259,9 +186,7 @@ class BillingItem(BillingItemBase, table=True):
 
     @classmethod
     def ensure_sku_exists(cls, session: Session, sku: str) -> Self | None:
-        """
-        This creates a stub BillingItem for an SKU if none already exists.
-        """
+        """This creates a stub BillingItem for an SKU if none already exists."""
         rnd_uuid = uuid.uuid4()
         session.execute(
             text(
@@ -281,14 +206,9 @@ class BillingItem(BillingItemBase, table=True):
 
     @classmethod
     def upsert_configured_item(cls, session: Session, entry: ConfiguredItem) -> None:
-        """
-        Insert or update a BillingItem from a validated configuration entry.
+        """Insert or update a BillingItem from a validated configuration entry.
 
         The item is inserted when its SKU is unknown, otherwise its name and unit are updated.
-        Both are written unconditionally, because an entry describes the item completely.
-
-        Partial updates belong to the admin CLI, which fills the fields the operator omitted
-        from the stored row before building a document.
         """
         item_obj = cls.find_billing_item(session, entry.sku)
 
@@ -300,52 +220,37 @@ class BillingItem(BillingItemBase, table=True):
 
 
 def _next_version(session: Session) -> int:
-    """One past the highest version stored.
-
-    Module level so a test can monkeypatch it into colliding. The race cannot be provoked from
-    a single connection otherwise.
-    """
+    """One past the highest version stored."""
     return (session.execute(select(func.max(col(PricingPolicy.version)))).scalar() or 0) + 1
 
 
 class PricingPolicy(SQLModel, table=True):
-    """
-    One calibration pass, covering every rate at once (D3).
-
-    Rows are immutable once written. A correction adds a new policy pointing at the one it
+    """Rows are immutable once written. A correction adds a new policy pointing at the one it
     corrects through `corrects_id`, which is what lets an already-charged period be re-priced
-    without destroying the record of what was charged at the time (D8).
+    without destroying the record of what was charged at the time.
 
     Bi-temporal. `valid_from` and `valid_until` say which usage the policy applies to;
     `configured_at` says when the decision was taken. Resolution orders by `configured_at`
-    descending, so a correcting policy wins over the policy it corrects (T5).
-
-    There is no index on the validity columns. A policy is one deliberate calibration pass, so
-    this table holds a handful of rows.
+    descending, so a correcting policy wins over the policy it corrects.
     """
 
     __tablename__ = "pricing_policy"  # pyright: ignore[reportAssignmentType]
 
     uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
 
-    # Human-usable identifier, minted as max + 1 by the loader (T4). Unique is what a database
-    # can enforce; monotonic is a property of how the loader assigns it. The constraint matters
-    # because the loader runs on every ingester pod start, so two replicas can race.
     version: int = SQLModelField(unique=True)
 
     valid_from: datetime = aware_timestamp()
     valid_until: datetime | None = aware_timestamp(default=None)
     configured_at: datetime = aware_timestamp(default=func.now())
 
-    # Set when this policy corrects an earlier one (D8). A bare foreign key with no relationship
-    # attribute: following it is an audit path (T19) that can query by uuid, and a
-    # self-referential relationship would need a `remote_side` to earn its keep.
+    # Set when this policy corrects an earlier one.
     corrects_id: UUID | None = SQLModelField(default=None, foreign_key="pricing_policy.uuid")
 
-    # Applied to a workspace that has no category assignment yet (D6).
+    # Applied to a workspace that has no category assignment yet.
     default_category: str
 
-    # Why this calibration happened. Feeds the audit log (T19).
+    # Why this calibration happened. Feeds the audit log.
     reason: str | None = None
 
     rates: list["PricingPolicyRate"] = Relationship(back_populates="policy")
@@ -360,14 +265,7 @@ class PricingPolicy(SQLModel, table=True):
 
     @classmethod
     def current(cls, session: Session) -> Self | None:
-        """The policy in force, or None when none has been loaded yet.
-
-        The most recently configured policy, not the one with the latest `valid_from`: a
-        correction is configured after the policy it corrects but backdated to cover the same
-        period, so `configured_at` decides between them (D8). Ties break on `version`
-        descending, because `configured_at` is the transaction timestamp and two policies
-        minted together share it.
-        """
+        """The policy in force, or None when none has been loaded yet."""
         return (
             session.execute(
                 select(cls)
@@ -384,11 +282,9 @@ class PricingPolicy(SQLModel, table=True):
         """The policy that prices usage occurring at `at`, or None when none is stored.
 
         The most recently configured policy whose `valid_from` is at or before `at`, ties
-        breaking on `version` descending (D8).
+        breaking on `version` descending.
 
-        When `at` predates every policy, the earliest policy prices it (D10) - the case of an
-        event backfilled from before the first calibration. The alternatives were to skip the
-        event, losing a charge silently, or to park it for retry, which needs a queue.
+        When `at` predates every policy, the earliest policy prices it.
 
         Distinct from `current()`, which ignores validity and answers "what did we configure
         last" for the loader. A policy dated next month is the last configured and prices
@@ -421,12 +317,7 @@ class PricingPolicy(SQLModel, table=True):
         )
 
     def rate_card(self) -> RateCard:
-        """This policy's numbers, in the form pricing needs them (T7).
-
-        The counterpart to `fingerprint`, and the same projection: a stored policy and the
-        document that minted it price identically, because both become the same value object
-        before any arithmetic happens.
-        """
+        """This policy's numbers, in the form pricing needs them."""
         return RateCard.of(
             default_category=self.default_category,
             rates=[(rate.item.sku, rate.credits_per_unit) for rate in self.rates],
@@ -523,16 +414,7 @@ class PricingPolicy(SQLModel, table=True):
 
 
 class PricingPolicyRate(SQLModel, table=True):
-    """
-    The credits charged per unit of one SKU under one policy.
-
-    One row per SKU per policy. T7 prices an event from this rate, the event's quantity and the
-    multiplier for the workspace's category.
-
-    The unique constraint on `(policy_id, item_id)` is what makes a policy well formed: a
-    second rate for the same SKU would make a charge depend on which row a query returned
-    first.
-    """
+    """The credits charged per unit of one SKU under one policy."""
 
     __tablename__ = "pricing_policy_rate"  # pyright: ignore[reportAssignmentType]
 
@@ -548,12 +430,9 @@ class PricingPolicyRate(SQLModel, table=True):
 
 
 class PricingPolicyCategoryMultiplier(SQLModel, table=True):
-    """
-    The multiplier applied to every rate in one policy, for one workspace category.
+    """The multiplier applied to every rate in one policy, for one workspace category.
 
-    A category is a plain string rather than an enum, because the set is defined by the
-    configuration document and by whatever the workspace service sends, not here. An unknown
-    category resolves to `default_category` (D6), so a value nobody has configured is a pricing
+    An unknown category resolves to `default_category`, so a value nobody has configured is a pricing
     decision rather than a validation failure.
     """
 
@@ -570,14 +449,7 @@ class PricingPolicyCategoryMultiplier(SQLModel, table=True):
 
 
 def _policy_load_options() -> tuple[_AbstractLoad, ...]:
-    """Eager-load a policy's rates, their items, and its category multipliers.
-
-    Every read of a policy needs all three, and walking `rate.item` per row would be a query
-    each.
-
-    The suppressions live here rather than at each call site: `selectinload` wants the
-    attribute itself, and nothing satisfies both the checker and SQLAlchemy.
-    """
+    """Eager-load a policy's rates, their items, and its category multipliers."""
     return (
         selectinload(PricingPolicy.rates).selectinload(  # pyright: ignore[reportArgumentType]
             PricingPolicyRate.item  # pyright: ignore[reportArgumentType]
@@ -587,13 +459,7 @@ def _policy_load_options() -> tuple[_AbstractLoad, ...]:
 
 
 class TimeAggregation(StrEnum):
-    """
-    Periods that usage data can be totalled over.
-
-    A closed set. The value is interpolated into SQL in find_billing_events, so the permitted
-    values are a security boundary as well as a validation rule, and an unrecognised one is
-    rejected rather than ignored.
-    """
+    """Periods that usage data can be totalled over."""
 
     DAY = "day"
     MONTH = "month"
@@ -606,8 +472,7 @@ class AfterBillingEventNotFound(Exception):
 
 
 class BillingEvent(SQLModel, table=True):
-    """
-    This records a particular workspace's consumption of a particular BillingItem at a particular
+    """This records a particular workspace's consumption of a particular BillingItem at a particular
     time or over a particular period. This consumption is priced at its start date.
 
     BillingEvents can be aggregated over time. A series of billing events can be combined if
@@ -824,9 +689,7 @@ GROUP BY 2, 3, 4, 6
         workspace: str | None,
         sku: str | None,
     ) -> Self | None:
-        """
-        Returns the most recent BillingEvent, optionally constrained by workspace and item.
-        """
+        """Returns the most recent BillingEvent, optionally constrained by workspace and item."""
         query = select(cls).order_by(col(cls.event_end).desc()).limit(1)
 
         if workspace is not None:
@@ -839,8 +702,7 @@ GROUP BY 2, 3, 4, 6
 
     @classmethod
     def insert_from_message(cls, session: Session, msg: eodhp_utils.pulsar.messages.BillingEvent) -> UUID | None:
-        """
-        Adds a new BillingEvent to the DB based on a Pulsar message.
+        """Adds a new BillingEvent to the DB based on a Pulsar message.
 
         Deals with duplicated UUIDs by ignoring the second message and returning None.
         """
@@ -875,8 +737,7 @@ GROUP BY 2, 3, 4, 6
 
 
 class BillableResourceConsumptionRateSample(SQLModel, table=True):
-    """
-    A consumption rate sample is a point-in-time sample of the rate at which a user is consuming a
+    """A consumption rate sample is a point-in-time sample of the rate at which a user is consuming a
     billed-for resources, typically storage but it could be any other resource where the time it's
     held for is the basis for the charge.
 
@@ -886,6 +747,8 @@ class BillableResourceConsumptionRateSample(SQLModel, table=True):
 
     Samples are used to generate estimated BillingEvents periodically by, effectively, interpolating
     between samples and integrating.
+
+    If we go for a separate billing system for non-transient items such as storage, this table can go.
     """
 
     __tablename__ = "billing_resource_consumption_rate_sample"  # pyright: ignore[reportAssignmentType]
@@ -945,7 +808,8 @@ class BillableResourceConsumptionRateSample(SQLModel, table=True):
         cls, session: Session, workspace: str, sku: str, start: datetime, end: datetime
     ) -> Sequence[Self]:
         """The samples covering an interval: the last one before it, those inside it, and the
-        first one after it. The bracketing samples are what make interpolation possible."""
+        first one after it. The bracketing samples are what make interpolation possible.
+        """
         item_subquery = select(col(BillingItem.uuid)).where(col(BillingItem.sku) == sku).scalar_subquery()
         last_before_start = (
             select(cls)
@@ -980,8 +844,7 @@ class BillableResourceConsumptionRateSample(SQLModel, table=True):
     def calculate_consumption_for_interval(
         cls, session: Session, workspace: str, sku: str, start: datetime, end: datetime
     ) -> float | None:
-        """
-        This calculates estimated consumption within a time interval, using linear interpolation
+        """This calculates estimated consumption within a time interval, using linear interpolation
         to estimate consumption rates from samples and then (effectively) integrating.
 
         It's assumed that the resource did not exist (zero consumption rate) before the first
@@ -1006,9 +869,7 @@ class BillableResourceConsumptionRateSample(SQLModel, table=True):
         workspace: str | None,
         item_id: UUID | None,
     ) -> Self | None:
-        """
-        Returns the first observed sample for the given constraints.
-        """
+        """Returns the first observed sample for the given constraints."""
         query = select(cls).order_by(col(cls.sample_time)).limit(1)
 
         if workspace is not None:
@@ -1034,10 +895,6 @@ class BillableResourceConsumptionRateSample(SQLModel, table=True):
 class TransactionType(StrEnum):
     """What kind of act a ledger row records.
 
-    Metadata, not arithmetic: the sign on `credits` carries the arithmetic, so nothing has to
-    know the type to total a balance correctly. The type is what an audit surface reports (T19)
-    and what the idempotency index keys on.
-
     Adding a value later is straightforward; removing or renaming one needs a replacement type
     and a swap of every column using it, so the value set is worth choosing deliberately.
     """
@@ -1048,24 +905,12 @@ class TransactionType(StrEnum):
 
 
 class CreditLedgerTransaction(SQLModel, table=True):
-    """One movement of credits: a usage debit, an admin grant, or a correction (T8).
+    """One movement of credits: a usage debit, an admin grant, or a correction.
 
-    Append-only. A correction is a new row referencing the one it corrects (D7). So concurrent
+    Append-only. A correction is a new row referencing the one it corrects. So concurrent
     debits never contend for a row, a balance needs no lock and no mutable total, and every row
     records what was actually charged at the time - which is what lets a period be re-priced
-    without destroying that record (D8).
-
-    A balance is `SUM(credits)`. Debits are stored negative and grants positive, so the sign
-    carries the arithmetic and `transaction_type` decides nothing about a total. Pricing returns
-    a positive charge and this is where it acquires its sign.
-
-    `quantity`, `policy_id` and `category` are stored beside the result, so the charge can be
-    recomputed from first principles months later. T13, T18 and T19 all read them. `category` is
-    the one resolved at pricing time, so recategorising a workspace does not rewrite its past.
-
-    `credits` is an unconstrained NUMERIC: nothing is rounded on the way in, so fixing a scale
-    here would make a replay reproduce the scale in force when the replay ran rather than the
-    policy.
+    without destroying that record.
     """
 
     __tablename__ = "credit_ledger_transaction"  # pyright: ignore[reportAssignmentType]
@@ -1074,8 +919,8 @@ class CreditLedgerTransaction(SQLModel, table=True):
 
     workspace: str
 
-    # Denormalised from the billing event rather than joined through it. Per-user budgets (T16)
-    # and the per-user usage filter (T12) both need it, and a grant has no billing event to join
+    # Denormalised from the billing event rather than joined through it. Per-user budgets
+    # and the per-user usage filter both need it, and a grant has no billing event to join
     # through, so under a join every grant would have no user at all. Null on a grant marks it
     # as belonging to the whole workspace pool.
     user: UUID | None = SQLModelField(default=None)
@@ -1103,13 +948,13 @@ class CreditLedgerTransaction(SQLModel, table=True):
     occurred_at: datetime = aware_timestamp()
     recorded_at: datetime = aware_timestamp(default=func.now())
 
-    # Corrections (T17, T18). `correction_batch_id` has no foreign key yet - T17 adds the
+    # Corrections. `correction_batch_id` has no foreign key yet - adds the
     # `correction_batch` table and the constraint with it - but the column exists now because
     # the idempotency index below tests it.
     reverses_id: UUID | None = SQLModelField(default=None, foreign_key="credit_ledger_transaction.uuid")
     correction_batch_id: UUID | None = SQLModelField(default=None)
 
-    # The hub_admin responsible, for a grant or a correction. Null on a usage debit.
+    # The hub_admin responsible for a grant or a correction. Null on a usage debit.
     created_by: UUID | None = SQLModelField(default=None)
     reason: str | None = None
 
@@ -1127,7 +972,7 @@ class CreditLedgerTransaction(SQLModel, table=True):
     __table_args__ = (
         # One original debit per billing event, while still allowing correction rows against
         # that same event: a plain unique constraint on billing_event_id would block re-pricing
-        # entirely (T18).
+        # entirely.
         #
         # The WHERE clause is load-bearing in both directions. PostgreSQL treats NULLs as
         # distinct in a unique index, so without it correction rows would not be constrained at
@@ -1145,7 +990,7 @@ class CreditLedgerTransaction(SQLModel, table=True):
         ),
         # A debit is priced, so it has a policy and a category. Stated as a rule about debits
         # rather than as an equivalence with "is a grant", because a reversal of a debit carries
-        # the original's policy (D7) while a reversal of a grant would carry none.
+        # the original's policy while a reversal of a grant would carry none.
         CheckConstraint(
             "transaction_type <> 'debit' OR (policy_id IS NOT NULL AND category IS NOT NULL)",
             name="debit_is_priced",
@@ -1160,7 +1005,7 @@ class CreditLedgerTransaction(SQLModel, table=True):
         priced: PricedUsage,
         policy_id: UUID,
     ) -> UUID | None:
-        """Charge a billing event, or return None if it has already been charged (T9).
+        """Charge a billing event, or return None if it has already been charged.
 
         The charge arrives positive from `price_usage` and is stored negated.
 
@@ -1211,10 +1056,10 @@ class CreditLedgerTransaction(SQLModel, table=True):
 
         Positive, and carrying no policy or category: a grant is not priced. `user` is left
         null, which marks the grant as belonging to the whole workspace rather than to one
-        member (D5).
+        member.
 
-        `reason` is required. A grant is a privileged write with no payment behind it (D2), so
-        the audit log (T19) has nothing to show but the reason somebody gave.
+        `reason` is required. A grant is a privileged write with no payment behind it, so
+        the audit log has nothing to show but the reason somebody gave.
 
         Not idempotent: two identical grants are two grants, because unlike a redelivered
         billing event there is no natural key saying they are the same act.
@@ -1237,7 +1082,7 @@ class CreditLedgerTransaction(SQLModel, table=True):
 
     @classmethod
     def balance(cls, session: Session, workspace: str, user: UUID | None = None) -> Decimal:
-        """The workspace's credit balance, or one user's net spend within it (T10).
+        """The workspace's credit balance, or one user's net spend within it.
 
         The latest snapshot plus every row recorded after it. With no snapshot stored this reads
         the whole ledger and is still correct, which is what lets a snapshot be rebuilt or
@@ -1248,7 +1093,7 @@ class CreditLedgerTransaction(SQLModel, table=True):
         outside the delta, and vanish from the balance.
 
         Passing `user` gives that user's net spend against the shared pool rather than an
-        allowance of their own: grants carry no user, so they are not in the sum (D5, T16).
+        allowance of their own: grants carry no user, so they are not in the sum.
         """
         snapshot = CreditBalanceSnapshot.latest(session, workspace, user)
         opening = snapshot.balance if snapshot else Decimal(0)
@@ -1265,11 +1110,11 @@ class CreditLedgerTransaction(SQLModel, table=True):
 
     @classmethod
     def find_transaction(cls, session: Session, uuid_: UUID, workspace: str | None = None) -> Self | None:
-        """One transaction, with everything needed to explain the charge loaded (T13).
+        """One transaction, with everything needed to explain the charge loaded.
 
         The policy comes with its rates and multipliers, because the explanation recomputes the
         charge rather than reading it back: the row stores the quantity, the policy and the
-        resolved category but not the rate or the multiplier (D8).
+        resolved category but not the rate or the multiplier.
 
         `workspace` scopes the lookup. A transaction UUID is not a capability, so an endpoint
         under /workspaces/{workspace}/ must not hand back a row belonging to another workspace
@@ -1298,8 +1143,8 @@ class CreditLedgerTransaction(SQLModel, table=True):
         Ordered on `recorded_at`, the order they were written rather than the order the usage
         happened in, so a backfilled event appears at the top where it can be noticed.
 
-        For the admin CLI. The API's ledger endpoint (T12) is a different query: it groups and
-        nets, because an individual reversal must not appear there as an event of its own (D12).
+        For the admin CLI. The API's ledger endpoint is a different query: it groups and
+        nets, because an individual reversal must not appear there as an event of its own.
         """
         return (
             session.execute(
@@ -1329,7 +1174,7 @@ class CreditBalanceSnapshot(SQLModel, table=True):
 
     An optimisation and not a source of truth: the ledger alone always gives the right answer,
     so a snapshot can be rebuilt or thrown away at any time. Nothing writes one yet. What this
-    table buys is a cheap balance for the budget checks that run on every billing event (T16).
+    table buys is a cheap balance for the budget checks that run on every billing event.
 
     `as_of` is compared against `recorded_at`, never `occurred_at`. A backfilled event carries
     an old `occurred_at`, and on that column it would be counted in neither the snapshot nor
