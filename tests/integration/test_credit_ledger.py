@@ -478,6 +478,47 @@ class TestTheBalance:
 
         assert CreditLedgerTransaction.balance(db_session, WORKSPACE) == Decimal(107)
 
+    def test_one_instant_cannot_be_snapshotted_twice_for_the_whole_pool(self, db_session: Session) -> None:
+        """The reason uniqueness is two partial indexes rather than one constraint.
+
+        The whole-pool row has a null user, and PostgreSQL counts two nulls as different
+        values, so an ordinary unique constraint would let this through and `latest` would
+        have two rows to choose between. `UNIQUE NULLS NOT DISTINCT` says it in one line and
+        is PostgreSQL 15; deployed databases are 14, so the pair of partial indexes says it
+        instead. Only PostgreSQL can answer whether the write is refused.
+        """
+        cut = datetime(2026, 1, 1, tzinfo=UTC)
+
+        db_session.add(CreditBalanceSnapshot(workspace=WORKSPACE, user=None, as_of=cut, balance=Decimal(100)))
+        db_session.add(CreditBalanceSnapshot(workspace=WORKSPACE, user=None, as_of=cut, balance=Decimal(999)))
+
+        with pytest.raises(IntegrityError):
+            db_session.commit()
+
+    def test_one_instant_cannot_be_snapshotted_twice_for_one_user(self, db_session: Session) -> None:
+        """The other half of the pair, covering the rows that do name a user."""
+        cut = datetime(2026, 1, 1, tzinfo=UTC)
+        user = uuid4()
+
+        db_session.add(CreditBalanceSnapshot(workspace=WORKSPACE, user=user, as_of=cut, balance=Decimal(100)))
+        db_session.add(CreditBalanceSnapshot(workspace=WORKSPACE, user=user, as_of=cut, balance=Decimal(999)))
+
+        with pytest.raises(IntegrityError):
+            db_session.commit()
+
+    def test_a_user_and_the_whole_pool_share_an_instant(self, db_session: Session) -> None:
+        """The pair must not over-constrain: a per-user snapshot and the whole-pool total are
+        different rows and both belong at the same cut.
+        """
+        cut = datetime(2026, 1, 1, tzinfo=UTC)
+
+        db_session.add(CreditBalanceSnapshot(workspace=WORKSPACE, user=None, as_of=cut, balance=Decimal(100)))
+        db_session.add(CreditBalanceSnapshot(workspace=WORKSPACE, user=uuid4(), as_of=cut, balance=Decimal(40)))
+        db_session.add(CreditBalanceSnapshot(workspace=WORKSPACE, user=uuid4(), as_of=cut, balance=Decimal(60)))
+        db_session.commit()
+
+        assert CreditBalanceSnapshot.latest(db_session, WORKSPACE) is not None
+
     def test_the_latest_snapshot_wins(self, db_session: Session) -> None:
         """Snapshots accumulate, keyed on `as_of`. Reading an older one would double-count
         everything between the two."""
