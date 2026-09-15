@@ -1,58 +1,96 @@
-import itertools
+"""Wrap a column in `col()` before reaching for a suppression. SQLModel declares fields as plain
+annotations, so `cls.sku == sku` types as a `bool` rather than as a SQL expression.
+"""
+
 import logging
 import uuid
-from collections import namedtuple
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 from typing import Any, Self
 from uuid import UUID, uuid4
 
 import eodhp_utils.pulsar.messages
+from pydantic_core import PydanticUndefined
 from sqlalchemy import (
     TIMESTAMP,
     CheckConstraint,
     CursorResult,
-    ForeignKey,
     Index,
-    Result,
-    Uuid,
+    MetaData,
+    UniqueConstraint,
     and_,
     func,
     or_,
     select,
     text,
     union,
-    update,
 )
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import (
-    DeclarativeBase,
-    Mapped,
-    Session,
-    aliased,
-    mapped_column,
-    relationship,
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, aliased, selectinload
+from sqlalchemy.orm.strategy_options import _AbstractLoad
+from sqlmodel import Field as SQLModelField
+from sqlmodel import Relationship, SQLModel, col
+
+from accounting_service.configuration import ConfiguredItem
+from accounting_service.consumption import ConsumptionWindow, RateSample, estimate_consumption
+from accounting_service.pricing import ConfiguredPolicy, PolicyFingerprint, PricedUsage, RateCard
+from accounting_service.timestamps import as_utc, datetime_default_to_utc
+
+# The naming convention is set on SQLModel's own MetaData so that indexes, unique constraints,
+# check constraints, foreign keys and primary keys all get deterministic names. Alembic matches
+# constraints by name, so a later revision cannot reference one that was named by PostgreSQL.
+SQLModel.metadata = MetaData(
+    naming_convention={
+        "ix": "ix_%(column_0_label)s",
+        "uq": "uq_%(table_name)s_%(column_0_name)s",
+        "ck": "ck_%(table_name)s_%(constraint_name)s",
+        "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+        "pk": "pk_%(table_name)s",
+    }
 )
 
-from accounting_service import db_settings
+
+metadata = SQLModel.metadata
+
+# How many times to retry a version another replica claimed first.
+_MINT_ATTEMPTS = 3
 
 
-class Base(DeclarativeBase):
-    pass
+def aware_timestamp(
+    *,
+    default: object = PydanticUndefined,
+    index: bool = False,
+) -> Any:  # noqa: ANN401 - SQLModel's Field() returns Any so it can be assigned to any field
+    """Declare a `timestamptz` column."""
+    return SQLModelField(
+        sa_type=TIMESTAMP(timezone=True),  # pyright: ignore[reportArgumentType]
+        default=default,
+        index=index,
+    )
 
 
-class WorkspaceAccount(Base):
+def pg_enum(values: "type[StrEnum]", name: str) -> Any:  # noqa: ANN401 - as aware_timestamp, SQLModel's Field() returns Any
+    """Declare a native PostgreSQL enum column over a `StrEnum`."""
+    return SQLModelField(
+        sa_type=SAEnum(values, name=name, values_callable=lambda enum: [member.value for member in enum]),  # pyright: ignore[reportArgumentType]
+    )
+
+
+class WorkspaceAccount(SQLModel, table=True):
     """
     This records which account contains each workspace.
 
     This is not the authoritative data, which is held by the workspace service and sent via Pulsar.
     """
 
-    __tablename__ = "workspace_account"
+    __tablename__ = "workspace_account"  # pyright: ignore[reportAssignmentType]
 
-    workspace: Mapped[str] = mapped_column(index=True, primary_key=True)
-    account: Mapped[UUID] = mapped_column(index=True)
+    workspace: str = SQLModelField(index=True, primary_key=True)
+    account: UUID = SQLModelField(index=True)
 
     @staticmethod
     def record_mapping(session: Session, account: UUID, workspace: str) -> bool:
@@ -69,7 +107,7 @@ class WorkspaceAccount(Base):
             [
                 {
                     "workspace": workspace,
-                    "account": (account.hex if db_settings.is_sqlite() else account),
+                    "account": account,
                 }
             ],
         )
@@ -78,45 +116,77 @@ class WorkspaceAccount(Base):
         return result.rowcount > 0
 
 
-class BillingItem(Base):
+class WorkspaceCategory(SQLModel, table=True):
+    """Which pricing category a workspace is charged under."""
+
+    __tablename__ = "workspace_category"  # pyright: ignore[reportAssignmentType]
+
+    workspace: str = SQLModelField(primary_key=True)
+    category: str
+    updated_at: datetime = aware_timestamp(default=func.now())
+    updated_by: UUID | None = SQLModelField(default=None)
+
+    @classmethod
+    def category_for(cls, session: Session, workspace: str) -> str | None:
+        """The category assigned to this workspace, or None if it has none."""
+        return session.execute(select(col(cls.category)).where(col(cls.workspace) == workspace)).scalar_one_or_none()
+
+    @classmethod
+    def assign(cls, session: Session, workspace: str, category: str, updated_by: UUID | None = None) -> None:
+        """Set this workspace's category, replacing any existing assignment."""
+        session.execute(
+            insert(cls)
+            .values(workspace=workspace, category=category, updated_at=func.now(), updated_by=updated_by)
+            .on_conflict_do_update(
+                index_elements=["workspace"],
+                set_={"category": category, "updated_at": func.now(), "updated_by": updated_by},
+            )
+        )
+
+
+class BillingItemBase(SQLModel):
     """
+    The fields a BillingItem has, shared by the table and the API response.
+
     A BillingItem is a thing we sell: a unit of CPU time, a unit of bandwidth, etc.
-
-    BillingItems should be pre-created, but if we see a BillingEvent referring to an unknown one
-    we auto-create it. The name and unit will be empty.
     """
 
-    __tablename__ = "billing_item"
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)  # Internal ID
 
-    uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)  # Internal ID
-    sku: Mapped[str] = mapped_column(
-        index=True
-    )  # User-visible ID like 'cpusecs-computenodes'. 'sku' = 'stock-keeping unit'.
-    name: Mapped[str]  # User-visible name like 'CPU time in notebooks and workflows'
-    unit: Mapped[str]  # Units, like seconds or GB-hours
+    sku: str = SQLModelField(
+        index=True,
+        description="Human-readable codename (SKU/stock-keeping unit) for the item",
+        schema_extra={"examples": ["wfcpu"]},
+    )
+    name: str = SQLModelField(
+        description="Human-readable name for the item",
+        schema_extra={"examples": ["Workflow CPU seconds"]},
+    )
+    unit: str = SQLModelField(
+        description="Unit the item is priced in",
+        schema_extra={"examples": ["GB-months"]},
+    )
+
+
+class BillingItem(BillingItemBase, table=True):
+    __tablename__ = "billing_item"  # pyright: ignore[reportAssignmentType]
 
     @classmethod
     def find_billing_items(cls, session: Session) -> Iterator[Self]:
         """Returns all user-visible BillingItems in order of SKU."""
-        # This is currently all BillingItems but this could change if we add a 'deleted' flag
-        # or some visibility rules.
         query = select(cls).order_by(cls.sku)
         return map(lambda r: r[0], session.execute(query))
 
     @classmethod
     def find_billing_item(cls, session: Session, sku: str) -> Self | None:
         """Returns a specified BillingItem, assuming it's visible."""
-        # This is currently any BillingItem but this could change if we add a 'deleted' flag
-        # or some visibility rules.
-        query = select(cls).where(cls.sku == sku)
+        query = select(cls).where(col(cls.sku) == sku)
         result = session.execute(query).first()
         return result[0] if result else None
 
     @classmethod
     def ensure_sku_exists(cls, session: Session, sku: str) -> Self | None:
-        """
-        This creates a stub BillingItem for an SKU if none already exists.
-        """
+        """This creates a stub BillingItem for an SKU if none already exists."""
         rnd_uuid = uuid.uuid4()
         session.execute(
             text(
@@ -129,153 +199,270 @@ class BillingItem(Base):
             [
                 {
                     "sku": sku,
-                    "uuid": (rnd_uuid.hex if db_settings.is_sqlite() else rnd_uuid),
+                    "uuid": rnd_uuid,
                 }
             ],
         )
 
     @classmethod
-    def upsert_configured_item(cls, session: Session, item: dict[str, Any]) -> None:
+    def upsert_configured_item(cls, session: Session, entry: ConfiguredItem) -> None:
+        """Insert or update a BillingItem from a validated configuration entry.
+
+        The item is inserted when its SKU is unknown, otherwise its name and unit are updated.
         """
-        This aimed at inserting or updating BillingItems based on a database-independent source
-        such as a YAML configuration file. 'item' should have fields 'sku', 'name' and 'unit'.
-        An item will be inserted if the SKU isn't known, otherwise name and unit will be updated.
-        """
-        item_obj = cls.find_billing_item(session, item["sku"])
+        item_obj = cls.find_billing_item(session, entry.sku)
+
         if item_obj:
-            if "name" in item:
-                item_obj.name = item["name"]
-            if "unit" in item:
-                item_obj.unit = item["unit"]
+            item_obj.name = entry.name
+            item_obj.unit = entry.unit
         else:
-            item_obj = BillingItem(**item)
-            session.add(item_obj)
+            session.add(BillingItem(sku=entry.sku, name=entry.name, unit=entry.unit))
 
 
-class BillingItemPrice(Base):
-    """
-    How much we charged for a particular item between a particular time range. `valid_until` will
-    be None for the current price.
+def _next_version(session: Session) -> int:
+    """One past the highest version stored."""
+    return (session.execute(select(func.max(col(PricingPolicy.version)))).scalar() or 0) + 1
 
-    To determine the price at time <x> use
-        SELECT price FROM BillingItemPrice
-            WHERE item=<item>
-              AND valid_from <= <x> and valid_until > <x>
-              ORDER BY configured_at DESC
-              LIMIT 1
 
-    Once created these must not change except for setting `valid_until` to the current time when
-    creating a new BillingItemPrice to replace it. If historical prices must be changed then this
-    is done by creating a new BillingItemPrice with an overlapping or identical time range but
-    setting `configured_at` to the time of configuration. This means we always have a record
-    of prices presented to users at any time in the past.
+class PricingPolicy(SQLModel, table=True):
+    """Rows are immutable once written. A correction adds a new policy pointing at the one it
+    corrects through `corrects_id`, which is what lets an already-charged period be re-priced
+    without destroying the record of what was charged at the time.
 
-    We support only a single price, not varying prices for different users or workspaces, tiered
-    prices, etc.
+    Bi-temporal. `valid_from` and `valid_until` say which usage the policy applies to;
+    `configured_at` says when the decision was taken. Resolution orders by `configured_at`
+    descending, so a correcting policy wins over the policy it corrects.
     """
 
-    __tablename__ = "billing_item_price"
+    __tablename__ = "pricing_policy"  # pyright: ignore[reportAssignmentType]
 
-    uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
-    item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
-    price: Mapped[Decimal]  # This is in pounds.
-    valid_from: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
-    valid_until: Mapped[datetime | None] = mapped_column(
-        TIMESTAMP(timezone=True)
-    )  # None for current price, a time in the past otherwise.
-    configured_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), default=func.now()
-    )  # Set to the current time at the time this row is added.
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
 
-    @property
-    def valid_from_utc(self) -> datetime:
-        return self.valid_from.astimezone(UTC)
+    version: int = SQLModelField(unique=True)
 
-    @property
-    def valid_until_utc(self) -> datetime | None:
-        return self.valid_until and self.valid_until.astimezone(UTC)
+    valid_from: datetime = aware_timestamp()
+    valid_until: datetime | None = aware_timestamp(default=None)
+    configured_at: datetime = aware_timestamp(default=func.now())
+
+    # Set when this policy corrects an earlier one.
+    corrects_id: UUID | None = SQLModelField(default=None, foreign_key="pricing_policy.uuid")
+
+    # Applied to a workspace that has no category assignment yet.
+    default_category: str
+
+    # Why this calibration happened. Feeds the audit log.
+    reason: str | None = None
+
+    rates: list["PricingPolicyRate"] = Relationship(back_populates="policy")
+    category_multipliers: list["PricingPolicyCategoryMultiplier"] = Relationship(back_populates="policy")
 
     __table_args__ = (
-        Index(
-            "billingitemprice_item_validfrom_index",
-            "item_id",
-            "valid_from",
+        CheckConstraint(
+            "valid_until IS NULL OR valid_from <= valid_until",
+            name="validity_order",
         ),
-        CheckConstraint("valid_until IS NULL OR valid_from <= valid_until"),
     )
 
     @classmethod
-    def find_prices(cls, session: Session, at: datetime) -> Result[tuple[Self, str]]:
-        """Returns all prices valid at the specified time. Each result is a tuple containing a
-        BillingItemPrice first and the associated SKU second."""
-        query = (
-            select(cls, BillingItem.sku)
-            .join(cls.item)
-            .where(cls.valid_from <= at)
-            .where(
-                or_(
-                    cls.valid_until == None,  # noqa: E711
-                    cls.valid_until > at,
-                )
+    def current(cls, session: Session) -> Self | None:
+        """The policy in force, or None when none has been loaded yet."""
+        return (
+            session.execute(
+                select(cls)
+                .options(*_policy_load_options())
+                .order_by(col(cls.configured_at).desc(), col(cls.version).desc())
+                .limit(1)
             )
-            .order_by(BillingItem.sku, cls.valid_from)
+            .scalars()
+            .first()
         )
-
-        return session.execute(query)
 
     @classmethod
-    def upsert_configured_price(cls, session: Session, price: dict[str, Any]) -> None:
+    def resolve(cls, session: Session, at: datetime) -> Self | None:
+        """The policy that prices usage occurring at `at`, or None when none is stored.
+
+        The most recently configured policy whose `valid_from` is at or before `at`, ties
+        breaking on `version` descending.
+
+        When `at` predates every policy, the earliest policy prices it.
+
+        Distinct from `current()`, which ignores validity and answers "what did we configure
+        last" for the loader. A policy dated next month is the last configured and prices
+        nothing today.
         """
-        This aimed at inserting or updating prices based on a database-independent source
-        such as a YAML configuration file. 'price' must contain 'sku', 'price' and 'valid_from'.
+        applicable = (
+            select(cls)
+            .options(*_policy_load_options())
+            .where(col(cls.valid_from) <= at)
+            .order_by(col(cls.configured_at).desc(), col(cls.version).desc())
+            .limit(1)
+        )
 
-        'valid_from' must either be newer than the current price, in which case the new price
-        will replace it at that time, or must exactly match an existing configured price, in
-        which case its price will be updated.
+        if policy := session.execute(applicable).scalars().first():
+            return policy
+
+        earliest = (
+            select(cls).options(*_policy_load_options()).order_by(col(cls.valid_from), col(cls.version)).limit(1)
+        )
+
+        return session.execute(earliest).scalars().first()
+
+    def fingerprint(self) -> PolicyFingerprint:
+        """What this policy would have to match for a document to leave it alone."""
+        return PolicyFingerprint.of(
+            valid_from=self.valid_from,
+            default_category=self.default_category,
+            rates=[(rate.item.sku, rate.credits_per_unit) for rate in self.rates],
+            category_multipliers=[(entry.category, entry.multiplier) for entry in self.category_multipliers],
+        )
+
+    def rate_card(self) -> RateCard:
+        """This policy's numbers, in the form pricing needs them."""
+        return RateCard.of(
+            default_category=self.default_category,
+            rates=[(rate.item.sku, rate.credits_per_unit) for rate in self.rates],
+            category_multipliers=[(entry.category, entry.multiplier) for entry in self.category_multipliers],
+        )
+
+    @classmethod
+    def load_configured_policy(cls, session: Session, entry: ConfiguredPolicy) -> Self | None:
+        """Mint a new version, or return None when the document is already in force.
+
+        Called on every ingester pod start, so the common case is an unchanged document and
+        this does nothing. Only a change to the numbers, the default category or `valid_from`
+        mints a version - see PolicyFingerprint.
+
+        Two replicas starting together both see the same current policy and both try to mint
+        the same version. The unique constraint refuses the second, and this recovers rather
+        than failing the pod: the write happens inside a savepoint so the caller's transaction
+        survives, and the loser re-reads.
+
+        Raises ValueError for a rate naming a SKU that does not exist. Items load before the
+        policy, so a document may introduce an item and rate it in the same pass.
         """
-        item_obj = BillingItem.find_billing_item(session, price["sku"])
-        if not item_obj:
-            logging.error("Failed to find item %s when configuring price", price["sku"])
-            raise ValueError(f"Attempt to add price for unknown SKU {price['sku']}")
+        wanted = entry.fingerprint
 
-        valid_from = datetime.fromisoformat(price["valid_from"]).astimezone(UTC)
+        current = cls.current(session)
+        if current is not None and current.fingerprint() == wanted:
+            logging.debug("Pricing policy version %s is already in force", current.version)
+            return None
 
-        existing_prices_updated = session.execute(
-            update(cls).where(cls.item == item_obj).where(cls.valid_from == valid_from).values(price=price["price"])
-        )
+        items = cls._resolve_rated_items(session, entry)
 
-        if existing_prices_updated.rowcount > 0:
-            return
+        for remaining in reversed(range(_MINT_ATTEMPTS)):
+            version = _next_version(session)
 
-        latest_price = (
-            session.execute(select(cls).where(cls.item == item_obj).order_by(cls.valid_from.desc()).limit(1))
-            .scalars()
-            .one_or_none()
-        )
+            try:
+                with session.begin_nested():
+                    policy = cls(
+                        version=version,
+                        valid_from=entry.valid_from,
+                        default_category=entry.default_category,
+                        reason=entry.reason,
+                    )
+                    # The generated __init__ knows nothing about relationships, so it reports
+                    # policy_id as missing even though SQLAlchemy fills it in on flush.
+                    policy.rates = [
+                        PricingPolicyRate(  # pyright: ignore[reportCallIssue]
+                            item_id=items[rate.sku], credits_per_unit=rate.credits_per_unit
+                        )
+                        for rate in entry.rates
+                    ]
+                    policy.category_multipliers = [
+                        PricingPolicyCategoryMultiplier(  # pyright: ignore[reportCallIssue]
+                            category=item.category, multiplier=item.multiplier
+                        )
+                        for item in entry.category_multipliers
+                    ]
+                    session.add(policy)
+                    session.flush()
+            except IntegrityError:
+                logging.info("Pricing policy version %s was taken while loading; re-reading", version)
+                session.expire_all()
 
-        if latest_price:
-            if latest_price.valid_from.astimezone(UTC) > valid_from:
-                raise ValueError(
-                    f"Attempt to add price {price['sku']} where valid_from is earlier "
-                    + f"than the latest existing price, {latest_price.valid_from}."
-                )
+                current = cls.current(session)
+                if current is not None and current.fingerprint() == wanted:
+                    return None
 
-            latest_price.valid_until = valid_from
+                if not remaining:
+                    raise
 
-        price_obj = cls(
-            item=item_obj,
-            valid_from=valid_from,
-            price=price["price"],
-        )
-        session.add(price_obj)
+                continue
+
+            logging.info("Minted pricing policy version %s", version)
+
+            return policy
+
+        # Unreachable: the last attempt either returns or re-raises.
+        raise AssertionError
+
+    @classmethod
+    def _resolve_rated_items(cls, session: Session, entry: ConfiguredPolicy) -> dict[str, UUID]:
+        skus = [rate.sku for rate in entry.rates]
+
+        found = {
+            sku: uuid
+            for sku, uuid in session.execute(
+                select(col(BillingItem.sku), col(BillingItem.uuid)).where(col(BillingItem.sku).in_(skus))
+            ).all()
+        }
+
+        if missing := sorted(set(skus) - set(found)):
+            raise ValueError(f"`pricing_policy.rates` names SKUs which do not exist: {', '.join(missing)}")
+
+        return found
 
 
-def datetime_default_to_utc(dt: datetime | None) -> datetime | None:
-    if dt and not dt.tzinfo:
-        return dt.replace(tzinfo=UTC)
+class PricingPolicyRate(SQLModel, table=True):
+    """The credits charged per unit of one SKU under one policy."""
 
-    return dt
+    __tablename__ = "pricing_policy_rate"  # pyright: ignore[reportAssignmentType]
+
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
+    policy_id: UUID = SQLModelField(foreign_key="pricing_policy.uuid")
+    item_id: UUID = SQLModelField(foreign_key="billing_item.uuid")
+    credits_per_unit: Decimal
+
+    policy: PricingPolicy = Relationship(back_populates="rates")
+    item: BillingItem = Relationship()
+
+    __table_args__ = (UniqueConstraint("policy_id", "item_id"),)
+
+
+class PricingPolicyCategoryMultiplier(SQLModel, table=True):
+    """The multiplier applied to every rate in one policy, for one workspace category.
+
+    An unknown category resolves to `default_category`, so a value nobody has configured is a pricing
+    decision rather than a validation failure.
+    """
+
+    __tablename__ = "pricing_policy_category_multiplier"  # pyright: ignore[reportAssignmentType]
+
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
+    policy_id: UUID = SQLModelField(foreign_key="pricing_policy.uuid")
+    category: str
+    multiplier: Decimal
+
+    policy: PricingPolicy = Relationship(back_populates="category_multipliers")
+
+    __table_args__ = (UniqueConstraint("policy_id", "category"),)
+
+
+def _policy_load_options() -> tuple[_AbstractLoad, ...]:
+    """Eager-load a policy's rates, their items, and its category multipliers."""
+    return (
+        selectinload(PricingPolicy.rates).selectinload(  # pyright: ignore[reportArgumentType]
+            PricingPolicyRate.item  # pyright: ignore[reportArgumentType]
+        ),
+        selectinload(PricingPolicy.category_multipliers),  # pyright: ignore[reportArgumentType]
+    )
+
+
+class TimeAggregation(StrEnum):
+    """Periods that usage data can be totalled over."""
+
+    DAY = "day"
+    MONTH = "month"
 
 
 class AfterBillingEventNotFound(Exception):
@@ -284,9 +471,8 @@ class AfterBillingEventNotFound(Exception):
     pass
 
 
-class BillingEvent(Base):
-    """
-    This records a particular workspace's consumption of a particular BillingItem at a particular
+class BillingEvent(SQLModel, table=True):
+    """This records a particular workspace's consumption of a particular BillingItem at a particular
     time or over a particular period. This consumption is priced at its start date.
 
     BillingEvents can be aggregated over time. A series of billing events can be combined if
@@ -294,34 +480,30 @@ class BillingEvent(Base):
     of the first event is kept. They can also be split if the event time period includes
     midnight.
 
-    Note that the 'workspace' field should always refer to a workspace in the WorkspaceAccount
-    entity. However, to avoid data loss in the event that messages from the workspace service
-    are received too late or not at all, we don't impose a foreign key constraint.
+    The 'workspace' field should always refer to a workspace in WorkspaceAccount, but there is
+    no foreign key: messages from the workspace service may arrive late or never, and losing a
+    billing event is worse than holding a dangling reference.
     """
 
-    __tablename__ = "billing_event"
+    __tablename__ = "billing_event"  # pyright: ignore[reportAssignmentType]
 
-    uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
-    event_start: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
-    event_end: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
-    item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
-    item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
-    user: Mapped[UUID | None]  # This is None for, for example, workspace storage.
-    workspace: Mapped[str]
-    quantity: Mapped[float]  # The units involved are defined in the BillingItem
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
+    event_start: datetime = aware_timestamp()
+    event_end: datetime = aware_timestamp()
+    item_id: UUID = SQLModelField(foreign_key="billing_item.uuid")
+    user: UUID | None = SQLModelField(default=None)  # None for, for example, workspace storage.
+    workspace: str
+    quantity: float  # The units involved are defined in the BillingItem
+
+    item: BillingItem = Relationship()
 
     @property
     def event_start_utc(self) -> datetime:
-        # In PostgreSQL we always have a sample_time with a timezone attached and it should always
-        # be UTC. In SQLite, used for tests, we get datetimes with no timezone, creating problems
-        # when we do comparisons.
-        #
-        # This harmonizes this.
-        return self.event_start.astimezone(UTC)
+        return as_utc(self.event_start)
 
     @property
     def event_end_utc(self) -> datetime:
-        return self.event_end.astimezone(UTC)
+        return as_utc(self.event_end)
 
     __table_args__ = (
         Index(
@@ -329,26 +511,27 @@ class BillingEvent(Base):
             "workspace",
             "event_start",
         ),
-        CheckConstraint("event_start <= event_end"),
+        CheckConstraint("event_start <= event_end", name="start_before_end"),
+        # The next two are listed in UNCOMPARED_INDEXES in alembic/env.py, because PostgreSQL
+        # normalises the expressions and Alembic then reports them as changed forever. That
+        # exclusion also stops autogenerate emitting them, so they are written by hand in the
+        # baseline migration: change one here and you must change the migration too, because
+        # `alembic check` reports clean when they are missing.
+        Index(
+            "billingevent_month_aggregate_index",
+            text("date_trunc('month', event_start AT TIME ZONE 'UTC')"),
+            text("(date_trunc('month', event_start AT TIME ZONE 'UTC') + '1 month'::interval)"),
+            "workspace",
+            "item_id",
+        ),
+        Index(
+            "billingevent_day_aggregate_index",
+            text("date_trunc('day', event_start AT TIME ZONE 'UTC')"),
+            text("(date_trunc('day', event_start AT TIME ZONE 'UTC') + '1 day'::interval)"),
+            "workspace",
+            "item_id",
+        ),
     )
-
-    if not db_settings.is_sqlite():
-        __table_args__ += (
-            Index(
-                "billingevent_month_aggregate_index",
-                text("date_trunc('month', event_start AT TIME ZONE 'UTC')"),
-                text("(date_trunc('month', event_start AT TIME ZONE 'UTC') + '1 month'::interval)"),
-                "workspace",
-                "item_id",
-            ),
-            Index(
-                "billingevent_day_aggregate_index",
-                text("date_trunc('day', event_start AT TIME ZONE 'UTC')"),
-                text("(date_trunc('day', event_start AT TIME ZONE 'UTC') + '1 day'::interval)"),
-                "workspace",
-                "item_id",
-            ),
-        )
 
     @classmethod
     def find_billing_events(
@@ -360,33 +543,28 @@ class BillingEvent(Base):
         end: datetime | None = None,
         after: UUID | None = None,
         limit: int = 5_000,
-        time_aggregation: str | None = None,
+        time_aggregation: TimeAggregation | None = None,
     ) -> Iterator[Self]:
         """
         Find and return BillingEvents matching some criteria.
 
         For paging, `after` should be the UUID of the last billing event on the previous page.
 
-        time_aggregation may be 'day' or 'month' to provide daily or monthly totals for each
-        SKU+workspace pair.
+        time_aggregation gives daily or monthly totals for each SKU+workspace pair. Anything
+        outside TimeAggregation raises ValueError rather than being ignored.
         """
-        # With no time aggregation we use the raw table as the source of rows to filter, sort,
-        # page and return.
-        #
-        # With time aggregation we use a sub-SELECT which calculates aggregated data as the
-        # source of rows. The UUID assigned is the lexicographically largest of all rows
-        # aggregated. This isn't perfect and can result in errors when fetching the last pages
-        # because new BillingEvents can arrive whilst paging and change the maximum UUIDs.
-        # This does not happen very often, especially with large page sizes.
-        if time_aggregation in {"day", "month"}:
-            if db_settings.is_sqlite():
-                period_start_expr = f"datetime(event_start, 'start of {time_aggregation}') || '.000000'"
-                period_end_expr = f"datetime(event_start, 'start of {time_aggregation}', '+1 {time_aggregation}')"
-                uuid_expr = "MAX(CAST(uuid AS TEXT))"
-            else:
-                period_start_expr = f"date_trunc('{time_aggregation}', event_start AT TIME ZONE 'UTC')"
-                period_end_expr = f"{period_start_expr} + '1 {time_aggregation}'::interval"
-                uuid_expr = "CAST(MAX(CAST(uuid AS TEXT)) AS UUID)"
+        # With no aggregation the raw table is the source of rows to filter, sort, page and
+        # return. With aggregation it is a sub-SELECT computing the totals, and the UUID
+        # assigned is the lexicographically largest of the rows aggregated. That can misbehave
+        # on the last pages, because events arriving while paging change the maximum UUIDs.
+        if time_aggregation is not None:
+            # Coerced rather than trusted: the value is interpolated into the SQL below, so the
+            # closed set has to be enforced at runtime and not only in the type hints.
+            period = TimeAggregation(time_aggregation).value
+
+            period_start_expr = f"date_trunc('{period}', event_start AT TIME ZONE 'UTC')"
+            period_end_expr = f"{period_start_expr} + '1 {period}'::interval"
+            uuid_expr = "CAST(MAX(CAST(uuid AS TEXT)) AS UUID)"
 
             select_aggregated_events = text(
                 f"""
@@ -402,83 +580,102 @@ GROUP BY 2, 3, 4, 6
 """
             )
 
+            # The table's own columns, not the ORM attributes. `.columns()` describes the result
+            # of the text above, so a Column is what it wants, and col() hands back `Mapped[...]`.
+            table = SQLModel.metadata.tables[str(cls.__tablename__)]
             select_aggregated_events = select_aggregated_events.columns(
-                cls.uuid,
-                cls.event_start,
-                cls.event_end,
-                cls.item_id,
-                cls.user,
-                cls.workspace,
-                cls.quantity,
+                table.c.uuid,
+                table.c.event_start,
+                table.c.event_end,
+                table.c.item_id,
+                table.c.user,
+                table.c.workspace,
+                table.c.quantity,
             )
 
             billingevent_src = aliased(BillingEvent, select_aggregated_events.subquery())
         else:
             billingevent_src = cls
 
-        all_billing_events = select(billingevent_src).join(BillingItem, BillingItem.uuid == billingevent_src.item_id)
+        # The join exists for the ordering and paging predicates below, which compare
+        # BillingItem.sku. It does not populate `item`, so reading event.item.sku on the way out
+        # cost one query per row. selectinload rather than contains_eager, which would reuse the
+        # join and then depend on a join that exists only for ordering.
+        #
+        # Column handles for everything below, named once so the paging comparison reads as the
+        # tuple comparison it is.
+        event_start = col(billingevent_src.event_start)
+        event_end = col(billingevent_src.event_end)
+        event_workspace = col(billingevent_src.workspace)
+        event_uuid = col(billingevent_src.uuid)
+        item_sku = col(BillingItem.sku)
+
+        all_billing_events = (
+            select(billingevent_src)
+            .join(BillingItem, col(BillingItem.uuid) == col(billingevent_src.item_id))
+            .options(selectinload(billingevent_src.item))  # pyright: ignore[reportArgumentType]
+        )
 
         # We need a complete and certain order so that the 'after' parameter works.
         query = all_billing_events.order_by(
-            billingevent_src.event_start,
-            billingevent_src.event_end,
-            billingevent_src.workspace,
-            BillingItem.sku,
-            billingevent_src.uuid,
+            event_start,
+            event_end,
+            event_workspace,
+            item_sku,
+            event_uuid,
         )
 
         query = query.limit(limit)
 
         if workspace is not None:
-            query = query.where(billingevent_src.workspace == workspace)
+            query = query.where(event_workspace == workspace)
 
         if account is not None:
-            query = query.join(WorkspaceAccount, WorkspaceAccount.workspace == billingevent_src.workspace).where(
-                WorkspaceAccount.account == account
+            query = query.join(WorkspaceAccount, col(WorkspaceAccount.workspace) == event_workspace).where(
+                col(WorkspaceAccount.account) == account
             )
 
         if start is not None:
-            query = query.where(billingevent_src.event_start >= start)
+            query = query.where(event_start >= start)
 
         if end is not None:
-            query = query.where(billingevent_src.event_end < end)
+            query = query.where(event_end < end)
 
         if after is not None:
-            # This is equivalent to
-            #   after_be = session.get(cls, after)
-            # but it works when billingevent_src is an alias rather than an ORM class.
-            after_be = session.execute(
-                select(billingevent_src).where(billingevent_src.uuid == after)
-            ).scalar_one_or_none()
+            # Equivalent to session.get(cls, after), but works when billingevent_src is an alias.
+            after_be = session.execute(select(billingevent_src).where(event_uuid == after)).scalar_one_or_none()
 
             if after_be is None:
                 raise AfterBillingEventNotFound(f"No records matching after={after} found")
 
+            # Everything strictly after `after_be` in the ordering above: a lexicographic
+            # comparison over (event_start, event_end, workspace, sku, uuid), spelled out
+            # because PostgreSQL cannot use the index for a row-value comparison here.
             query = query.where(
-                billingevent_src.event_start >= after_be.event_start,
+                event_start >= after_be.event_start,
                 or_(
-                    (billingevent_src.event_start > after_be.event_start),
+                    event_start > after_be.event_start,
                     and_(
-                        billingevent_src.event_start == after_be.event_start,
-                        billingevent_src.event_end > after_be.event_end,
+                        event_start == after_be.event_start,
+                        event_end > after_be.event_end,
                     ),
                     and_(
-                        billingevent_src.event_start == after_be.event_start,
-                        billingevent_src.event_end == after_be.event_end,
-                        billingevent_src.workspace > after_be.workspace,
+                        event_start == after_be.event_start,
+                        event_end == after_be.event_end,
+                        event_workspace > after_be.workspace,
                     ),
                     and_(
-                        billingevent_src.event_start == after_be.event_start,
-                        billingevent_src.event_end == after_be.event_end,
-                        billingevent_src.workspace == after_be.workspace,
-                        BillingItem.sku > after_be.item.sku,
+                        event_start == after_be.event_start,
+                        event_end == after_be.event_end,
+                        event_workspace == after_be.workspace,
+                        item_sku > after_be.item.sku,
                     ),
                     and_(
-                        billingevent_src.event_start == after_be.event_start,
-                        billingevent_src.event_end == after_be.event_end,
-                        billingevent_src.workspace == after_be.workspace,
-                        BillingItem.sku == after_be.item.sku,
-                        billingevent_src.uuid > after,
+                        event_start == after_be.event_start,
+                        event_end == after_be.event_end,
+                        event_workspace == after_be.workspace,
+                        item_sku == after_be.item.sku,
+                        event_uuid > after,
                     ),
                 ),
             )
@@ -492,23 +689,20 @@ GROUP BY 2, 3, 4, 6
         workspace: str | None,
         sku: str | None,
     ) -> Self | None:
-        """
-        Returns the most recent BillingEvent, optionally constrained by workspace and item.
-        """
-        query = select(cls).order_by(cls.event_end.desc()).limit(1)
+        """Returns the most recent BillingEvent, optionally constrained by workspace and item."""
+        query = select(cls).order_by(col(cls.event_end).desc()).limit(1)
 
         if workspace is not None:
-            query = query.where(cls.workspace == workspace)
+            query = query.where(col(cls.workspace) == workspace)
 
         if sku is not None:
-            query = query.join(BillingItem).where(BillingItem.sku == sku)
+            query = query.join(BillingItem).where(col(BillingItem.sku) == sku)
 
         return session.execute(query).scalar_one_or_none()
 
     @classmethod
     def insert_from_message(cls, session: Session, msg: eodhp_utils.pulsar.messages.BillingEvent) -> UUID | None:
-        """
-        Adds a new BillingEvent to the DB based on a Pulsar message.
+        """Adds a new BillingEvent to the DB based on a Pulsar message.
 
         Deals with duplicated UUIDs by ignoring the second message and returning None.
         """
@@ -518,13 +712,13 @@ GROUP BY 2, 3, 4, 6
                 uuid=UUID(str(msg.uuid)),
                 event_start=datetime_default_to_utc(datetime.fromisoformat(str(msg.event_start))),
                 event_end=datetime_default_to_utc(datetime.fromisoformat(str(msg.event_end))),
-                item_id=select(BillingItem.uuid).where(BillingItem.sku == msg.sku).scalar_subquery(),
+                item_id=select(col(BillingItem.uuid)).where(col(BillingItem.sku) == msg.sku).scalar_subquery(),
                 user=UUID(str(msg.user)) if msg.user else None,
                 workspace=msg.workspace,
                 quantity=msg.quantity,
             )
             .on_conflict_do_nothing(index_elements=["uuid"])
-            .returning(BillingEvent.uuid)
+            .returning(col(BillingEvent.uuid))
         )
 
         return result.scalar_one_or_none()
@@ -542,9 +736,8 @@ GROUP BY 2, 3, 4, 6
         )
 
 
-class BillableResourceConsumptionRateSample(Base):
-    """
-    A consumption rate sample is a point-in-time sample of the rate at which a user is consuming a
+class BillableResourceConsumptionRateSample(SQLModel, table=True):
+    """A consumption rate sample is a point-in-time sample of the rate at which a user is consuming a
     billed-for resources, typically storage but it could be any other resource where the time it's
     held for is the basis for the charge.
 
@@ -554,34 +747,33 @@ class BillableResourceConsumptionRateSample(Base):
 
     Samples are used to generate estimated BillingEvents periodically by, effectively, interpolating
     between samples and integrating.
+
+    If we go for a separate billing system for non-transient items such as storage, this table can go.
     """
 
-    __tablename__ = "billing_resource_consumption_rate_sample"
+    __tablename__ = "billing_resource_consumption_rate_sample"  # pyright: ignore[reportAssignmentType]
 
-    uuid: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
 
     # Typically this is the end of the sampling process, although we pretend here that it was
     # instantaneous.
-    sample_time: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), index=True)
+    sample_time: datetime = aware_timestamp(index=True)
 
-    item_id: Mapped[UUID] = mapped_column(ForeignKey(BillingItem.uuid))
-    item: Mapped["BillingItem"] = relationship(foreign_keys=item_id)
+    item_id: UUID = SQLModelField(foreign_key="billing_item.uuid")
 
-    user: Mapped[UUID | None]  # This is None for, for example, workspace storage.
-    workspace: Mapped[str]
+    # This is None for, for example, workspace storage.
+    user: UUID | None = SQLModelField(default=None)
+    workspace: str
 
     # The units of this are defined in the BillingItem and divided by seconds.
     # eg, storage consumption is measured in GB-seconds, so this is in GB.
-    rate: Mapped[float]
+    rate: float
+
+    item: BillingItem = Relationship()
 
     @property
     def sample_time_utc(self) -> datetime:
-        # In PostgreSQL we always have a sample_time with a timezone attached and it should always
-        # be UTC. In SQLite, used for tests, we get datetimes with no timezone, creating problems
-        # when we do comparisons.
-        #
-        # This harmonizes this.
-        return self.sample_time.astimezone(UTC)
+        return as_utc(self.sample_time)
 
     __table_args__ = (
         Index(
@@ -600,13 +792,13 @@ class BillableResourceConsumptionRateSample(Base):
             .values(
                 uuid=UUID(str(msg.uuid)),
                 sample_time=datetime_default_to_utc(datetime.fromisoformat(str(msg.sample_time))),
-                item_id=(select(BillingItem.uuid).where(BillingItem.sku == msg.sku).scalar_subquery()),
+                item_id=(select(col(BillingItem.uuid)).where(col(BillingItem.sku) == msg.sku).scalar_subquery()),
                 user=UUID(str(msg.user)) if msg.user else None,
                 workspace=msg.workspace,
                 rate=msg.rate,
             )
             .on_conflict_do_nothing(index_elements=["uuid"])
-            .returning(cls.uuid)
+            .returning(col(cls.uuid))
         )
 
         return result.scalar_one_or_none()
@@ -615,39 +807,33 @@ class BillableResourceConsumptionRateSample(Base):
     def find_data_for_interval(
         cls, session: Session, workspace: str, sku: str, start: datetime, end: datetime
     ) -> Sequence[Self]:
-        item_subquery = select(BillingItem.uuid).where(BillingItem.sku == sku).scalar_subquery()
+        """The samples covering an interval: the last one before it, those inside it, and the
+        first one after it. The bracketing samples are what make interpolation possible.
+        """
+        item_subquery = select(col(BillingItem.uuid)).where(col(BillingItem.sku) == sku).scalar_subquery()
         last_before_start = (
             select(cls)
-            .where(cls.item_id == item_subquery)
-            .where(cls.workspace == workspace)
-            .where(cls.sample_time <= start)
-            .order_by(cls.sample_time.desc())
+            .where(col(cls.item_id) == item_subquery)
+            .where(col(cls.workspace) == workspace)
+            .where(col(cls.sample_time) <= start)
+            .order_by(col(cls.sample_time).desc())
             .limit(1)
         )
         first_after_end = (
             select(cls)
-            .where(cls.item_id == item_subquery)
-            .where(cls.workspace == workspace)
-            .where(cls.sample_time >= end)
-            .order_by(cls.sample_time)
+            .where(col(cls.item_id) == item_subquery)
+            .where(col(cls.workspace) == workspace)
+            .where(col(cls.sample_time) >= end)
+            .order_by(col(cls.sample_time))
             .limit(1)
         )
         in_period = (
             select(cls)
-            .where(cls.item_id == item_subquery)
-            .where(cls.workspace == workspace)
-            .where(cls.sample_time > start)
-            .where(cls.sample_time < end)
+            .where(col(cls.item_id) == item_subquery)
+            .where(col(cls.workspace) == workspace)
+            .where(col(cls.sample_time) > start)
+            .where(col(cls.sample_time) < end)
         )
-
-        if db_settings.is_sqlite():
-            # Only used in tests (but the tests can be run with PostgreSQL as well).
-            # SQLite can't cope with the UNION syntax used by SQLAlchemy.
-            return (
-                list(session.execute(last_before_start).scalars().all())
-                + list(session.execute(in_period).scalars().all())
-                + list(session.execute(first_after_end).scalars().all())
-            )
 
         query = select(cls).from_statement(
             union(last_before_start, first_after_end, in_period).order_by("sample_time")
@@ -658,8 +844,7 @@ class BillableResourceConsumptionRateSample(Base):
     def calculate_consumption_for_interval(
         cls, session: Session, workspace: str, sku: str, start: datetime, end: datetime
     ) -> float | None:
-        """
-        This calculates estimated consumption within a time interval, using linear interpolation
+        """This calculates estimated consumption within a time interval, using linear interpolation
         to estimate consumption rates from samples and then (effectively) integrating.
 
         It's assumed that the resource did not exist (zero consumption rate) before the first
@@ -667,65 +852,15 @@ class BillableResourceConsumptionRateSample(Base):
         until sample collection has got as far as at least one sample after the end of the
         interval. If no sample exists after the end of the interval then, if one is later
         collected, the answer given by this method will change.
+
+        The arithmetic is in accounting_service.consumption, which owns no database.
         """
-        rate_samples = list(cls.find_data_for_interval(session, workspace, sku, start, end))
+        samples = cls.find_data_for_interval(session, workspace, sku, start, end)
 
-        if not rate_samples or len(rate_samples) <= 1:
-            # No record of any consumption at all.
-            #
-            # If there is one sample then this is equivalent to no consumption. THis is because
-            # we assume that the resource didn't exist until the first sample and didn't exist
-            # after the last one, so we act as if it existed for zero time.
-            return None
-
-        # We need an estimate of consumption rate at the start and end of the interval.
-        # We use interpolation.
-        def interpolate(at: datetime, s0: Self, s1: Self) -> float:
-            assert at >= s0.sample_time_utc
-            assert at <= s1.sample_time_utc
-
-            proportion: float = (at - s0.sample_time_utc) / (s1.sample_time_utc - s0.sample_time_utc)
-
-            return s0.rate + proportion * (s1.rate - s0.rate)
-
-        RateTime = namedtuple("RateTime", ["at", "rate"])
-
-        starting_ratetime = (
-            # If no samples exist before the window then it may not have existed yet.
-            # To avoid awkward questions, we treat consumption as zero up until the first
-            # sample.
-            RateTime(at=rate_samples[0].seconds_after(start), rate=0)
-            if rate_samples[0].sample_time_utc > start
-            else RateTime(at=0, rate=interpolate(start, rate_samples[0], rate_samples[1]))
+        return estimate_consumption(
+            [RateSample(at=sample.sample_time_utc, rate=sample.rate) for sample in samples],
+            ConsumptionWindow(start=start, end=end),
         )
-
-        ending_ratetime = (
-            # If there are no samples after the window we assume the resource was destroyed
-            # sometime after the last sample. Again, to avoid awkward questions we assume
-            # this happened exactly at the last sample.
-            RateTime(at=rate_samples[-1].seconds_after(start), rate=0)
-            if rate_samples[-1].sample_time_utc < end
-            else RateTime(at=(end - start).seconds, rate=interpolate(end, rate_samples[-2], rate_samples[-1]))
-        )
-
-        mid_samples = filter(lambda s: s.after(start) and not s.after(end), rate_samples)
-        mid_ratetimes = map(lambda s: RateTime(at=s.seconds_after(start), rate=s.rate), mid_samples)
-
-        # Form a list of RateTimes tuples covering exactly the window, clipped to a shorter period
-        # only if we've assumed the resource was created/destroyed during the window.
-        ratelist: list[RateTime] = [starting_ratetime, *mid_ratetimes, ending_ratetime]
-
-        # Now imagine a linear interpolation between the points in ratelist being integrated to
-        # produce our answer.
-        total_consumption: float = 0.0
-        for s0, s1 in itertools.pairwise(ratelist):
-            assert s1.at >= s0.at
-
-            duration = s1.at - s0.at
-            rate = (s0.rate + s1.rate) / 2.0
-            total_consumption += duration * rate
-
-        return total_consumption
 
     @classmethod
     def find_earliest(
@@ -734,24 +869,16 @@ class BillableResourceConsumptionRateSample(Base):
         workspace: str | None,
         item_id: UUID | None,
     ) -> Self | None:
-        """
-        Returns the first observed sample for the given constraints.
-        """
-        query = select(cls).order_by(cls.sample_time).limit(1)
+        """Returns the first observed sample for the given constraints."""
+        query = select(cls).order_by(col(cls.sample_time)).limit(1)
 
         if workspace is not None:
-            query = query.where(cls.workspace == workspace)
+            query = query.where(col(cls.workspace) == workspace)
 
         if item_id is not None:
-            query = query.where(cls.item_id == item_id)
+            query = query.where(col(cls.item_id) == item_id)
 
         return session.execute(query).scalar_one_or_none()
-
-    def seconds_after(self, after: datetime) -> float:
-        return (self.sample_time_utc - after).seconds
-
-    def after(self, t: datetime) -> bool:
-        return self.sample_time_utc > t
 
     def __repr__(self) -> str:
         return (
@@ -762,4 +889,342 @@ class BillableResourceConsumptionRateSample(Base):
             + f"{self.user=}, "
             + f"{self.workspace=}, "
             + f"{self.rate=})"
+        )
+
+
+class TransactionType(StrEnum):
+    """What kind of act a ledger row records.
+
+    Adding a value later is straightforward; removing or renaming one needs a replacement type
+    and a swap of every column using it, so the value set is worth choosing deliberately.
+    """
+
+    DEBIT = "debit"
+    GRANT = "grant"
+    REVERSAL = "reversal"
+
+
+class CreditLedgerTransaction(SQLModel, table=True):
+    """One movement of credits: a usage debit, an admin grant, or a correction.
+
+    Append-only. A correction is a new row referencing the one it corrects. So concurrent
+    debits never contend for a row, a balance needs no lock and no mutable total, and every row
+    records what was actually charged at the time - which is what lets a period be re-priced
+    without destroying that record.
+    """
+
+    __tablename__ = "credit_ledger_transaction"  # pyright: ignore[reportAssignmentType]
+
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
+
+    workspace: str
+
+    # Denormalised from the billing event rather than joined through it. Per-user budgets
+    # and the per-user usage filter both need it, and a grant has no billing event to join
+    # through, so under a join every grant would have no user at all. Null on a grant marks it
+    # as belonging to the whole workspace pool.
+    user: UUID | None = SQLModelField(default=None)
+
+    transaction_type: TransactionType = pg_enum(TransactionType, "transaction_type")
+
+    credits: Decimal
+
+    # Set for a usage debit and for a correction of one. Null for a grant, which prices nothing
+    # and meters nothing.
+    billing_event_id: UUID | None = SQLModelField(default=None, foreign_key="billing_event.uuid")
+    item_id: UUID | None = SQLModelField(default=None, foreign_key="billing_item.uuid")
+    quantity: float | None = SQLModelField(default=None)
+
+    # How this was priced: a reference to the policy, not a copy of its numbers, so the charge
+    # can be recomputed rather than merely re-read. Nullable because a grant is not priced, and
+    # a non-null column would have to be filled with a policy that did not apply to it. The
+    # invariant that does hold is the `debit_is_priced` constraint below.
+    policy_id: UUID | None = SQLModelField(default=None, foreign_key="pricing_policy.uuid")
+    category: str | None = SQLModelField(default=None)
+
+    # Period filters want when the usage happened; audit and reconciliation want when this
+    # service learned of it. A backfilled event carries an old `occurred_at` and a recent
+    # `recorded_at`, and one column cannot answer both.
+    occurred_at: datetime = aware_timestamp()
+    recorded_at: datetime = aware_timestamp(default=func.now())
+
+    # Corrections. `correction_batch_id` has no foreign key yet - adds the
+    # `correction_batch` table and the constraint with it - but the column exists now because
+    # the idempotency index below tests it.
+    reverses_id: UUID | None = SQLModelField(default=None, foreign_key="credit_ledger_transaction.uuid")
+    correction_batch_id: UUID | None = SQLModelField(default=None)
+
+    # The hub_admin responsible for a grant or a correction. Null on a usage debit.
+    created_by: UUID | None = SQLModelField(default=None)
+    reason: str | None = None
+
+    item: BillingItem | None = Relationship()
+    policy: PricingPolicy | None = Relationship()
+
+    @property
+    def occurred_at_utc(self) -> datetime:
+        return as_utc(self.occurred_at)
+
+    @property
+    def recorded_at_utc(self) -> datetime:
+        return as_utc(self.recorded_at)
+
+    __table_args__ = (
+        # One original debit per billing event, while still allowing correction rows against
+        # that same event: a plain unique constraint on billing_event_id would block re-pricing
+        # entirely.
+        #
+        # The WHERE clause is load-bearing in both directions. PostgreSQL treats NULLs as
+        # distinct in a unique index, so without it correction rows would not be constrained at
+        # all and original debits would not be protected from each other.
+        Index(
+            "credit_ledger_original_debit_index",
+            "billing_event_id",
+            unique=True,
+            postgresql_where=text("correction_batch_id IS NULL AND transaction_type = 'debit'"),
+        ),
+        Index(
+            "credit_ledger_workspace_recorded_index",
+            "workspace",
+            "recorded_at",
+        ),
+        # A debit is priced, so it has a policy and a category. Stated as a rule about debits
+        # rather than as an equivalence with "is a grant", because a reversal of a debit carries
+        # the original's policy while a reversal of a grant would carry none.
+        CheckConstraint(
+            "transaction_type <> 'debit' OR (policy_id IS NOT NULL AND category IS NOT NULL)",
+            name="debit_is_priced",
+        ),
+    )
+
+    @classmethod
+    def record_usage_debit(
+        cls,
+        session: Session,
+        event: "BillingEvent",
+        priced: PricedUsage,
+        policy_id: UUID,
+    ) -> UUID | None:
+        """Charge a billing event, or return None if it has already been charged.
+
+        The charge arrives positive from `price_usage` and is stored negated.
+
+        Idempotent through the partial unique index rather than through a prior SELECT.
+        Checking first and inserting second leaves a race between the two, and this runs on a
+        consumer that can redeliver a message and be restarted mid-transaction, so
+        `on_conflict_do_nothing` collapses both into one statement the database arbitrates.
+
+        `BillingEvent.insert_from_message` deduplicates on the message UUID; this protects
+        against the same stored event being priced twice.
+
+        Does not commit, so the event and its debit land together or not at all.
+        """
+        result = session.execute(
+            insert(cls)
+            .values(
+                workspace=event.workspace,
+                user=event.user,
+                transaction_type=TransactionType.DEBIT,
+                credits=-priced.credits,
+                billing_event_id=event.uuid,
+                item_id=event.item_id,
+                quantity=priced.quantity,
+                policy_id=policy_id,
+                category=priced.category,
+                occurred_at=event.event_start_utc,
+            )
+            .on_conflict_do_nothing(
+                index_elements=["billing_event_id"],
+                index_where=text("correction_batch_id IS NULL AND transaction_type = 'debit'"),
+            )
+            .returning(col(cls.uuid))
+        )
+
+        return result.scalar_one_or_none()
+
+    @classmethod
+    def record_grant(
+        cls,
+        session: Session,
+        workspace: str,
+        credits: Decimal,
+        reason: str,
+        created_by: UUID | None = None,
+        occurred_at: datetime | None = None,
+    ) -> Self:
+        """Add credits to a workspace's pool.
+
+        Positive, and carrying no policy or category: a grant is not priced. `user` is left
+        null, which marks the grant as belonging to the whole workspace rather than to one
+        member.
+
+        `reason` is required. A grant is a privileged write with no payment behind it, so
+        the audit log has nothing to show but the reason somebody gave.
+
+        Not idempotent: two identical grants are two grants, because unlike a redelivered
+        billing event there is no natural key saying they are the same act.
+
+        Does not commit.
+        """
+        transaction = cls(
+            workspace=workspace,
+            transaction_type=TransactionType.GRANT,
+            credits=credits,
+            reason=reason,
+            created_by=created_by,
+            occurred_at=occurred_at or datetime.now(UTC),
+        )
+
+        session.add(transaction)
+        session.flush()
+
+        return transaction
+
+    @classmethod
+    def balance(cls, session: Session, workspace: str, user: UUID | None = None) -> Decimal:
+        """The workspace's credit balance, or one user's net spend within it.
+
+        The latest snapshot plus every row recorded after it. With no snapshot stored this reads
+        the whole ledger and is still correct, which is what lets a snapshot be rebuilt or
+        discarded at any time.
+
+        The delta is taken on `recorded_at`, never `occurred_at`. A backfilled event carries an
+        old `occurred_at`, so on that column it would fall after the snapshot's cut and also
+        outside the delta, and vanish from the balance.
+
+        Passing `user` gives that user's net spend against the shared pool rather than an
+        allowance of their own: grants carry no user, so they are not in the sum.
+        """
+        snapshot = CreditBalanceSnapshot.latest(session, workspace, user)
+        opening = snapshot.balance if snapshot else Decimal(0)
+
+        delta = select(func.coalesce(func.sum(col(cls.credits)), Decimal(0))).where(col(cls.workspace) == workspace)
+
+        if snapshot:
+            delta = delta.where(col(cls.recorded_at) > snapshot.as_of_utc)
+
+        if user is not None:
+            delta = delta.where(col(cls.user) == user)
+
+        return opening + session.execute(delta).scalar_one()
+
+    @classmethod
+    def find_transaction(cls, session: Session, uuid_: UUID, workspace: str | None = None) -> Self | None:
+        """One transaction, with everything needed to explain the charge loaded.
+
+        The policy comes with its rates and multipliers, because the explanation recomputes the
+        charge rather than reading it back: the row stores the quantity, the policy and the
+        resolved category but not the rate or the multiplier.
+
+        `workspace` scopes the lookup. A transaction UUID is not a capability, so an endpoint
+        under /workspaces/{workspace}/ must not hand back a row belonging to another workspace
+        merely because the UUID was right.
+        """
+        query = (
+            select(cls)
+            .options(
+                selectinload(cls.item),  # pyright: ignore[reportArgumentType]
+                selectinload(cls.policy).options(  # pyright: ignore[reportArgumentType]
+                    *_policy_load_options()
+                ),
+            )
+            .where(col(cls.uuid) == uuid_)
+        )
+
+        if workspace is not None:
+            query = query.where(col(cls.workspace) == workspace)
+
+        return session.execute(query).scalars().first()
+
+    @classmethod
+    def recent_transactions(cls, session: Session, workspace: str, limit: int = 50) -> Sequence[Self]:
+        """The workspace's most recent transactions, newest first.
+
+        Ordered on `recorded_at`, the order they were written rather than the order the usage
+        happened in, so a backfilled event appears at the top where it can be noticed.
+
+        For the admin CLI. The API's ledger endpoint is a different query: it groups and
+        nets, because an individual reversal must not appear there as an event of its own.
+        """
+        return (
+            session.execute(
+                select(cls)
+                .options(selectinload(cls.item))  # pyright: ignore[reportArgumentType]
+                .where(col(cls.workspace) == workspace)
+                .order_by(col(cls.recorded_at).desc())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+
+    def __repr__(self) -> str:
+        return (
+            "CreditLedgerTransaction("
+            + f"{self.uuid=}, "
+            + f"{self.workspace=}, "
+            + f"{self.transaction_type=}, "
+            + f"{self.credits=}, "
+            + f"{self.occurred_at=})"
+        )
+
+
+class CreditBalanceSnapshot(SQLModel, table=True):
+    """A workspace's balance as at one instant, so a balance read need not sum every row.
+
+    An optimisation and not a source of truth: the ledger alone always gives the right answer,
+    so a snapshot can be rebuilt or thrown away at any time. Nothing writes one yet. What this
+    table buys is a cheap balance for the budget checks that run on every billing event.
+
+    `as_of` is compared against `recorded_at`, never `occurred_at`. A backfilled event carries
+    an old `occurred_at`, and on that column it would be counted in neither the snapshot nor
+    the delta.
+
+    Keyed on workspace and user the same way budgets are. A null `user` is the whole-pool total
+    that the balance endpoint reads; a row naming a user serves a per-user threshold check. The
+    surrogate primary key is because a primary key column cannot be null, and the unique
+    constraint declares NULLS NOT DISTINCT because PostgreSQL otherwise counts two null users
+    as different values and would let one instant be snapshotted twice.
+
+    Whatever writes a snapshot must take `as_of` from the `recorded_at` of the newest row it
+    included, not from the clock: `func.now()` is the transaction timestamp, so rows written
+    together share it and a cut at that instant would drop all of them from the delta.
+    """
+
+    __tablename__ = "credit_balance_snapshot"  # pyright: ignore[reportAssignmentType]
+
+    uuid: UUID = SQLModelField(default_factory=uuid4, primary_key=True)
+    workspace: str
+    user: UUID | None = SQLModelField(default=None)
+    as_of: datetime = aware_timestamp()
+    balance: Decimal
+
+    __table_args__ = (
+        UniqueConstraint("workspace", "user", "as_of", postgresql_nulls_not_distinct=True),
+        Index("credit_balance_snapshot_lookup_index", "workspace", "user", "as_of"),
+    )
+
+    @property
+    def as_of_utc(self) -> datetime:
+        return as_utc(self.as_of)
+
+    @classmethod
+    def latest(cls, session: Session, workspace: str, user: UUID | None = None) -> Self | None:
+        """The most recent snapshot for this workspace, or for one user within it.
+
+        `user=None` means the whole-pool row, which is not the same as "any user", so this
+        matches IS NULL rather than leaving the filter off.
+        """
+        by_user = col(cls.user) == user if user is not None else col(cls.user).is_(None)
+
+        return (
+            session.execute(
+                select(cls)
+                .where(col(cls.workspace) == workspace)
+                .where(by_user)
+                .order_by(col(cls.as_of).desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
         )

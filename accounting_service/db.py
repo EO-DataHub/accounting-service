@@ -1,60 +1,66 @@
-import logging
 from collections.abc import Iterator
+from functools import cache
 from typing import TextIO
 
-import yaml
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
-from yaml.error import YAMLError
+from sqlalchemy import Engine, create_engine
+from sqlalchemy.orm import Session, sessionmaker
 
 from accounting_service import models
-from accounting_service.db_settings import connect_args, get_db_url
-
-engine = create_engine(get_db_url(), connect_args=connect_args)
-
-
-def create_db_and_tables() -> None:
-    with engine.begin() as conn:
-        models.Base.metadata.create_all(conn)
+from accounting_service.configuration import load_configuration
+from accounting_service.settings import get_db_url
 
 
-def drop_tables() -> None:
-    with engine.begin() as conn:
-        models.Base.metadata.drop_all(conn)
+@cache
+def get_engine() -> Engine:
+    """The process-wide engine, created on first use.
+
+    Cached because connection pooling wants one engine per process. Call
+    `get_engine.cache_clear()` after changing the configuration.
+    """
+    return create_engine(get_db_url())
+
+
+@cache
+def get_sessionmaker() -> sessionmaker[Session]:
+    """The process-wide session factory. Pass this where a component needs to open sessions."""
+    return sessionmaker(bind=get_engine())
 
 
 def get_session() -> Iterator[Session]:
-    with Session(engine) as session:
+    with get_sessionmaker()() as session:
         yield session
 
 
-def insert_configuration(config: TextIO) -> None:
+def insert_configuration(session: Session, config: TextIO) -> None:
     """
-    This updates the database of prices and items based on the configuration given.
+    Apply a configuration document: the billing items it defines, then its pricing policy.
+
+    The caller owns the transaction, so this does not commit. Raises ConfigurationError for a
+    bad document, before anything is applied.
+
+    Items are applied first, so a document may introduce an item and rate it in the same pass.
+    The policy is mint-or-match: a document whose numbers are already in force writes nothing.
 
     Example config (YAML format):
     items:
       - sku: "my-sku"
         name: "my product"
         unit: "GB-s"
-    prices:
-      - sku: "my-sku"
-        valid_from: "2025-01-01T00:00:00Z"
-        price: 12.34
+    pricing_policy:
+      valid_from: "2025-01-01T00:00:00Z"
+      default_category: standard
+      rates:
+        - sku: "my-sku"
+          credits_per_unit: 12.34
+      category_multipliers:
+        - category: standard
+          multiplier: 1
     """
-    try:
-        config_obj = yaml.safe_load(config)
-        if not isinstance(config_obj, dict):
-            raise YAMLError("Expected a YAML dictionary in config file - check the format")
-    except YAMLError:
-        logging.fatal("accounting-service configuration file is not valid - check the format")
-        raise
+    configuration = load_configuration(config)
 
-    with Session(engine) as session:
-        for item in config_obj.get("items", []):
-            models.BillingItem.upsert_configured_item(session, item)
+    for item in configuration.items:
+        models.BillingItem.upsert_configured_item(session, item)
 
-        for price in config_obj.get("prices", []):
-            models.BillingItemPrice.upsert_configured_price(session, price)
-
-        session.commit()
+    # After the items, so a policy may rate an item the same document introduces.
+    if configuration.pricing_policy is not None:
+        models.PricingPolicy.load_configured_policy(session, configuration.pricing_policy)

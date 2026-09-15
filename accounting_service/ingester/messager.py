@@ -7,12 +7,26 @@ from uuid import UUID
 from eodhp_utils.messagers import Messager, PulsarJSONMessager
 from eodhp_utils.pulsar import messages
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from accounting_service import db, models
+from accounting_service.pricing import UnratedSKUError, price_usage
 
 
 class DBIngester:
+    """Shared database handling for the ingester messagers."""
+
+    def __init__(self, session_factory: sessionmaker[Session] | None = None) -> None:
+        # Messager's own arguments (s3_client, output_bucket, producer) all default and none of
+        # these messagers use them, so there is nothing to forward.
+        super().__init__()
+        self._session_factory = session_factory
+
+    def _session(self) -> Session:
+        # Resolved per call, so constructing a messager needs no database configuration.
+        factory = self._session_factory or db.get_sessionmaker()
+        return factory()
+
     def is_temporary_error(self, e: Exception) -> bool:
         if isinstance(e, OperationalError):
             return True
@@ -20,7 +34,7 @@ class DBIngester:
         return False
 
     def _add_observed_sku(self, msg: messages.BillingEvent | messages.BillingResourceConsumptionRateSample) -> None:
-        with Session(db.engine) as session:
+        with self._session() as session:
             models.BillingItem.ensure_sku_exists(session, str(msg.sku))
             session.commit()
 
@@ -30,14 +44,11 @@ def truncate_to_hour(dt: datetime) -> datetime:
 
 
 class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.BillingEvent, bytes]):
-    """
-    This Messager receives Pulsar messages containing billing events and updates the
-    accounting DB.
-    """
+    """This Messager receives Pulsar messages containing billing events and updates the accounting DB."""
 
     def process_payload(self, obj: messages.BillingEvent) -> Sequence[Messager.Action]:
         try:
-            uuid = self._try_record_event(obj)
+            uuid_ = self._try_record_event(obj)
         except IntegrityError:
             # This is /probably/ because the SKU in the message is unknown.
             #
@@ -49,26 +60,88 @@ class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.Billing
             )
 
             self._add_observed_sku(obj)
-            uuid = self._try_record_event(obj)
+            uuid_ = self._try_record_event(obj)
 
-        if uuid:
-            logging.debug("Recorded BillingEvent with uuid %s", str(uuid))
+        if uuid_:
+            logging.debug("Recorded BillingEvent with uuid %s", str(uuid_))
         else:
             logging.info("Received duplicate BillingEvent uuid %s", obj.uuid)
 
         return []
 
     def _try_record_event(self, bemsg: messages.BillingEvent) -> UUID | None:
-        with Session(db.engine) as session:
-            uuid = models.BillingEvent.insert_from_message(session, bemsg)
+        """Record the event and charge for it, in one transaction."""
+        with self._session() as session:
+            uuid_ = models.BillingEvent.insert_from_message(session, bemsg)
+
+            if uuid_ is not None:
+                self._charge_event(session, uuid_, str(bemsg.sku))
+
             session.commit()
 
-        return uuid
+        return uuid_
+
+    def _charge_event(self, session: Session, event_id: UUID, sku: str) -> None:
+        """Price the event and write the debit."""
+        event = session.get(models.BillingEvent, event_id)
+
+        if event is None:
+            raise AssertionError(f"billing event {event_id} vanished within its own transaction")
+
+        policy = models.PricingPolicy.resolve(session, event.event_start_utc)
+
+        if policy is None:
+            logging.error(
+                "No pricing policy applies to BillingEvent %s at %s - recorded but not charged",
+                event_id,
+                event.event_start_utc.isoformat(),
+            )
+            return
+
+        # None where the workspace has no assignment, which the rate card resolves to the
+        # policy's default category.
+        category = models.WorkspaceCategory.category_for(session, event.workspace)
+
+        try:
+            priced = price_usage(policy.rate_card(), sku=sku, quantity=event.quantity, category=category)
+        except UnratedSKUError:
+            logging.error(
+                "Pricing policy version %s holds no rate for SKU %s - BillingEvent %s recorded but not charged",
+                policy.version,
+                sku,
+                event_id,
+            )
+            return
+        except ValueError:
+            # A negative or non-finite quantity: a producer fault rather than a transient one.
+            logging.exception(
+                "Cannot price quantity %r of %s - BillingEvent %s recorded but not charged",
+                event.quantity,
+                sku,
+                event_id,
+            )
+            return
+
+        debit = models.CreditLedgerTransaction.record_usage_debit(session, event, priced, policy.uuid)
+
+        if debit is None:
+            # The partial unique index refused it, so this event already carries an original
+            # debit - stored before this code shipped, or written by a concurrent consumer.
+            logging.info("BillingEvent %s is already charged", event_id)
+        else:
+            logging.debug(
+                "Charged %s credits to %s for BillingEvent %s under policy version %s, category %s",
+                priced.credits,
+                event.workspace,
+                event_id,
+                policy.version,
+                priced.category,
+            )
 
 
 class WorkspaceSettingsIngesterMessager(DBIngester, PulsarJSONMessager[messages.WorkspaceSettings, bytes]):
     def process_payload(self, obj: messages.WorkspaceSettings) -> Sequence[Messager.Action]:
-        with Session(db.engine) as session:
+        with self._session() as session:
             recorded = models.WorkspaceAccount.record_mapping(session, UUID(str(obj.account)), str(obj.name))
             session.commit()
 
@@ -83,8 +156,7 @@ class WorkspaceSettingsIngesterMessager(DBIngester, PulsarJSONMessager[messages.
 class ConsumptionSampleRateIngesterMessager(
     DBIngester, PulsarJSONMessager[messages.BillingResourceConsumptionRateSample, bytes]
 ):
-    """
-    This Messager receives Pulsar messages containing consumption rate samples and adds them to
+    """This Messager receives Pulsar messages containing consumption rate samples and adds them to
     the accounting DB. It also converts them to estimated BillingEvents periodically.
     """
 
@@ -95,7 +167,7 @@ class ConsumptionSampleRateIngesterMessager(
         # We do this in one hour windows.
         #
         # To do this accurately, we need complete consumption rate data extending at least one
-        # sample beyoned the end of the window, so when we receive a message we generate up
+        # sample beyond the end of the window, so when we receive a message we generate up
         # to the start of the hour containing its timestamp.
         #
         # If a resource is deleted then part of the last hour of use may be uncharged.
@@ -110,7 +182,7 @@ class ConsumptionSampleRateIngesterMessager(
 
     def _record_event(self, msg: messages.BillingResourceConsumptionRateSample) -> None:
         try:
-            uuid = self._try_record_event(msg)
+            uuid_ = self._try_record_event(msg)
         except IntegrityError:
             logging.exception(
                 "IntegrityError recording %s with sku %s - assuming missing BillingItem",
@@ -119,24 +191,22 @@ class ConsumptionSampleRateIngesterMessager(
             )
 
             self._add_observed_sku(msg)
-            uuid = self._try_record_event(msg)
+            uuid_ = self._try_record_event(msg)
 
-        if uuid:
-            logging.debug("Recorded %s with uuid %s", type(msg), str(uuid))
+        if uuid_:
+            logging.debug("Recorded %s with uuid %s", type(msg), str(uuid_))
         else:
             logging.info("Received duplicate %s uuid %s", type(msg), msg.uuid)
 
     def _try_record_event(self, msg: messages.BillingResourceConsumptionRateSample) -> UUID | None:
-        with Session(db.engine) as session:
-            uuid = models.BillableResourceConsumptionRateSample.insert_from_message(session, msg)
+        with self._session() as session:
+            uuid_ = models.BillableResourceConsumptionRateSample.insert_from_message(session, msg)
             session.commit()
 
-        return uuid
+        return uuid_
 
-    @staticmethod
-    def _generate_new_estimates(workspace: str, sku: str, upto: datetime) -> None:
-        """
-        This generates BillingEvents with estimated resource consumption for one hour windows, each
+    def _generate_new_estimates(self, workspace: str, sku: str, upto: datetime) -> None:
+        """This generates BillingEvents with estimated resource consumption for one hour windows, each
         starting on the hour. The first will begin at the end time of the last generated
         BillingItem for this SKU and workspace if any exists, otherwise it will begin at the start
         of the hour in which the first observed consumption rate sample was taken.
@@ -150,7 +220,7 @@ class ConsumptionSampleRateIngesterMessager(
             upto,
         )
 
-        with Session(db.engine) as session:
+        with self._session() as session:
             item = models.BillingItem.find_billing_item(session, sku=sku)
             assert item is not None  # _record_event would have failed without it
 
@@ -193,7 +263,10 @@ class ConsumptionSampleRateIngesterMessager(
                 )
 
                 session.add(
-                    models.BillingEvent(
+                    # item_id is set from the `item` relationship at flush. SQLModel's
+                    # generated __init__ knows nothing about relationships, so pyright reads
+                    # this as a missing argument.
+                    models.BillingEvent(  # pyright: ignore[reportCallIssue]
                         uuid=uuid.uuid5(
                             uuid.UUID("67f9a35c-567c-4a30-b51d-2fc64328bd55"),
                             f"{workspace}-{sku}-{generate_from.isoformat()}",

@@ -5,6 +5,7 @@ import click
 from eodhp_utils.runner import log_component_version, run, setup_logging
 
 from accounting_service import db
+from accounting_service.configuration import ConfigurationError
 from accounting_service.ingester.messager import (
     AccountingIngesterMessager,
     ConsumptionSampleRateIngesterMessager,
@@ -14,10 +15,16 @@ from accounting_service.ingester.messager import (
 
 def load_config_file(filename: str = "/etc/eodh/accounting.conf") -> None:
     try:
-        with open(filename) as f:
-            db.insert_configuration(f)
+        with open(filename) as f, db.get_sessionmaker()() as session:
+            db.insert_configuration(session, f)
+            session.commit()
     except FileNotFoundError:
         logging.warning("Configuration file %s not found - not loading item or price data", filename)
+    except ConfigurationError:
+        # Deliberately fatal. The ingester loads this before it starts consuming, so carrying
+        # on would price events against a config an operator has already got wrong.
+        logging.fatal("Configuration file %s is not valid - refusing to start", filename)
+        raise
 
 
 @click.command
@@ -29,7 +36,6 @@ def cli(takeover: bool, verbose: int, config_file: str, pulsar_url: str | None =
     setup_logging(verbosity=verbose)
     log_component_version("accounting-service")
 
-    db.create_db_and_tables()
     load_config_file(config_file)
 
     messagers: dict[str, Any] = {
