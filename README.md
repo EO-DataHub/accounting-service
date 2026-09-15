@@ -28,6 +28,7 @@ A number of `make` targets are defined:
 - `make dockerbuild`: build a `latest` Docker image (use `make dockerbuild VERSION=1.2.3` for a release image)
 - `make dockerpush`: push a `latest` Docker image (again, you can add `VERSION=1.2.3`)
 
+
 ## Managing dependencies
 
 Dependencies are specified in `pyproject.toml`. After changing them, run `uv sync` to update the lockfile and
