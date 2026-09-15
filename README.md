@@ -112,6 +112,17 @@ Nothing converts credits to money. A user who needs credits asks a hub admin, wh
 
 Run `uv run billing-admin ls` to see every item with its rate under the policy in force, or `uv run billing-admin ls my-sku` for that SKU's rate in every policy.
 
+Over HTTP:
+
+```commandline
+GET /accounting/prices
+GET /accounting/pricing-policy
+```
+
+`prices` is one row per SKU. `pricing-policy` is the whole rate card as one version - every rate, every category multiplier and the default category. Version history is not served; `billing-admin ls my-sku` is the way to read it.
+
+Both need a token, as every endpoint here does. Neither looks at its claims: the rates in force are the same for every caller, but they are not public.
+
 ## Credits and the ledger
 
 Every billing event the ingester records is priced and written to the credit ledger as one debit. The ledger is append-only: nothing updates or deletes a row, and a correction is a new row referencing the one it corrects. Debits are negative and grants positive, so a balance is the sum of the ledger.

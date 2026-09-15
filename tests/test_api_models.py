@@ -23,8 +23,15 @@ from accounting_service.app.models import (
     BillingEventAPIResult,
     BillingItemAPIResult,
     BillingItemRateAPIResult,
+    PricingPolicyAPIResult,
 )
-from accounting_service.models import BillingEvent, BillingItem
+from accounting_service.models import (
+    BillingEvent,
+    BillingItem,
+    PricingPolicy,
+    PricingPolicyCategoryMultiplier,
+    PricingPolicyRate,
+)
 
 
 def an_item(sku: str = "cpu-seconds") -> BillingItem:
@@ -182,3 +189,84 @@ class TestBillingItemRateAPIResult:
         policies, and `uuid` identified a price row nothing asks about.
         """
         assert gone not in BillingItemRateAPIResult.model_fields
+
+
+class TestPricingPolicyAPIResult:
+    """The whole rate card in force, projected from a stored policy."""
+
+    @staticmethod
+    def a_policy(
+        *,
+        rates: tuple[tuple[str, str], ...] = (("cpu-seconds", "0.001"),),
+        multipliers: tuple[tuple[str, str], ...] = (("standard", "1"),),
+    ) -> PricingPolicy:
+        policy = PricingPolicy(
+            version=3,
+            valid_from=datetime(2025, 1, 1, tzinfo=UTC),
+            configured_at=datetime(2024, 12, 20, 9, 30, tzinfo=UTC),
+            default_category="standard",
+        )
+        policy.rates = [
+            PricingPolicyRate(  # pyright: ignore[reportCallIssue]
+                item_id=uuid4(),
+                credits_per_unit=Decimal(credits_per_unit),
+                item=an_item(sku),
+            )
+            for sku, credits_per_unit in rates
+        ]
+        policy.category_multipliers = [
+            PricingPolicyCategoryMultiplier(  # pyright: ignore[reportCallIssue]
+                category=category, multiplier=Decimal(multiplier)
+            )
+            for category, multiplier in multipliers
+        ]
+
+        return policy
+
+    def test_every_field_comes_across(self) -> None:
+        emitted = PricingPolicyAPIResult.of(self.a_policy()).model_dump(mode="json")
+
+        assert emitted == {
+            "version": 3,
+            "valid_from": "2025-01-01T00:00:00Z",
+            "configured_at": "2024-12-20T09:30:00Z",
+            "default_category": "standard",
+            "rates": [{"sku": "cpu-seconds", "credits_per_unit": "0.001"}],
+            "category_multipliers": [{"category": "standard", "multiplier": "1"}],
+        }
+
+    def test_rates_and_multipliers_are_sorted(self) -> None:
+        """Relationship order is whatever the database returned. The response is not."""
+        policy = self.a_policy(
+            rates=(("memory-gb-seconds", "0.002"), ("cpu-seconds", "0.001")),
+            multipliers=(("standard", "1"), ("academic", "0.5")),
+        )
+
+        emitted = PricingPolicyAPIResult.of(policy).model_dump(mode="json")
+
+        assert [rate["sku"] for rate in emitted["rates"]] == ["cpu-seconds", "memory-gb-seconds"]
+        assert [entry["category"] for entry in emitted["category_multipliers"]] == ["academic", "standard"]
+
+    @pytest.mark.parametrize(("stored", "emitted"), [("0.000000412", "0.000000412"), ("0.50", "0.50")])
+    def test_amounts_are_exact_decimal_strings(self, stored: str, emitted: str) -> None:
+        """Both amounts go through ExactDecimal, not just the rate."""
+        policy = self.a_policy(rates=(("cpu-seconds", stored),), multipliers=(("standard", stored),))
+
+        rendered = PricingPolicyAPIResult.of(policy).model_dump(mode="json")
+
+        assert rendered["rates"][0]["credits_per_unit"] == emitted
+        assert rendered["category_multipliers"][0]["multiplier"] == emitted
+
+    def test_a_naive_stored_timestamp_is_taken_as_utc(self) -> None:
+        """configured_at defaults to func.now() and comes back naive from some drivers."""
+        policy = self.a_policy()
+        policy.configured_at = datetime(2024, 12, 20, 9, 30)
+
+        assert PricingPolicyAPIResult.of(policy).model_dump(mode="json")["configured_at"] == "2024-12-20T09:30:00Z"
+
+    @pytest.mark.parametrize("gone", ["uuid", "reason", "corrects_id", "valid_until"])
+    def test_the_audit_fields_are_not_served(self, gone: str) -> None:
+        """The endpoint answers "what am I charged", not "who changed it and why".
+        `billing-admin` is the audit path, and T19 is where an audit trail lands.
+        """
+        assert gone not in PricingPolicyAPIResult.model_fields

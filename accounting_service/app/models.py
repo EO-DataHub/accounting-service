@@ -16,6 +16,7 @@ from pydantic import (
 from accounting_service.models import (
     BillingItemBase,
     CreditLedgerTransaction,
+    PricingPolicy,
     TimeAggregation,
     TransactionType,
 )
@@ -177,6 +178,78 @@ class BillingItemRateAPIResult(BaseModel):
     ]
     valid_from: Annotated[UtcTimestamp, Field(description="When the calibration that set this took effect")]
     policy_version: Annotated[int, Field(description="Which pricing policy version this rate comes from")]
+
+
+class PolicyRateAPIResult(BaseModel):
+    """What one SKU costs per unit under one policy."""
+
+    sku: Annotated[str, Field(description="The product this applies to", examples=["cpu-seconds"])]
+    credits_per_unit: Annotated[
+        ExactDecimal,
+        Field(description="Credits charged per unit, as an exact decimal string", examples=["0.001"]),
+    ]
+
+
+class CategoryMultiplierAPIResult(BaseModel):
+    """What one workspace category multiplies every rate by, under one policy."""
+
+    category: Annotated[str, Field(description="The workspace category", examples=["academic"])]
+    multiplier: Annotated[
+        ExactDecimal,
+        Field(description="Applied to every rate above for a workspace in this category", examples=["0.5"]),
+    ]
+
+
+class PricingPolicyAPIResult(BaseModel):
+    """The whole rate card in force: every rate and every multiplier.
+
+    Narrower than the stored row. `reason`, `corrects_id` and `valid_until` are audit fields,
+    and the audit path is `billing-admin` rather than this endpoint.
+
+    Whether a caller should see every category's multiplier or only their own workspace's is
+    undecided. If it becomes the latter, `of` is where the list is built, and the route's
+    `Vary` has to gain `Authorization` in the same change.
+    """
+
+    version: Annotated[int, Field(description="The policy version these numbers come from", examples=[3])]
+    valid_from: Annotated[UtcTimestamp, Field(description="The usage this policy prices starts here")]
+    configured_at: Annotated[UtcTimestamp, Field(description="When this calibration was recorded")]
+    default_category: Annotated[
+        str,
+        Field(
+            description="The category a workspace prices under when it has no assignment of its own",
+            examples=["standard"],
+        ),
+    ]
+    rates: Annotated[list[PolicyRateAPIResult], Field(description="Every rated SKU, in SKU order")]
+    category_multipliers: Annotated[
+        list[CategoryMultiplierAPIResult],
+        Field(description="Every category multiplier, in category order"),
+    ]
+
+    @classmethod
+    def of(cls, policy: PricingPolicy) -> "PricingPolicyAPIResult":
+        """Project a stored policy into the response, sorted so the order is stable."""
+        return cls(
+            version=policy.version,
+            valid_from=policy.valid_from,
+            configured_at=policy.configured_at,
+            default_category=policy.default_category,
+            rates=sorted(
+                (
+                    PolicyRateAPIResult(sku=rate.item.sku, credits_per_unit=rate.credits_per_unit)
+                    for rate in policy.rates
+                ),
+                key=lambda rate: rate.sku,
+            ),
+            category_multipliers=sorted(
+                (
+                    CategoryMultiplierAPIResult(category=entry.category, multiplier=entry.multiplier)
+                    for entry in policy.category_multipliers
+                ),
+                key=lambda entry: entry.category,
+            ),
+        )
 
 
 class CreditBalanceAPIResult(BaseModel):

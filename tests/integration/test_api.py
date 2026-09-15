@@ -1,3 +1,4 @@
+import re
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager
@@ -7,11 +8,14 @@ from http import HTTPStatus
 from typing import Any
 
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm.session import Session
 
 from accounting_service import models
+from accounting_service.app.app import app as fastapi_app
+from accounting_service.app.authz import decode_jwt_token
 from tests.conftest import (
     TOKEN_MEMBER,
     TOKEN_STRANGER,
@@ -486,20 +490,141 @@ def test_prices_api_is_empty_when_no_policy_is_configured(db_session: Session, c
     assert response.json() == []
 
 
-def _a_policy(session: Session, *, version: int, valid_from: datetime, rate: str) -> models.PricingPolicy:
-    """A policy rating every stored SKU at the same rate."""
+def _a_policy(
+    session: Session,
+    *,
+    version: int,
+    valid_from: datetime,
+    rate: str,
+    configured_at: datetime | None = None,
+    multipliers: tuple[tuple[str, str], ...] = (("standard", "1"),),
+) -> models.PricingPolicy:
+    """A policy rating every stored SKU at the same rate.
+
+    `configured_at` defaults to the column default, which is the transaction timestamp and so
+    is the same for every policy a test writes. Pass it where a response asserts on it.
+    """
     policy = models.PricingPolicy(version=version, valid_from=valid_from, default_category="standard")
+
+    if configured_at is not None:
+        policy.configured_at = configured_at
+
     policy.rates = [
         models.PricingPolicyRate(item_id=item.uuid, credits_per_unit=Decimal(rate))  # pyright: ignore[reportCallIssue]
         for item in session.execute(select(models.BillingItem)).scalars()
     ]
     policy.category_multipliers = [
-        models.PricingPolicyCategoryMultiplier(category="standard", multiplier=Decimal(1))  # pyright: ignore[reportCallIssue]
+        models.PricingPolicyCategoryMultiplier(category=category, multiplier=Decimal(multiplier))  # pyright: ignore[reportCallIssue]
+        for category, multiplier in multipliers
     ]
     session.add(policy)
     session.flush()
 
     return policy
+
+
+def test_pricing_policy_api_returns_the_whole_rate_card_in_force(db_session: Session, client: TestClient) -> None:
+    """One version carrying every rate and every multiplier (D3).
+
+    The same resolution as /accounting/prices, so a calibration dated in the future is not
+    served yet; what this adds is the multipliers and the default category.
+    """
+    ############# Setup
+    db_session.add(models.BillingItem(uuid=uuid.uuid4(), sku="sku2", name="Item b", unit="GBh"))
+    db_session.add(models.BillingItem(uuid=uuid.uuid4(), sku="sku1", name="Item a", unit="GBh"))
+    db_session.flush()
+
+    _a_policy(
+        db_session,
+        version=1,
+        valid_from=datetime(2024, 1, 16, tzinfo=UTC),
+        rate="2.34",
+        configured_at=datetime(2024, 1, 10, 9, 30, tzinfo=UTC),
+        multipliers=(("standard", "1"), ("academic", "0.5")),
+    )
+    _a_policy(db_session, version=2, valid_from=datetime(2999, 1, 1, tzinfo=UTC), rate="99.99")
+
+    ############# Test
+    response = client.get("/accounting/pricing-policy", headers=AUTH_HEADERS)
+
+    ############# Behaviour check
+    assert response.status_code == 200
+    assert response.json() == {
+        "version": 1,
+        "valid_from": "2024-01-16T00:00:00Z",
+        "configured_at": "2024-01-10T09:30:00Z",
+        "default_category": "standard",
+        "rates": [
+            {"sku": "sku1", "credits_per_unit": "2.34"},
+            {"sku": "sku2", "credits_per_unit": "2.34"},
+        ],
+        "category_multipliers": [
+            {"category": "academic", "multiplier": "0.5"},
+            {"category": "standard", "multiplier": "1"},
+        ],
+    }
+
+
+def test_pricing_policy_api_is_404_when_nothing_is_configured(db_session: Session, client: TestClient) -> None:
+    """A single object, so absence is a 404 where /accounting/prices returns an empty list."""
+    response = client.get("/accounting/pricing-policy", headers=AUTH_HEADERS)
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "No pricing policy has been configured"}
+
+
+# Every route this service serves, as of the decision that nothing is anonymously readable.
+# Listed rather than discovered so that adding an endpoint means adding a line here, and a
+# route that reaches production without authorisation cannot do so quietly.
+EVERY_ROUTE = {
+    "GET /workspaces/{workspace}/accounting/usage-data",
+    "GET /workspaces/{workspace}/accounting/balance",
+    "GET /workspaces/{workspace}/accounting/ledger/{transaction}",
+    "GET /accounts/{account_id}/accounting/usage-data",
+    "GET /accounting/skus",
+    "GET /accounting/skus/{sku}",
+    "GET /accounting/prices",
+    "GET /accounting/pricing-policy",
+}
+
+
+def _fill(path: str) -> str:
+    """A concrete URL for a route template.
+
+    Unrecognised parameters become UUIDs, because those are the ones that would answer 422
+    on a bad value and hide the 401 this is looking for.
+    """
+    named = {"workspace": "workspace1", "sku": "sku1"}
+
+    return re.sub(r"\{(\w+)\}", lambda match: named.get(match.group(1), str(uuid.uuid4())), path)
+
+
+def test_no_endpoint_is_readable_without_a_token(db_session: Session, client: TestClient) -> None:
+    """Nothing this service serves is anonymously readable.
+
+    The rates and the SKU list were open until the rule was settled; they are not now. The
+    workspace and account endpoints reach `decode_jwt_token` through their own authorisation
+    dependency, the rest through `require_token`, and this does not care which.
+
+    The decode override has to come off for the real dependency to run, so this is the only
+    test here that sees the bearer scheme itself.
+    """
+    fastapi_app.dependency_overrides.pop(decode_jwt_token)
+
+    served = {
+        f"{method} {route.path}"
+        for route in fastapi_app.routes
+        if isinstance(route, APIRoute)
+        for method in (route.methods or set()) - {"HEAD", "OPTIONS"}
+    }
+
+    assert served == EVERY_ROUTE
+
+    for route in sorted(EVERY_ROUTE):
+        method, path = route.split(" ", 1)
+        response = client.request(method, _fill(path))
+
+        assert response.status_code == 401, f"{route} answered {response.status_code} without a token"
 
 
 def test_usage_data_query_count_does_not_grow_with_the_page(

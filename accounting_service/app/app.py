@@ -25,6 +25,7 @@ from accounting_service.app.authz import MinTier
 from accounting_service.app.dependencies import (
     global_data_cache,
     require_account,
+    require_token,
     require_workspace,
     usage_data_cache,
 )
@@ -43,6 +44,7 @@ from .models import (
     BillingItemRateAPIResult,
     CreditBalanceAPIResult,
     LedgerTransactionAPIResult,
+    PricingPolicyAPIResult,
     UsageQuery,
 )
 
@@ -198,7 +200,7 @@ def get_account_usage_data(
 @app.get(
     "/accounting/skus",
     summary="Describe available billing items (products / stock-keeping units).",
-    dependencies=[Depends(global_data_cache)],
+    dependencies=[Depends(require_token), Depends(global_data_cache)],
 )
 def get_item_list(session: SessionDep) -> list[BillingItemAPIResult]:
     """Returns all available billing items in SKU order. Note that prices must be fetched
@@ -211,7 +213,7 @@ def get_item_list(session: SessionDep) -> list[BillingItemAPIResult]:
 @app.get(
     "/accounting/skus/{sku}",
     summary="Describe a single billing item",
-    dependencies=[Depends(global_data_cache)],
+    dependencies=[Depends(require_token), Depends(global_data_cache)],
 )
 def get_item(session: SessionDep, sku: str) -> BillingItemAPIResult:
     """Returns a specific billing item based on its SKU."""
@@ -226,7 +228,7 @@ def get_item(session: SessionDep, sku: str) -> BillingItemAPIResult:
 @app.get(
     "/accounting/prices",
     summary="Return the current EO DataHub credit rates",
-    dependencies=[Depends(global_data_cache)],
+    dependencies=[Depends(require_token), Depends(global_data_cache)],
 )
 def get_prices(session: SessionDep) -> list[BillingItemRateAPIResult]:
     """Returns the credits charged per unit for every SKU, in SKU order. The unit is defined
@@ -249,3 +251,27 @@ def get_prices(session: SessionDep) -> list[BillingItemRateAPIResult]:
         ),
         key=lambda rate: rate.sku,
     )
+
+
+@app.get(
+    "/accounting/pricing-policy",
+    summary="Return the pricing policy in force",
+    dependencies=[Depends(require_token), Depends(global_data_cache)],
+)
+def get_pricing_policy(session: SessionDep) -> PricingPolicyAPIResult:
+    """Returns the whole rate card that prices usage now: every SKU's credits per unit and
+    every category multiplier.
+
+    `/accounting/prices` serves the same rates one row per SKU, without the multipliers or the
+    default category.
+    """
+    policy = PricingPolicy.resolve(session, datetime.now(UTC))
+
+    if policy is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No pricing policy has been configured",
+            headers={"Cache-Control": "max-age=60"},
+        )
+
+    return PricingPolicyAPIResult.of(policy)
