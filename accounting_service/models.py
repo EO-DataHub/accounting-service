@@ -1182,9 +1182,14 @@ class CreditBalanceSnapshot(SQLModel, table=True):
 
     Keyed on workspace and user the same way budgets are. A null `user` is the whole-pool total
     that the balance endpoint reads; a row naming a user serves a per-user threshold check. The
-    surrogate primary key is because a primary key column cannot be null, and the unique
-    constraint declares NULLS NOT DISTINCT because PostgreSQL otherwise counts two null users
-    as different values and would let one instant be snapshotted twice.
+    surrogate primary key is because a primary key column cannot be null.
+
+    Uniqueness is two partial unique indexes rather than one constraint, because PostgreSQL
+    counts two null users as different values and would let one instant be snapshotted twice.
+    `UNIQUE NULLS NOT DISTINCT` says so in one line and is what this used to declare, but it
+    is PostgreSQL 15 and deployed databases are 14. The pair says the same thing on both:
+    one index covers the rows naming a user, the other the whole-pool rows, where the null is
+    the key rather than a value in it.
 
     Whatever writes a snapshot must take `as_of` from the `recorded_at` of the newest row it
     included, not from the clock: `func.now()` is the transaction timestamp, so rows written
@@ -1200,7 +1205,21 @@ class CreditBalanceSnapshot(SQLModel, table=True):
     balance: Decimal
 
     __table_args__ = (
-        UniqueConstraint("workspace", "user", "as_of", postgresql_nulls_not_distinct=True),
+        Index(
+            "credit_balance_snapshot_user_unique",
+            "workspace",
+            "user",
+            "as_of",
+            unique=True,
+            postgresql_where=text('"user" IS NOT NULL'),
+        ),
+        Index(
+            "credit_balance_snapshot_pool_unique",
+            "workspace",
+            "as_of",
+            unique=True,
+            postgresql_where=text('"user" IS NULL'),
+        ),
         Index("credit_balance_snapshot_lookup_index", "workspace", "user", "as_of"),
     )
 

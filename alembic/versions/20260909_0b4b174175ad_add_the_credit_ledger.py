@@ -114,16 +114,24 @@ def upgrade() -> None:
         sa.Column("as_of", sa.TIMESTAMP(timezone=True), nullable=False),
         sa.Column("balance", sa.Numeric(), nullable=False),
         sa.PrimaryKeyConstraint("uuid", name=op.f("pk_credit_balance_snapshot")),
-        # NULLS NOT DISTINCT so the whole-pool row, which has a null user, stays unique. By
-        # default PostgreSQL treats two null users as different values and would let the same
-        # workspace and instant be snapshotted more than once.
-        sa.UniqueConstraint(
-            "workspace",
-            "user",
-            "as_of",
-            name=op.f("uq_credit_balance_snapshot_workspace"),
-            postgresql_nulls_not_distinct=True,
-        ),
+    )
+    # Uniqueness as two partial indexes, because PostgreSQL treats two null users as different
+    # values and would let the same workspace and instant be snapshotted more than once. The
+    # one-line form for this is `UNIQUE NULLS NOT DISTINCT`, which is PostgreSQL 15; deployed
+    # databases are 14, where it is a syntax error.
+    op.create_index(
+        "credit_balance_snapshot_user_unique",
+        "credit_balance_snapshot",
+        ["workspace", "user", "as_of"],
+        unique=True,
+        postgresql_where=sa.text('"user" IS NOT NULL'),
+    )
+    op.create_index(
+        "credit_balance_snapshot_pool_unique",
+        "credit_balance_snapshot",
+        ["workspace", "as_of"],
+        unique=True,
+        postgresql_where=sa.text('"user" IS NULL'),
     )
     op.create_index(
         "credit_balance_snapshot_lookup_index",
@@ -152,6 +160,16 @@ def downgrade() -> None:
     op.drop_table("workspace_category")
 
     op.drop_index("credit_balance_snapshot_lookup_index", table_name="credit_balance_snapshot")
+    op.drop_index(
+        "credit_balance_snapshot_pool_unique",
+        table_name="credit_balance_snapshot",
+        postgresql_where=sa.text('"user" IS NULL'),
+    )
+    op.drop_index(
+        "credit_balance_snapshot_user_unique",
+        table_name="credit_balance_snapshot",
+        postgresql_where=sa.text('"user" IS NOT NULL'),
+    )
     op.drop_table("credit_balance_snapshot")
 
     op.drop_index("credit_ledger_workspace_recorded_index", table_name="credit_ledger_transaction")
