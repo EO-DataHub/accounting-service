@@ -31,11 +31,12 @@ from accounting_service.app.dependencies import (
 )
 from accounting_service.db import get_session
 from accounting_service.models import (
-    AfterBillingEventNotFound,
     BillingEvent,
     BillingItem,
     CreditLedgerTransaction,
+    PagingCursorNotFound,
     PricingPolicy,
+    UsageRow,
 )
 
 from .models import (
@@ -43,6 +44,7 @@ from .models import (
     BillingItemAPIResult,
     BillingItemRateAPIResult,
     CreditBalanceAPIResult,
+    LedgerQuery,
     LedgerTransactionAPIResult,
     PricingPolicyAPIResult,
     UsageQuery,
@@ -64,9 +66,12 @@ app = FastAPI(root_path=root_path)
 FastAPIInstrumentor.instrument_app(app)
 
 
-@app.exception_handler(AfterBillingEventNotFound)
-def handle_after_billing_event_not_found(_request: Request, exc: AfterBillingEventNotFound) -> JSONResponse:
-    """Paging from an event that does not exist is a 404."""
+@app.exception_handler(PagingCursorNotFound)
+def handle_paging_cursor_not_found(_request: Request, exc: PagingCursorNotFound) -> JSONResponse:
+    """Paging from a row that does not exist is a 404.
+
+    Registered on the base, so it covers `after` on the usage reads and on the ledger alike.
+    """
 
     return JSONResponse(status_code=HTTPStatus.NOT_FOUND, content={"detail": str(exc)})
 
@@ -90,7 +95,7 @@ def get_workspace_usage_data(
 ) -> list[BillingEventAPIResult]:
     """Returns resource consumption data for a workspace within some given time range (or all)."""
 
-    events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
+    usage: Iterator[UsageRow] = BillingEvent.find_billing_events(
         session,
         workspace=workspace,
         start=query.start,
@@ -100,7 +105,7 @@ def get_workspace_usage_data(
         time_aggregation=query.time_aggregation,
     )
 
-    return [BillingEventAPIResult.model_validate(event) for event in events]
+    return [BillingEventAPIResult.model_validate(row) for row in usage]
 
 
 @app.get(
@@ -125,6 +130,44 @@ def get_workspace_balance(
         balance=CreditLedgerTransaction.balance(session, workspace),
         as_of=datetime.now(UTC),
     )
+
+
+@app.get(
+    "/workspaces/{workspace}/accounting/ledger",
+    summary="List a workspace's credit transactions",
+    dependencies=[Depends(require_workspace(MinTier.MEMBER)), Depends(usage_data_cache)],
+)
+def get_ledger(
+    session: SessionDep,
+    workspace: Annotated[
+        str,
+        Path(
+            title="EO DataHub workspace name",
+            description="Credit transactions for this workspace will be returned.",
+            examples=["my-workspace"],
+        ),
+    ],
+    query: Annotated[LedgerQuery, Query()],
+) -> list[LedgerTransactionAPIResult]:
+    """Returns a workspace's credit transactions, newest first.
+
+    Every movement as recorded, including reversals: this is the ledger, not a usage total.
+    `?type=grant` narrows it to credits granted to the workspace.
+
+    The usage endpoints answer a different question - what was consumed and what it cost -
+    and net a correction against the charge it corrects rather than showing either (D12).
+    """
+    transactions = CreditLedgerTransaction.find_transactions(
+        session,
+        workspace=workspace,
+        transaction_type=query.transaction_type,
+        start=query.start,
+        end=query.end,
+        limit=query.limit,
+        after=query.after,
+    )
+
+    return [LedgerTransactionAPIResult.of(transaction) for transaction in transactions]
 
 
 @app.get(
@@ -184,7 +227,7 @@ def get_account_usage_data(
     within some given time range (or all).
     """
 
-    events: Iterator[BillingEvent] = BillingEvent.find_billing_events(
+    usage: Iterator[UsageRow] = BillingEvent.find_billing_events(
         session,
         account=account_id,
         start=query.start,
@@ -194,7 +237,7 @@ def get_account_usage_data(
         time_aggregation=query.time_aggregation,
     )
 
-    return [BillingEventAPIResult.model_validate(event) for event in events]
+    return [BillingEventAPIResult.model_validate(row) for row in usage]
 
 
 @app.get(

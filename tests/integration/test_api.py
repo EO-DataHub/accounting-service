@@ -66,6 +66,7 @@ def test_workspace_usage_data_returns_correct_items_from_db(db_session: Session,
             "item": "sku2",
             "workspace": "workspace2",
             "quantity": 1.23,
+            "credits": "0",
         }
     ]
 
@@ -353,6 +354,7 @@ def test_account_usage_data_returns_correct_items_from_db(db_session: Session, c
             "item": "sku1",
             "workspace": "workspace1",
             "quantity": 1.1,
+            "credits": "0",
         },
         {
             "uuid": str(event_uuids[2]),
@@ -361,6 +363,7 @@ def test_account_usage_data_returns_correct_items_from_db(db_session: Session, c
             "item": "sku3",
             "workspace": "workspace3",
             "quantity": 1.1,
+            "credits": "0",
         },
     ]
 
@@ -579,6 +582,7 @@ def test_pricing_policy_api_is_404_when_nothing_is_configured(db_session: Sessio
 EVERY_ROUTE = {
     "GET /workspaces/{workspace}/accounting/usage-data",
     "GET /workspaces/{workspace}/accounting/balance",
+    "GET /workspaces/{workspace}/accounting/ledger",
     "GET /workspaces/{workspace}/accounting/ledger/{transaction}",
     "GET /accounts/{account_id}/accounting/usage-data",
     "GET /accounting/skus",

@@ -110,8 +110,82 @@ class UsageQuery(BaseModel):
         return datetime_default_to_utc(value)
 
 
+class LedgerQuery(BaseModel):
+    """The query parameters for the ledger list endpoint.
+
+    Deliberately not UsageQuery. They share three parameters by coincidence rather than by
+    contract: a ledger row is a movement of credits and has no period to aggregate over, and
+    `type` has no counterpart in a usage read.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    transaction_type: Annotated[
+        TransactionType | None,
+        Field(
+            default=None,
+            alias="type",
+            title="Kind of movement to return",
+            description=(
+                "Restrict the result to one kind of movement - 'grant', 'debit' or 'reversal'. "
+                "Omit the parameter for all three; any other value is rejected."
+            ),
+            examples=["grant"],
+        ),
+    ]
+    start: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            title="Start timestamp (RFC8601 timestamp)",
+            description="Only transactions which occurred at or after this time are included",
+            examples=["2025-02-12T13:34:22Z"],
+        ),
+    ]
+    end: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            title="End timestamp (RFC8601 timestamp)",
+            description="Only transactions which occurred before this time are included",
+            examples=["2025-02-15T13:34:22Z"],
+        ),
+    ]
+    limit: Annotated[
+        int,
+        Field(
+            default=100,
+            ge=1,
+            title="Maximum number of results to return",
+            description="When paging, set this to the page size and use 'after' to fetch subsequent pages",
+            examples=[200],
+        ),
+    ]
+    after: Annotated[
+        UUID | None,
+        Field(
+            default=None,
+            title="Paging continuation location",
+            description=(
+                "When paging with 'limit', set this to the UUID of the last transaction you "
+                "saw to get the next page of results."
+            ),
+            examples=["456e15d1-d01b-4060-8b7b-85b93ecbf050"],
+        ),
+    ]
+
+    @field_validator("start", "end")
+    @classmethod
+    def _naive_timestamp_means_utc(cls, value: datetime | None) -> datetime | None:
+        """A timestamp arriving without an offset is taken to be UTC."""
+        return datetime_default_to_utc(value)
+
+
 # No shared base with BillingEvent: the response exposes `item` as a SKU string where the
-# table has a relationship.
+# table has a relationship, and `credits` is not on the table at all.
+#
+# Validated from a `UsageRow` rather than from a BillingEvent, so every alias path reaches
+# through `event` and `credits` is read from the row beside it.
 class BillingEventAPIResult(BaseModel):
     """
     Billing events represent the consumption of a chargeable resource, often over some time
@@ -120,33 +194,64 @@ class BillingEventAPIResult(BaseModel):
 
     All consumption happens within a specific workspace and all charges are attributed to
     a single workspace.
+
+    Both figures for the same consumption: `quantity` is what was metered, `credits` is what
+    it cost.
     """
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
-    uuid: UUID
+    uuid: Annotated[UUID, Field(validation_alias=AliasPath("event", "uuid"))]
     event_start: Annotated[
         UtcTimestamp,
-        Field(description="Start time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
+        Field(
+            validation_alias=AliasPath("event", "event_start"),
+            description="Start time of resource consumption",
+            examples=["2025-02-12T13:34:22Z"],
+        ),
     ]
     event_end: Annotated[
         UtcTimestamp,
-        Field(description="End time of resource consumption", examples=["2025-02-12T13:34:22Z"]),
+        Field(
+            validation_alias=AliasPath("event", "event_end"),
+            description="End time of resource consumption",
+            examples=["2025-02-12T13:34:22Z"],
+        ),
     ]
     item: Annotated[
         str,
         Field(
-            validation_alias=AliasPath("item", "sku"),
+            validation_alias=AliasPath("event", "item", "sku"),
             description="Item (SKU) consumed",
             examples=["wfcpu"],
         ),
     ]
-    workspace: Annotated[str, Field(description="Workspace which consumed the resource", examples=["my-workspace"])]
+    workspace: Annotated[
+        str,
+        Field(
+            validation_alias=AliasPath("event", "workspace"),
+            description="Workspace which consumed the resource",
+            examples=["my-workspace"],
+        ),
+    ]
     quantity: Annotated[
         float,
         Field(
+            validation_alias=AliasPath("event", "quantity"),
             description="Quantity consumed in the units defined in the item definition",
             examples=["0.42"],
+        ),
+    ]
+    credits: Annotated[
+        ExactDecimal,
+        Field(
+            description=(
+                "Credits this consumption cost, as an exact decimal string. Positive, unlike "
+                "the ledger's own signing, so it reads alongside `quantity`. Net of any "
+                "correction, so a fully reversed charge reports 0 - as does usage recorded "
+                "before any pricing policy covered it."
+            ),
+            examples=["1.8"],
         ),
     ]
 

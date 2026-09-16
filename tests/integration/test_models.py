@@ -164,7 +164,7 @@ def test_finding_billing_events_for_workspace(db_session: Session) -> None:
     )
 
     ############# Behaviour check
-    bes = list(bes)
+    bes = [row.event for row in bes]
 
     print(repr(bes))
 
@@ -203,9 +203,9 @@ def test_paging_billing_events_produces_all_events_once(db_session: Session) -> 
 
     ############# Test
     assert len(list(models.BillingEvent.find_billing_events(db_session, limit=200))) == 5
-    bes1 = list(models.BillingEvent.find_billing_events(db_session, limit=2))
-    bes2 = list(models.BillingEvent.find_billing_events(db_session, limit=2, after=bes1[-1].uuid))
-    bes3 = list(models.BillingEvent.find_billing_events(db_session, limit=2, after=bes2[-1].uuid))
+    bes1 = [row.event for row in models.BillingEvent.find_billing_events(db_session, limit=2)]
+    bes2 = [row.event for row in models.BillingEvent.find_billing_events(db_session, limit=2, after=bes1[-1].uuid)]
+    bes3 = [row.event for row in models.BillingEvent.find_billing_events(db_session, limit=2, after=bes2[-1].uuid)]
 
     ############# Behaviour check
     assert len(bes1) == 2

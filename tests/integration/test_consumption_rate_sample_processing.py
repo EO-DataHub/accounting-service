@@ -65,7 +65,7 @@ def test_messages_across_two_hours_generates_appropriate_billing_events(
     assert not failures2.any_permanent()
     assert not failures2.any_temporary()
 
-    bes = list(models.BillingEvent.find_billing_events(db_session, str(crs1.workspace)))
+    bes = [row.event for row in models.BillingEvent.find_billing_events(db_session, str(crs1.workspace))]
     assert len(bes) == 2
 
     assert bes[0].event_start_utc == datetime(2025, 1, 1, 1, 0, 0, tzinfo=UTC)
