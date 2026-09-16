@@ -19,7 +19,10 @@ import sys
 
 from testcontainers.community.postgres import PostgresContainer
 
-IMAGE = "postgres:17"
+# Match the oldest deployed PostgreSQL, not the newest available. Deployed databases are 14,
+# where `UNIQUE NULLS NOT DISTINCT` is a syntax error; checking on 17 passed a revision that
+# could not apply in production. Override with PG_IMAGE to try another version.
+IMAGE = os.environ.get("PG_IMAGE", "postgres:14")
 
 # Alembic's plugin registration lines say nothing useful and there are seven of them.
 NOISE = "INFO  [alembic.runtime.plugins]"

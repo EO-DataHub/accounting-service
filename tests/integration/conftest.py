@@ -43,10 +43,14 @@ def postgres_container() -> Iterator[PostgresContainer]:
     A real PostgreSQL because the schema cannot be expressed in SQLite: date_trunc expression
     indexes have no equivalent.
 
+    The version matches the oldest deployed database rather than the newest available, so a
+    feature the deployed estate does not have fails here rather than in a migration job. See
+    the note in dev/check_migrations.py. Override with PG_IMAGE.
+
     A container rather than a shared instance because the suite creates the schema, so the
     tests cannot destroy a real database - they never learn how to reach one.
     """
-    with PostgresContainer("postgres:17", driver="psycopg") as container:
+    with PostgresContainer(os.environ.get("PG_IMAGE", "postgres:14"), driver="psycopg") as container:
         os.environ["SQL_DRIVER"] = "postgresql+psycopg"
         os.environ["SQL_HOST"] = container.get_container_host_ip()
         os.environ["SQL_PORT"] = str(container.get_exposed_port(5432))
