@@ -8,7 +8,7 @@ from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Self
+from typing import Any, NamedTuple, Self
 from uuid import UUID, uuid4
 
 import eodhp_utils.pulsar.messages
@@ -19,8 +19,10 @@ from sqlalchemy import (
     CursorResult,
     Index,
     MetaData,
+    Numeric,
     UniqueConstraint,
     and_,
+    column,
     func,
     or_,
     select,
@@ -465,10 +467,42 @@ class TimeAggregation(StrEnum):
     MONTH = "month"
 
 
-class AfterBillingEventNotFound(Exception):
+class PagingCursorNotFound(Exception):
+    """Raised when paging from a row that does not exist.
+
+    One base so the API maps every such case to a 404 through a single handler, rather than
+    growing a handler per read.
+    """
+
+
+class AfterBillingEventNotFound(PagingCursorNotFound):
     """Raised when paging and specifying the page after an unknown event"""
 
     pass
+
+
+class AfterTransactionNotFound(PagingCursorNotFound):
+    """Raised when paging and specifying the page after an unknown ledger transaction"""
+
+    pass
+
+
+class UsageRow(NamedTuple):
+    """One row of usage: what was consumed, and what it cost.
+
+    `credits` is positive - the credits this usage consumed - so it reads alongside
+    `quantity` rather than against it. The ledger stores a debit negative, and this is the
+    negation of the sum over every ledger row referencing the event, so a reversal nets
+    against the charge it corrects (D12) and a fully reversed charge reports zero.
+
+    Zero also means "not charged": usage recorded before any policy priced it keeps its
+    quantity and reports no credits (`ingester/messager.py` logs each such event at error).
+    The two cases are indistinguishable here by design - this endpoint reports what the
+    ledger holds, and the audit surface is where an uncharged event is a finding.
+    """
+
+    event: "BillingEvent"
+    credits: Decimal
 
 
 class BillingEvent(SQLModel, table=True):
@@ -544,15 +578,34 @@ class BillingEvent(SQLModel, table=True):
         after: UUID | None = None,
         limit: int = 5_000,
         time_aggregation: TimeAggregation | None = None,
-    ) -> Iterator[Self]:
+    ) -> Iterator[UsageRow]:
         """
-        Find and return BillingEvents matching some criteria.
+        Find and return BillingEvents matching some criteria, each with what it cost.
 
         For paging, `after` should be the UUID of the last billing event on the previous page.
 
         time_aggregation gives daily or monthly totals for each SKU+workspace pair. Anything
         outside TimeAggregation raises ValueError rather than being ignored.
+
+        Credits come from the ledger through a per-event sub-SELECT rather than from a direct
+        join. One event carries one debit and may carry several corrections, so joining the
+        ledger rows in would fan out and multiply `SUM(quantity)` by the number of rows. See
+        `UsageRow` for what the figure means.
         """
+        # What one event cost: every ledger row referencing it, summed, one row per event.
+        # Both branches below need this and neither can share a spelling with the other - the
+        # aggregated branch has to fold credits in before its own GROUP BY, which puts the
+        # sub-SELECT inside the text(). Change one and change the other.
+        charged = (
+            select(
+                col(CreditLedgerTransaction.billing_event_id).label("billing_event_id"),
+                func.sum(col(CreditLedgerTransaction.credits)).label("credits"),
+            )
+            .where(col(CreditLedgerTransaction.billing_event_id).is_not(None))
+            .group_by(col(CreditLedgerTransaction.billing_event_id))
+            .subquery()
+        )
+
         # With no aggregation the raw table is the source of rows to filter, sort, page and
         # return. With aggregation it is a sub-SELECT computing the totals, and the UUID
         # assigned is the lexicographically largest of the rows aggregated. That can misbehave
@@ -562,26 +615,41 @@ class BillingEvent(SQLModel, table=True):
             # closed set has to be enforced at runtime and not only in the type hints.
             period = TimeAggregation(time_aggregation).value
 
-            period_start_expr = f"date_trunc('{period}', event_start AT TIME ZONE 'UTC')"
-            period_end_expr = f"{period_start_expr} + '1 {period}'::interval"
-            uuid_expr = "CAST(MAX(CAST(uuid AS TEXT)) AS UUID)"
+            events = str(cls.__tablename__)
+            ledger = str(CreditLedgerTransaction.__tablename__)
 
+            period_start_expr = f"date_trunc('{period}', {events}.event_start AT TIME ZONE 'UTC')"
+            period_end_expr = f"{period_start_expr} + '1 {period}'::interval"
+            uuid_expr = f"CAST(MAX(CAST({events}.uuid AS TEXT)) AS UUID)"
+
+            # The LEFT JOIN is to one row per event, not to the ledger itself: an event carries
+            # one debit and may carry corrections, and joining those in directly would repeat
+            # each event's quantity once per ledger row.
             select_aggregated_events = text(
                 f"""
 SELECT {uuid_expr} as uuid,
        {period_start_expr} AS event_start,
        {period_end_expr} AS event_end,
-       item_id,
+       {events}.item_id,
        NULL AS user,
-       workspace,
-       SUM(quantity) AS quantity
-FROM {cls.__tablename__}
+       {events}.workspace,
+       SUM({events}.quantity) AS quantity,
+       -COALESCE(SUM(charged.credits), 0) AS credits
+FROM {events}
+LEFT JOIN (
+    SELECT billing_event_id, SUM(credits) AS credits
+    FROM {ledger}
+    WHERE billing_event_id IS NOT NULL
+    GROUP BY billing_event_id
+) charged ON charged.billing_event_id = {events}.uuid
 GROUP BY 2, 3, 4, 6
 """
             )
 
             # The table's own columns, not the ORM attributes. `.columns()` describes the result
             # of the text above, so a Column is what it wants, and col() hands back `Mapped[...]`.
+            # `credits` is not a BillingEvent column, so it is declared here rather than taken
+            # from the table.
             table = SQLModel.metadata.tables[str(cls.__tablename__)]
             select_aggregated_events = select_aggregated_events.columns(
                 table.c.uuid,
@@ -591,11 +659,17 @@ GROUP BY 2, 3, 4, 6
                 table.c.user,
                 table.c.workspace,
                 table.c.quantity,
+                column("credits", Numeric),
             )
 
-            billingevent_src = aliased(BillingEvent, select_aggregated_events.subquery())
+            aggregated = select_aggregated_events.subquery()
+            billingevent_src = aliased(BillingEvent, aggregated)
+            credits_col = aggregated.c.credits
         else:
             billingevent_src = cls
+            # Negated and defaulted here rather than in the sub-SELECT, which stays as the
+            # ledger stores it. NULL is an event with no ledger row at all.
+            credits_col = -func.coalesce(charged.c.credits, 0)
 
         # The join exists for the ordering and paging predicates below, which compare
         # BillingItem.sku. It does not populate `item`, so reading event.item.sku on the way out
@@ -611,10 +685,16 @@ GROUP BY 2, 3, 4, 6
         item_sku = col(BillingItem.sku)
 
         all_billing_events = (
-            select(billingevent_src)
+            select(billingevent_src, credits_col.label("credits"))
             .join(BillingItem, col(BillingItem.uuid) == col(billingevent_src.item_id))
             .options(selectinload(billingevent_src.item))  # pyright: ignore[reportArgumentType]
         )
+
+        # The aggregated branch has already folded credits in, so only the raw one joins.
+        if time_aggregation is None:
+            all_billing_events = all_billing_events.outerjoin(
+                charged, charged.c.billing_event_id == col(billingevent_src.uuid)
+            )
 
         # We need a complete and certain order so that the 'after' parameter works.
         query = all_billing_events.order_by(
@@ -680,7 +760,7 @@ GROUP BY 2, 3, 4, 6
                 ),
             )
 
-        return map(lambda r: r[0], session.execute(query))
+        return (UsageRow(row[0], Decimal(row.credits or 0)) for row in session.execute(query))
 
     @classmethod
     def find_latest_billing_event(
@@ -1135,6 +1215,79 @@ class CreditLedgerTransaction(SQLModel, table=True):
             query = query.where(col(cls.workspace) == workspace)
 
         return session.execute(query).scalars().first()
+
+    @classmethod
+    def find_transactions(
+        cls,
+        session: Session,
+        workspace: str,
+        transaction_type: TransactionType | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        after: UUID | None = None,
+        limit: int = 100,
+    ) -> Iterator[Self]:
+        """The workspace's ledger, newest first, for the API.
+
+        Every row as stored, including reversals: this is the ledger rather than a usage
+        total, and a correction is a movement a reader can see in their balance. The usage
+        endpoints net a reversal against the charge it corrects and show neither (D12).
+
+        Ordered on `recorded_at` like `recent_transactions`, so a backfilled event appears at
+        the top rather than buried at its occurrence date. `start` and `end` filter on
+        `occurred_at`, which is what a date picker means.
+
+        For paging, `after` is the UUID of the last transaction on the previous page. The
+        ordering is total - `(recorded_at, uuid)` descending - so a row is never skipped or
+        repeated across pages.
+
+        `policy` is loaded because the response explains a charge. `recent_transactions` is
+        the CLI's narrower read and loads only `item`.
+        """
+        query = (
+            select(cls)
+            .options(
+                selectinload(cls.item),  # pyright: ignore[reportArgumentType]
+                selectinload(cls.policy).options(  # pyright: ignore[reportArgumentType]
+                    *_policy_load_options()
+                ),
+            )
+            .where(col(cls.workspace) == workspace)
+            .order_by(col(cls.recorded_at).desc(), col(cls.uuid).desc())
+            .limit(limit)
+        )
+
+        if transaction_type is not None:
+            query = query.where(col(cls.transaction_type) == TransactionType(transaction_type))
+
+        if start is not None:
+            query = query.where(col(cls.occurred_at) >= start)
+
+        if end is not None:
+            query = query.where(col(cls.occurred_at) < end)
+
+        if after is not None:
+            after_row = session.execute(
+                select(cls).where(col(cls.uuid) == after, col(cls.workspace) == workspace)
+            ).scalar_one_or_none()
+
+            if after_row is None:
+                raise AfterTransactionNotFound(f"No transaction matching after={after} found")
+
+            # Strictly after `after_row` in the descending order above, spelled out as a
+            # lexicographic comparison for the same reason as in `find_billing_events`.
+            query = query.where(
+                col(cls.recorded_at) <= after_row.recorded_at,
+                or_(
+                    col(cls.recorded_at) < after_row.recorded_at,
+                    and_(
+                        col(cls.recorded_at) == after_row.recorded_at,
+                        col(cls.uuid) < after,
+                    ),
+                ),
+            )
+
+        return iter(session.execute(query).scalars().all())
 
     @classmethod
     def recent_transactions(cls, session: Session, workspace: str, limit: int = 50) -> Sequence[Self]:

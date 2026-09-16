@@ -10,8 +10,10 @@ tested here is that the arithmetic reaches a row, that the row survives redelive
 the charge can still be explained from what the row stores (T8, T9, T10, T13).
 """
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -34,6 +36,7 @@ from accounting_service.models import (
     TransactionType,
     WorkspaceCategory,
 )
+from tests.conftest import TOKEN_STRANGER
 from tests.integration.conftest import bemsg_to_pulsar_msg
 
 JANUARY = datetime(2025, 1, 1, tzinfo=UTC)
@@ -655,3 +658,260 @@ class TestTheBalanceEndpoint:
         db_session.commit()
 
         assert client.get(f"/workspaces/{WORKSPACE}/accounting/balance").json()["balance"] == "0.000000412"
+
+
+class TestUsageDataReportsCredits:
+    """The usage endpoints report what consumption cost, not only what was metered.
+
+    The credits come from the ledger through a per-event sub-SELECT in
+    `find_billing_events`, so what is tested here is that the figure arrives, that its sign
+    is flipped for a reader, and that joining the ledger in has not multiplied the quantity.
+    """
+
+    def test_a_charged_event_reports_its_cost(
+        self,
+        client: TestClient,
+        db_session: Session,
+        db_session_factory: sessionmaker[Session],
+        policy: PricingPolicy,
+    ) -> None:
+        """Positive here, negative in the ledger: the endpoint reports consumption."""
+        AccountingIngesterMessager(session_factory=db_session_factory).consume(bemsg_to_pulsar_msg(a_usage_message()))
+
+        (debit,) = debits(db_session)
+        (row,) = client.get(f"/workspaces/{WORKSPACE}/accounting/usage-data").json()
+
+        assert debit.credits == Decimal("-3.6000")
+        assert row["credits"] == "3.6000"
+        assert row["quantity"] == 3600.0
+
+    def test_usage_recorded_before_any_policy_reports_zero(
+        self, client: TestClient, db_session: Session, item: BillingItem
+    ) -> None:
+        """No policy, so the ingester recorded the event and wrote no debit.
+
+        The quantity survives and the cost is zero rather than null, so a reader has two
+        cases rather than three. `ingester/messager.py` logs each of these at error level,
+        which is where an uncharged event is meant to be noticed.
+        """
+        db_session.add(
+            models.BillingEvent(
+                event_start=JANUARY,
+                event_end=JANUARY + timedelta(hours=1),
+                item_id=item.uuid,
+                workspace=WORKSPACE,
+                quantity=3600.0,
+            )
+        )
+        db_session.commit()
+
+        (row,) = client.get(f"/workspaces/{WORKSPACE}/accounting/usage-data").json()
+
+        assert row["credits"] == "0"
+        assert row["quantity"] == 3600.0
+
+    def test_a_reversal_nets_against_the_charge_and_does_not_repeat_the_quantity(
+        self,
+        client: TestClient,
+        db_session: Session,
+        db_session_factory: sessionmaker[Session],
+        policy: PricingPolicy,
+    ) -> None:
+        """D12, and the reason credits are summed in a sub-SELECT rather than joined.
+
+        An event carries one debit and may carry corrections. Joining those rows directly
+        would repeat the event once per ledger row and double its quantity, which is the
+        failure this asserts against.
+        """
+        AccountingIngesterMessager(session_factory=db_session_factory).consume(bemsg_to_pulsar_msg(a_usage_message()))
+
+        (debit,) = debits(db_session)
+        db_session.add(
+            CreditLedgerTransaction(
+                workspace=WORKSPACE,
+                transaction_type=TransactionType.REVERSAL,
+                credits=-debit.credits,
+                billing_event_id=debit.billing_event_id,
+                item_id=debit.item_id,
+                quantity=debit.quantity,
+                policy_id=debit.policy_id,
+                category=debit.category,
+                occurred_at=debit.occurred_at,
+                reverses_id=debit.uuid,
+                correction_batch_id=uuid4(),
+                reason="test reversal",
+            )
+        )
+        db_session.commit()
+
+        rows = client.get(f"/workspaces/{WORKSPACE}/accounting/usage-data").json()
+
+        assert len(rows) == 1
+        # Compared as a number: what matters is that it nets to nothing, and the scale of a
+        # zero that came out of NUMERIC arithmetic is not part of the contract.
+        assert Decimal(rows[0]["credits"]) == 0
+        assert rows[0]["quantity"] == 3600.0
+
+    def test_the_daily_aggregate_totals_credits(
+        self,
+        client: TestClient,
+        db_session: Session,
+        db_session_factory: sessionmaker[Session],
+        policy: PricingPolicy,
+    ) -> None:
+        """Two events on the same day and SKU collapse to one row carrying both totals."""
+        messager = AccountingIngesterMessager(session_factory=db_session_factory)
+        messager.consume(bemsg_to_pulsar_msg(a_usage_message(quantity=3600.0)))
+        messager.consume(bemsg_to_pulsar_msg(a_usage_message(quantity=1800.0)))
+
+        (row,) = client.get(f"/workspaces/{WORKSPACE}/accounting/usage-data?time-aggregation=day").json()
+
+        assert row["quantity"] == 5400.0
+        assert Decimal(row["credits"]) == Decimal("5.4")
+
+    def test_a_grant_never_appears_as_usage(
+        self, client: TestClient, db_session: Session, policy: PricingPolicy
+    ) -> None:
+        """A grant has no billing event, so there is nothing for it to be usage of."""
+        CreditLedgerTransaction.record_grant(db_session, WORKSPACE, Decimal(100), reason="test")
+        db_session.commit()
+
+        assert client.get(f"/workspaces/{WORKSPACE}/accounting/usage-data").json() == []
+
+
+class TestTheLedgerEndpoint:
+    """The ledger as a list: every movement, newest first, optionally one kind of movement.
+
+    Distinct from the usage endpoints above, which net a correction away and show neither
+    the charge nor the reversal (D12). This is the raw record, because a correction is a
+    movement a reader can see in their balance.
+    """
+
+    def test_it_lists_every_kind_of_movement(
+        self,
+        client: TestClient,
+        db_session: Session,
+        db_session_factory: sessionmaker[Session],
+        policy: PricingPolicy,
+    ) -> None:
+        """A grant and a usage debit, both as stored and both signed as stored."""
+        CreditLedgerTransaction.record_grant(db_session, WORKSPACE, Decimal(100), reason="opening balance")
+        db_session.commit()
+        AccountingIngesterMessager(session_factory=db_session_factory).consume(bemsg_to_pulsar_msg(a_usage_message()))
+
+        body = client.get(f"/workspaces/{WORKSPACE}/accounting/ledger").json()
+
+        assert {row["transaction_type"]: row["credits"] for row in body} == {
+            "grant": "100",
+            "debit": "-3.6000",
+        }
+
+    def test_it_is_ordered_newest_recorded_first(self, client: TestClient, db_session: Session) -> None:
+        """`recorded_at`, not `occurred_at`: a backfilled event belongs at the top, where it
+        can be noticed, rather than buried at the date the usage happened.
+
+        The timestamps are set rather than left to default. Every write in one test shares a
+        transaction here, and `func.now()` is the transaction's start time, so defaulted rows
+        would all carry the same instant and this would be asserting on the uuid tiebreak.
+        """
+        for n, recorded in enumerate([JANUARY, JANUARY + timedelta(days=2), JANUARY + timedelta(days=1)]):
+            db_session.add(
+                CreditLedgerTransaction(
+                    workspace=WORKSPACE,
+                    transaction_type=TransactionType.GRANT,
+                    credits=Decimal(n),
+                    reason=f"grant {n}",
+                    occurred_at=JANUARY,
+                    recorded_at=recorded,
+                )
+            )
+        db_session.commit()
+
+        body = client.get(f"/workspaces/{WORKSPACE}/accounting/ledger").json()
+
+        assert [row["reason"] for row in body] == ["grant 1", "grant 2", "grant 0"]
+
+    def test_the_type_filter_returns_grants_alone(
+        self,
+        client: TestClient,
+        db_session: Session,
+        db_session_factory: sessionmaker[Session],
+        policy: PricingPolicy,
+    ) -> None:
+        CreditLedgerTransaction.record_grant(db_session, WORKSPACE, Decimal(100), reason="opening balance")
+        db_session.commit()
+        AccountingIngesterMessager(session_factory=db_session_factory).consume(bemsg_to_pulsar_msg(a_usage_message()))
+
+        body = client.get(f"/workspaces/{WORKSPACE}/accounting/ledger?type=grant").json()
+
+        assert len(body) == 1
+        assert body[0]["transaction_type"] == "grant"
+        assert body[0]["reason"] == "opening balance"
+        assert body[0]["credits"] == "100"
+
+    def test_a_grant_carries_no_pricing_and_no_user(self, client: TestClient, db_session: Session) -> None:
+        """A grant is not priced and belongs to the workspace pool rather than to a member."""
+        CreditLedgerTransaction.record_grant(db_session, WORKSPACE, Decimal(100), reason="test")
+        db_session.commit()
+
+        (row,) = client.get(f"/workspaces/{WORKSPACE}/accounting/ledger?type=grant").json()
+
+        assert row["pricing"] is None
+        assert row["user"] is None
+
+    def test_an_unknown_transaction_type_is_rejected(self, client: TestClient) -> None:
+        """Closed set, like `time-aggregation` on the usage reads."""
+        assert client.get(f"/workspaces/{WORKSPACE}/accounting/ledger?type=refund").status_code == 422
+
+    def test_another_workspace_is_not_visible(self, client: TestClient, db_session: Session) -> None:
+        """The path scopes the read. A hub_admin token passes the tier check, and this is
+        still not a listing of everybody's credits."""
+        CreditLedgerTransaction.record_grant(db_session, "other-workspace", Decimal(500), reason="theirs")
+        CreditLedgerTransaction.record_grant(db_session, WORKSPACE, Decimal(100), reason="ours")
+        db_session.commit()
+
+        body = client.get(f"/workspaces/{WORKSPACE}/accounting/ledger").json()
+
+        assert [row["reason"] for row in body] == ["ours"]
+
+    def test_paging_produces_every_transaction_once(self, client: TestClient, db_session: Session) -> None:
+        for n in range(5):
+            CreditLedgerTransaction.record_grant(
+                db_session,
+                WORKSPACE,
+                Decimal(n),
+                reason=f"grant {n}",
+                occurred_at=JANUARY + timedelta(days=n),
+            )
+            # Flushed one at a time so `recorded_at` orders them: the default is func.now(),
+            # which is the transaction's start time and identical across a single flush. The
+            # uuid tiebreak is what actually makes the order total, and this exercises it.
+            db_session.flush()
+        db_session.commit()
+
+        seen: list[str] = []
+        after = ""
+        for _ in range(3):
+            page = client.get(f"/workspaces/{WORKSPACE}/accounting/ledger?limit=2{after}").json()
+            seen.extend(row["uuid"] for row in page)
+
+            if not page:
+                break
+
+            after = f"&after={page[-1]['uuid']}"
+
+        assert len(seen) == 5
+        assert len(set(seen)) == 5
+
+    def test_paging_from_an_unknown_transaction_is_not_found(self, client: TestClient) -> None:
+        response = client.get(f"/workspaces/{WORKSPACE}/accounting/ledger?after={uuid4()}")
+
+        assert response.status_code == 404
+
+    def test_a_stranger_is_refused(
+        self, client: TestClient, authenticate_as: Callable[[dict[str, Any]], None]
+    ) -> None:
+        """Same tier check as every other read under /workspaces/{workspace}/."""
+        authenticate_as(TOKEN_STRANGER)
+
+        assert client.get(f"/workspaces/{WORKSPACE}/accounting/ledger").status_code == 401

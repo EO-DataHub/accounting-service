@@ -31,6 +31,7 @@ from accounting_service.models import (
     PricingPolicy,
     PricingPolicyCategoryMultiplier,
     PricingPolicyRate,
+    UsageRow,
 )
 
 
@@ -64,6 +65,15 @@ def an_event(
     )
 
 
+def a_usage_row(event: BillingEvent | None = None, credits: Decimal = Decimal("1.8")) -> UsageRow:
+    """What the usage endpoints map: an event, and what the ledger charged for it.
+
+    The response is validated from the pair rather than from the event, because `credits`
+    is not on the table.
+    """
+    return UsageRow(event=event or an_event(), credits=credits)
+
+
 class TestBillingItemAPIResult:
     """Shares BillingItemBase with the table, so there is nothing to map."""
 
@@ -93,14 +103,14 @@ class TestBillingEventAPIResult:
         Expressed as a validation alias rather than a constructor, so this is the test that
         the alias path still reaches through the relationship.
         """
-        result = BillingEventAPIResult.model_validate(an_event(item=an_item(sku="EFS-STORAGE-STD")))
+        result = BillingEventAPIResult.model_validate(a_usage_row(an_event(item=an_item(sku="EFS-STORAGE-STD"))))
 
         assert result.item == "EFS-STORAGE-STD"
 
     def test_the_scalar_fields_come_across(self) -> None:
         event = an_event(workspace="other-workspace", quantity=42.5)
 
-        result = BillingEventAPIResult.model_validate(event)
+        result = BillingEventAPIResult.model_validate(a_usage_row(event))
 
         assert result.uuid == event.uuid
         assert result.workspace == "other-workspace"
@@ -111,7 +121,7 @@ class TestBillingEventAPIResult:
         the response has always claimed UTC with a Z suffix."""
         one_am_utc_as_two_am_plus_one = datetime(2025, 6, 15, 2, 0, tzinfo=timezone(timedelta(hours=1)))
 
-        result = BillingEventAPIResult.model_validate(an_event(event_start=one_am_utc_as_two_am_plus_one))
+        result = BillingEventAPIResult.model_validate(a_usage_row(an_event(event_start=one_am_utc_as_two_am_plus_one)))
 
         assert result.event_start == datetime(2025, 6, 15, 1, 0, tzinfo=UTC)
 
@@ -121,7 +131,7 @@ class TestBillingEventAPIResult:
         Without the validator it would serialise with no offset at all, which is a silently
         different wire format from every other timestamp the API emits.
         """
-        result = BillingEventAPIResult.model_validate(an_event(event_start=datetime(2025, 6, 15, 12, 0)))
+        result = BillingEventAPIResult.model_validate(a_usage_row(an_event(event_start=datetime(2025, 6, 15, 12, 0))))
 
         assert result.event_start == datetime(2025, 6, 15, 12, 0, tzinfo=UTC)
 
@@ -139,9 +149,33 @@ class TestBillingEventAPIResult:
         The truncation to whole seconds was dropped deliberately: billing event timestamps
         arrive from Pulsar with microseconds, so it was discarding real precision.
         """
-        result = BillingEventAPIResult.model_validate(an_event(event_start=stored))
+        result = BillingEventAPIResult.model_validate(a_usage_row(an_event(event_start=stored)))
 
         assert result.model_dump(mode="json")["event_start"] == emitted
+
+    def test_credits_come_from_the_row_rather_than_the_event(self) -> None:
+        """The only field with no counterpart on the table."""
+        result = BillingEventAPIResult.model_validate(a_usage_row(credits=Decimal("1.8")))
+
+        assert result.credits == Decimal("1.8")
+
+    def test_credits_serialise_as_an_exact_decimal_string(self) -> None:
+        """A float here would round a charge on the way out."""
+        result = BillingEventAPIResult.model_validate(a_usage_row(credits=Decimal("0.0000001")))
+
+        assert result.model_dump(mode="json")["credits"] == "0.0000001"
+
+    def test_usage_that_was_never_charged_reports_zero_credits(self) -> None:
+        """An event with no ledger row keeps its quantity and reports no cost.
+
+        `find_billing_events` coalesces the missing sum to zero, so the field is never null
+        and the front end has no third case to handle. The distinction between "cost nothing"
+        and "was never priced" is not on this endpoint by design - see `UsageRow`.
+        """
+        result = BillingEventAPIResult.model_validate(a_usage_row(credits=Decimal(0)))
+
+        assert result.credits == Decimal(0)
+        assert result.quantity == 1.5
 
 
 class TestBillingItemRateAPIResult:

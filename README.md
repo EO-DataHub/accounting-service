@@ -139,10 +139,14 @@ This shows the recent transactions and the balance. Over HTTP:
 
 ```commandline
 GET /workspaces/my-workspace/accounting/balance
+GET /workspaces/my-workspace/accounting/ledger
+GET /workspaces/my-workspace/accounting/ledger?type=grant
 GET /workspaces/my-workspace/accounting/ledger/{transaction}
 ```
 
-The second returns one transaction and, for a charge, the arithmetic behind it. Both need a token holding membership of the workspace.
+`balance` is the total. `ledger` lists the movements behind it, newest first, paged with `limit` and `after` and filtered to one kind with `type=grant`, `type=debit` or `type=reversal`. The last returns one transaction and, for a charge, the arithmetic behind it. All need a token holding membership of the workspace.
+
+The ledger lists every movement as recorded, including reversals. The usage endpoints below net a reversal against the charge it corrects and show neither.
 
 ### Grant credits
 
@@ -215,7 +219,25 @@ Environment variables take priority over `.env`, so this overrides whatever that
    curl -H "Authorization: Bearer $TOKEN" localhost:8000/workspaces/my-workspace/accounting/balance
    ```
 
-5. Make the category matter. Set the workspace to `academic`, which the local configuration halves, and send the same usage again.
+5. Read the ledger over HTTP, and then the grants alone.
+
+   ```commandline
+   curl -H "Authorization: Bearer $TOKEN" localhost:8000/workspaces/my-workspace/accounting/ledger
+   curl -H "Authorization: Bearer $TOKEN" "localhost:8000/workspaces/my-workspace/accounting/ledger?type=grant"
+   ```
+
+   The first lists every movement, newest first: the debit from step 2 and the grant from step 1. The second is the grant on its own, with the reason it was given.
+
+6. Read the usage, which reports both what was metered and what it cost.
+
+   ```commandline
+   curl -H "Authorization: Bearer $TOKEN" \
+     "localhost:8000/workspaces/my-workspace/accounting/usage-data?time-aggregation=day"
+   ```
+
+   Each row carries `quantity` in the SKU's own units and `credits` for the same consumption. Drop `time-aggregation` for one row per event rather than daily totals.
+
+7. Make the category matter. Set the workspace to `academic`, which the local configuration halves, and send the same usage again.
 
    ```commandline
    uv run billing-admin set-category --workspace my-workspace --category academic
@@ -225,7 +247,7 @@ Environment variables take priority over `.env`, so this overrides whatever that
 
    The second charge is half the first.
 
-6. Recalibrate. Change `cpu-seconds` to `0.002` in `dev/accounting.conf` and restart the ingester, which loads the file and mints a new policy version.
+8. Recalibrate. Change `cpu-seconds` to `0.002` in `dev/accounting.conf` and restart the ingester, which loads the file and mints a new policy version.
 
    ```commandline
    docker compose restart ingester
