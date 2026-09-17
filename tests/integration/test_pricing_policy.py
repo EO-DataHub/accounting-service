@@ -352,6 +352,53 @@ class TestWhichPolicyIsInForce:
     def test_no_policy_at_all_is_not_an_error(self, db_session: Session) -> None:
         assert PricingPolicy.current(db_session) is None
 
+    def test_a_backdated_policy_supersedes_a_later_dated_one(self, db_session: Session) -> None:
+        """Backdating reaches forward as well as back.
+
+        Resolution orders on `configured_at`, so a backdated policy wins for every date from
+        its own `valid_from` onwards - not only the period it was aimed at. A policy dated
+        later but configured earlier is superseded outright, and nothing announces it.
+        """
+        db.insert_configuration(db_session, a_document(valid_from="2026-01-01T00:00:00Z", rate="0.5"))
+        db.insert_configuration(db_session, a_document(valid_from="2020-01-01T00:00:00Z", rate="0.9"))
+
+        superseded = PricingPolicy.resolve(db_session, datetime(2026, 6, 1, tzinfo=UTC))
+        assert superseded is not None
+
+        assert superseded.version == 2
+        assert superseded.rate_card().rates[SKU] == Decimal("0.9")
+
+    def test_re_adding_a_superseded_policy_reclaims_only_its_own_dates(self, db_session: Session) -> None:
+        """And the repair for the above, which is to load the superseded document again.
+
+        It mints rather than matching: `current()` ignores validity, so the document is
+        fingerprinted against the backdated policy and differs from it. Version 1 and version
+        3 therefore hold identical numbers.
+
+        The re-load takes back only the dates it qualifies for. Everything before its
+        `valid_from` stays with the backdated policy, which is the only policy eligible for
+        those dates at all.
+        """
+        db.insert_configuration(db_session, a_document(valid_from="2026-01-01T00:00:00Z", rate="0.5"))
+        db.insert_configuration(db_session, a_document(valid_from="2020-01-01T00:00:00Z", rate="0.9"))
+        db.insert_configuration(db_session, a_document(valid_from="2026-01-01T00:00:00Z", rate="0.5"))
+
+        assert stored_versions(db_session) == [1, 2, 3]
+
+        def resolved(when: datetime) -> PricingPolicy:
+            policy = PricingPolicy.resolve(db_session, when)
+            assert policy is not None
+            return policy
+
+        # The backdated policy keeps the window it was loaded for, either side of the re-load.
+        assert resolved(datetime(2021, 6, 1, tzinfo=UTC)).version == 2
+        assert resolved(datetime(2025, 12, 31, tzinfo=UTC)).rate_card().rates[SKU] == Decimal("0.9")
+
+        # And the re-load takes back everything from its own valid_from.
+        reclaimed = resolved(datetime(2026, 6, 1, tzinfo=UTC))
+        assert reclaimed.version == 3
+        assert reclaimed.rate_card().rates[SKU] == Decimal("0.5")
+
 
 class TestTwoReplicasRacing:
     """Both pods start together, both see the same current policy, both mint the same
