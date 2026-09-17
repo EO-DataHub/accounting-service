@@ -38,55 +38,9 @@ class DBIngester:
             models.BillingItem.ensure_sku_exists(session, str(msg.sku))
             session.commit()
 
-
-def truncate_to_hour(dt: datetime) -> datetime:
-    return dt.replace(minute=0, second=0, microsecond=0)
-
-
-class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.BillingEvent, bytes]):
-    """This Messager receives Pulsar messages containing billing events and updates the accounting DB."""
-
-    def process_payload(self, obj: messages.BillingEvent) -> Sequence[Messager.Action]:
-        try:
-            uuid_ = self._try_record_event(obj)
-        except IntegrityError:
-            # This is /probably/ because the SKU in the message is unknown.
-            #
-            # To avoid the risk of data loss if we forget to configured an item in advance, we
-            # create an empty item. This can be corrected later by an admin.
-            logging.exception(
-                "IntegrityError recording BillingEvent with sku %s - assuming missing BillingItem",
-                obj.sku,
-            )
-
-            self._add_observed_sku(obj)
-            uuid_ = self._try_record_event(obj)
-
-        if uuid_:
-            logging.debug("Recorded BillingEvent with uuid %s", str(uuid_))
-        else:
-            logging.info("Received duplicate BillingEvent uuid %s", obj.uuid)
-
-        return []
-
-    def _try_record_event(self, bemsg: messages.BillingEvent) -> UUID | None:
-        """Record the event and charge for it, in one transaction."""
-        with self._session() as session:
-            uuid_ = models.BillingEvent.insert_from_message(session, bemsg)
-
-            if uuid_ is not None:
-                self._charge_event(session, uuid_, str(bemsg.sku))
-
-            session.commit()
-
-        return uuid_
-
-    def _charge_event(self, session: Session, event_id: UUID, sku: str) -> None:
+    def _charge_event(self, session: Session, event: models.BillingEvent, sku: str) -> None:
         """Price the event and write the debit."""
-        event = session.get(models.BillingEvent, event_id)
-
-        if event is None:
-            raise AssertionError(f"billing event {event_id} vanished within its own transaction")
+        event_id = event.uuid
 
         policy = models.PricingPolicy.resolve(session, event.event_start_utc)
 
@@ -137,6 +91,54 @@ class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.Billing
                 policy.version,
                 priced.category,
             )
+
+
+def truncate_to_hour(dt: datetime) -> datetime:
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
+class AccountingIngesterMessager(DBIngester, PulsarJSONMessager[messages.BillingEvent, bytes]):
+    """This Messager receives Pulsar messages containing billing events and updates the accounting DB."""
+
+    def process_payload(self, obj: messages.BillingEvent) -> Sequence[Messager.Action]:
+        try:
+            uuid_ = self._try_record_event(obj)
+        except IntegrityError:
+            # This is /probably/ because the SKU in the message is unknown.
+            #
+            # To avoid the risk of data loss if we forget to configured an item in advance, we
+            # create an empty item. This can be corrected later by an admin.
+            logging.exception(
+                "IntegrityError recording BillingEvent with sku %s - assuming missing BillingItem",
+                obj.sku,
+            )
+
+            self._add_observed_sku(obj)
+            uuid_ = self._try_record_event(obj)
+
+        if uuid_:
+            logging.debug("Recorded BillingEvent with uuid %s", str(uuid_))
+        else:
+            logging.info("Received duplicate BillingEvent uuid %s", obj.uuid)
+
+        return []
+
+    def _try_record_event(self, bemsg: messages.BillingEvent) -> UUID | None:
+        """Record the event and charge for it, in one transaction."""
+        with self._session() as session:
+            uuid_ = models.BillingEvent.insert_from_message(session, bemsg)
+
+            if uuid_ is not None:
+                event = session.get(models.BillingEvent, uuid_)
+
+                if event is None:
+                    raise AssertionError(f"billing event {uuid_} vanished within its own transaction")
+
+                self._charge_event(session, event, str(bemsg.sku))
+
+            session.commit()
+
+        return uuid_
 
 
 class WorkspaceSettingsIngesterMessager(DBIngester, PulsarJSONMessager[messages.WorkspaceSettings, bytes]):
@@ -262,23 +264,27 @@ class ConsumptionSampleRateIngesterMessager(
                     generate_to,
                 )
 
-                session.add(
-                    # item_id is set from the `item` relationship at flush. SQLModel's
-                    # generated __init__ knows nothing about relationships, so pyright reads
-                    # this as a missing argument.
-                    models.BillingEvent(  # pyright: ignore[reportCallIssue]
-                        uuid=uuid.uuid5(
-                            uuid.UUID("67f9a35c-567c-4a30-b51d-2fc64328bd55"),
-                            f"{workspace}-{sku}-{generate_from.isoformat()}",
-                        ),
-                        event_start=generate_from,
-                        event_end=generate_to,
-                        item=item,
-                        user=None,
-                        workspace=workspace,
-                        quantity=consumption or 0,
-                    )
+                event_id = uuid.uuid5(
+                    uuid.UUID("67f9a35c-567c-4a30-b51d-2fc64328bd55"),
+                    f"{workspace}-{sku}-{generate_from.isoformat()}",
                 )
+
+                event = models.BillingEvent(  # pyright: ignore[reportCallIssue]
+                    uuid=event_id,
+                    event_start=generate_from,
+                    event_end=generate_to,
+                    item=item,
+                    user=None,
+                    workspace=workspace,
+                    quantity=consumption or 0,
+                )
+                session.add(event)
+                # item_id is set from the `item` relationship at flush. SQLModel's generated
+                # __init__ knows nothing about relationships, so pyright reads the constructor
+                # call above as a missing argument.
+                session.flush()
+
+                self._charge_event(session, event, sku)
 
                 generate_from = generate_to
                 generate_to = truncate_to_hour(generate_from + timedelta(hours=1))
