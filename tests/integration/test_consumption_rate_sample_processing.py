@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID
 
 from eodhp_utils.pulsar import messages
@@ -7,6 +8,7 @@ from sqlalchemy.orm.session import Session
 
 from accounting_service import models
 from accounting_service.ingester.messager import ConsumptionSampleRateIngesterMessager
+from accounting_service.pricing import exact_decimal
 from tests.integration.conftest import msg_to_pulsar_msg
 
 
@@ -87,3 +89,53 @@ def test_messages_across_two_hours_generates_appropriate_billing_events(
     #  03:30:00: 4
     assert bes[0].quantity == 1800 * (2 + 2.5) / 2
     assert bes[1].quantity == 3600 * (2.5 + 3.5) / 2
+
+
+def test_generated_billing_events_are_charged_under_the_active_pricing_policy(
+    db_session: Session, db_session_factory: sessionmaker[Session]
+) -> None:
+    """Regression test: the estimator used to write BillingEvent rows straight to the database
+    without ever calling `_charge_event`, so consumption-derived usage recorded a quantity but
+    never a credit charge, no matter what the pricing policy said.
+    """
+    ############# Setup
+    crs1 = messages.BillingResourceConsumptionRateSample.get_fake(sample_time="2025-01-01T01:30:00Z", rate=2)
+    crs2 = messages.BillingResourceConsumptionRateSample.get_fake(
+        sample_time="2025-01-01T03:30:00Z", rate=4, sku=crs1.sku, workspace=crs1.workspace
+    )
+
+    item = models.BillingItem(sku=crs1.sku, name="test", unit="GB-h")
+    db_session.add(item)
+    db_session.flush()
+
+    policy = models.PricingPolicy(version=1, valid_from=datetime(2025, 1, 1, tzinfo=UTC), default_category="standard")
+    policy.rates = [
+        models.PricingPolicyRate(item_id=item.uuid, credits_per_unit=Decimal("0.5"))  # pyright: ignore[reportCallIssue]
+    ]
+    policy.category_multipliers = [
+        models.PricingPolicyCategoryMultiplier(category="standard", multiplier=Decimal(1))  # pyright: ignore[reportCallIssue]
+    ]
+    db_session.add(policy)
+    db_session.commit()
+
+    msg1 = msg_to_pulsar_msg(ConsumptionSampleRateIngesterMessager, crs1)
+    msg2 = msg_to_pulsar_msg(ConsumptionSampleRateIngesterMessager, crs2)
+
+    ############# Test
+    messager = ConsumptionSampleRateIngesterMessager(session_factory=db_session_factory)
+    failures1 = messager.consume(msg1)
+    failures2 = messager.consume(msg2)
+
+    ############# Behaviour check
+    assert not failures1.any_permanent()
+    assert not failures1.any_temporary()
+    assert not failures2.any_permanent()
+    assert not failures2.any_temporary()
+
+    usage = sorted(
+        models.BillingEvent.find_billing_events(db_session, str(crs1.workspace)),
+        key=lambda row: row.event.event_start_utc,
+    )
+    assert len(usage) == 2
+    assert all(row.credits > 0 for row in usage)
+    assert [row.credits for row in usage] == [exact_decimal(row.event.quantity) * Decimal("0.5") for row in usage]
