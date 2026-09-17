@@ -1,4 +1,5 @@
 import json
+from bisect import bisect_right
 from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -15,6 +16,8 @@ from sqlalchemy.orm import Session
 from sqlmodel import col
 
 from accounting_service import db, models
+from accounting_service.pricing import RateCard, UnratedSKUError, price_usage
+from accounting_service.timestamps import as_utc
 
 console = Console(stderr=False)
 
@@ -333,6 +336,223 @@ def ledger(session: Session, workspace: str, limit: int) -> None:
 
     if not transactions:
         console.print(f"No transactions for [blue]{workspace}[/blue]")
+
+
+# noinspection unresolved-references
+@cli.command("recharge")
+@click.pass_obj
+@click.option("--start", help="Only events whose `event_start` is at or after this ISO 8601 instant")
+@click.option("--end", help="Only events whose `event_start` is before this ISO 8601 instant")
+@click.option("-w", "--workspace", help="Only this workspace")
+@click.option("-s", "--sku", help="Only this SKU")
+@click.option("--policy", help="Charge under this policy version rather than the one resolution picks", type=int)
+@click.option("--batch", help="Events per transaction", type=int, default=1000, show_default=True)
+@click.option("--commit", help="Write the debits. Without this, nothing is written", is_flag=True)
+@handle_errors
+def recharge(
+    session: Session,
+    start: str | None,
+    end: str | None,
+    workspace: str | None,
+    sku: str | None,
+    policy: int | None,
+    batch: int,
+    commit: bool,
+) -> None:
+    """
+    Charges billing events that carry no debit, reporting what it would do unless `--commit`.
+
+    An event consumed before any policy existed was recorded and not charged: `_charge_event`
+    logs and returns, and nothing revisits it. The usage reads coalesce the absent ledger row
+    to zero (D12's netting works on rows that exist), so the event reads as free rather than
+    as unpriced. This writes the missing debits.
+
+    **Not a re-pricing.** Every event it touches has no debit at all. An event already charged
+    is left alone, which makes this safe to re-run and safe to interrupt: the ledger's partial
+    unique index is the arbiter, not a check this makes first. Changing a charge that exists
+    is D8's job and needs a reversal, not this.
+
+    By default each event is priced by the policy that resolution picks for its `event_start`,
+    so a backfilled charge is indistinguishable from one the ingester would have written. Note
+    what that means when policies share a `valid_from`: the most recently configured one wins
+    for the whole period, not just for the part it was calibrated against. The dry run prints
+    the split by policy version so this is visible before anything is written.
+
+    `--policy` overrides that and charges everything under one version. It is the escape hatch
+    for a backfill that should not price under the current calibration; the version used is
+    recorded on every row either way, so the choice stays auditable.
+    """
+    started = _parse_instant(start, "--start")
+    ended = _parse_instant(end, "--end")
+
+    if started is not None and ended is not None and started >= ended:
+        raise ValueError(f"--start [blue]{started}[/blue] is not before --end [blue]{ended}[/blue]")
+
+    pinned = _find_policy_version(session, policy) if policy is not None else None
+
+    if pinned is None and models.PricingPolicy.current(session) is None:
+        raise ValueError("No pricing policy is loaded, so nothing would price these events")
+
+    if batch < 1:
+        raise ValueError(f"--batch must be at least 1, not [blue]{batch}[/blue]")
+
+    charged: dict[tuple[int, str], tuple[int, Decimal]] = {}
+    skipped: dict[str, int] = {}
+    after: UUID | None = None
+    seen = 0
+
+    # Resolution is a query per call, and a backfill of any size cannot afford one per event.
+    # Its answer depends only on which policies have started by the given instant, so it is
+    # constant between consecutive `valid_from` boundaries: caching on the boundary an event
+    # falls after asks the question once per calibration rather than once per timestamp.
+    boundaries = sorted(
+        as_utc(valid_from) for valid_from in session.execute(select(col(models.PricingPolicy.valid_from))).scalars()
+    )
+    policies: dict[int, models.PricingPolicy | None] = {}
+    rate_cards: dict[UUID, RateCard] = {}
+    categories: dict[str, str | None] = {}
+
+    def policy_for(when: datetime) -> models.PricingPolicy | None:
+        # -1 when `when` precedes every boundary, which is the bucket resolve() answers from
+        # the earliest policy rather than from the policies in force (D10).
+        bucket = bisect_right(boundaries, when) - 1
+
+        if bucket not in policies:
+            policies[bucket] = models.PricingPolicy.resolve(session, when)
+
+        return policies[bucket]
+
+    while True:
+        events = models.BillingEvent.find_uncharged_events(
+            session,
+            start=started,
+            end=ended,
+            workspace=workspace,
+            sku=sku,
+            after=after,
+            limit=batch,
+        )
+
+        if not events:
+            break
+
+        for event in events:
+            after = event.uuid
+            seen += 1
+
+            in_force = pinned if pinned is not None else policy_for(event.event_start_utc)
+
+            if in_force is None:
+                skipped["no applicable policy"] = skipped.get("no applicable policy", 0) + 1
+                continue
+
+            if in_force.uuid not in rate_cards:
+                rate_cards[in_force.uuid] = in_force.rate_card()
+
+            if event.workspace not in categories:
+                categories[event.workspace] = models.WorkspaceCategory.category_for(session, event.workspace)
+
+            try:
+                priced = price_usage(
+                    rate_cards[in_force.uuid],
+                    sku=event.item.sku,
+                    quantity=event.quantity,
+                    category=categories[event.workspace],
+                )
+            except UnratedSKUError:
+                skipped[f"{event.item.sku}: unrated by v{in_force.version}"] = (
+                    skipped.get(f"{event.item.sku}: unrated by v{in_force.version}", 0) + 1
+                )
+                continue
+            except ValueError:
+                # A negative or non-finite quantity. The ingester refuses these too.
+                skipped[f"{event.item.sku}: unpriceable quantity"] = (
+                    skipped.get(f"{event.item.sku}: unpriceable quantity", 0) + 1
+                )
+                continue
+
+            count, total = charged.get((in_force.version, event.item.sku), (0, Decimal(0)))
+            charged[(in_force.version, event.item.sku)] = (count + 1, total + priced.credits)
+
+            if commit:
+                models.CreditLedgerTransaction.record_usage_debit(session, event, priced, in_force.uuid)
+
+        if commit:
+            # Per batch rather than once at the end, so an interrupted run keeps the work it
+            # did and the next run resumes from the events still uncharged.
+            session.commit()
+
+        if len(events) < batch:
+            break
+
+    _report_recharge(charged, skipped, seen, committed=commit, pinned=pinned)
+
+
+def _parse_instant(value: str | None, flag: str) -> datetime | None:
+    """An ISO 8601 instant, defaulted to UTC when it carries no offset, as the loader does."""
+    if value is None:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"{flag} [blue]{value}[/blue] is not an ISO 8601 date or datetime") from None
+
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+
+def _find_policy_version(session: Session, version: int) -> models.PricingPolicy:
+    found = session.execute(
+        select(models.PricingPolicy).where(col(models.PricingPolicy.version) == version)
+    ).scalar_one_or_none()
+
+    if found is None:
+        raise ValueError(f"No pricing policy with version [blue]{version}[/blue]")
+
+    return found
+
+
+def _report_recharge(
+    charged: dict[tuple[int, str], tuple[int, Decimal]],
+    skipped: dict[str, int],
+    seen: int,
+    *,
+    committed: bool,
+    pinned: models.PricingPolicy | None,
+) -> None:
+    if not seen:
+        console.print("[green]No uncharged events match.[/green]")
+        return
+
+    table = Table(title="Debits written" if committed else "Debits that would be written")
+    table.add_column("Policy", justify="right")
+    table.add_column("SKU")
+    table.add_column("Events", justify="right")
+    table.add_column("Credits", justify="right")
+
+    # Plain decimal notation throughout: a rate of 0.000000007 per unit renders as an exponent
+    # under str(), which is unreadable next to a whole number of events.
+    for (version, item), (count, total) in sorted(charged.items()):
+        table.add_row(f"v{version}", item, f"{count:,}", format(total, "f"))
+
+    console.print(table)
+
+    events = sum(count for count, _ in charged.values())
+    credits = sum((total for _, total in charged.values()), Decimal(0))
+
+    console.print(f"{events:,} of {seen:,} events, {format(credits, 'f')} credits.")
+
+    if pinned is not None:
+        console.print(
+            f"[yellow]Every event priced under v{pinned.version} because --policy was given, "
+            f"not under the policy resolution would pick for it.[/yellow]"
+        )
+
+    for reason, count in sorted(skipped.items()):
+        console.print(f"[yellow]{count:,} skipped - {reason}[/yellow]")
+
+    if not committed:
+        console.print("[blue]Nothing was written. Re-run with --commit.[/blue]")
 
 
 if __name__ == "__main__":
