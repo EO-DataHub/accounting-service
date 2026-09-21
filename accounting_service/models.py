@@ -763,6 +763,83 @@ GROUP BY 2, 3, 4, 6
         return (UsageRow(row[0], Decimal(row.credits or 0)) for row in session.execute(query))
 
     @classmethod
+    def find_uncharged_events(
+        cls,
+        session: Session,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        workspace: str | None = None,
+        sku: str | None = None,
+        after: UUID | None = None,
+        limit: int = 1_000,
+    ) -> Sequence[Self]:
+        """Events carrying no original debit, in primary key order, each with its item loaded.
+
+        An event is uncharged when no ledger row references it as an original debit, which is
+        the condition `record_usage_debit`'s partial unique index enforces. What this returns
+        is therefore exactly the set that insert would accept, so a caller charging as it goes
+        cannot double-charge even if it is run twice.
+
+        Arises when messages were consumed before any policy was loaded: `_charge_event`
+        records the event, logs, and returns without a debit, and nothing revisits it (T5,
+        D10). The usage reads coalesce the missing ledger row to zero, so an uncharged event
+        is indistinguishable from a free one until it is charged.
+
+        `start` and `end` bound `event_start`, which is the instant pricing resolves a policy
+        for. `find_billing_events` bounds `event_end` instead, because a usage read is about
+        windows that have closed; the two are deliberately different.
+
+        Paged on `uuid` rather than on OFFSET, because a caller that charges as it reads
+        removes rows from the result set as it goes, and an offset would then step over the
+        rows that moved up behind them. Pass the last row's `uuid` back as `after`.
+
+        The primary key rather than `event_start`, which would be the natural order, because
+        nothing indexes `event_start` alone: ordering on it costs a sequential scan and a sort
+        of the whole table per page, where the primary key index stops as soon as the page is
+        full. A backfill does not need chronological order - each debit records the event's
+        own `occurred_at` however it was reached.
+        """
+        already_charged = (
+            select(col(CreditLedgerTransaction.uuid))
+            .where(
+                col(CreditLedgerTransaction.billing_event_id) == col(cls.uuid),
+                col(CreditLedgerTransaction.correction_batch_id).is_(None),
+                col(CreditLedgerTransaction.transaction_type) == TransactionType.DEBIT,
+            )
+            .exists()
+        )
+
+        query = (
+            select(cls)
+            # The caller reads item.sku on every row to price it, so without this each row
+            # costs a query of its own.
+            .options(selectinload(cls.item))  # pyright: ignore[reportArgumentType]
+            .where(~already_charged)
+            .order_by(col(cls.uuid))
+            .limit(limit)
+        )
+
+        if start is not None:
+            query = query.where(col(cls.event_start) >= start)
+
+        if end is not None:
+            query = query.where(col(cls.event_start) < end)
+
+        if workspace is not None:
+            query = query.where(col(cls.workspace) == workspace)
+
+        if sku is not None:
+            query = query.join(BillingItem, col(BillingItem.uuid) == col(cls.item_id)).where(
+                col(BillingItem.sku) == sku
+            )
+
+        if after is not None:
+            query = query.where(col(cls.uuid) > after)
+
+        return session.execute(query).scalars().all()
+
+    @classmethod
     def find_latest_billing_event(
         cls,
         session: Session,
