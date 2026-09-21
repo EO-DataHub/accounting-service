@@ -11,6 +11,7 @@ from pydantic import (
     Field,
     PlainSerializer,
     field_validator,
+    model_validator,
 )
 
 from accounting_service.models import (
@@ -19,6 +20,7 @@ from accounting_service.models import (
     PricingPolicy,
     TimeAggregation,
     TransactionType,
+    UsageDimension,
 )
 from accounting_service.pricing import price_usage
 from accounting_service.timestamps import as_utc, datetime_default_to_utc
@@ -102,12 +104,90 @@ class UsageQuery(BaseModel):
             examples=["day", "month"],
         ),
     ]
+    user: Annotated[
+        UUID | None,
+        Field(
+            default=None,
+            title="Only usage by this user",
+            description=(
+                "Restrict the result to consumption attributed to one user. Usage that no user "
+                "is responsible for, such as workspace storage, is attributed to none and is "
+                "excluded by this filter."
+            ),
+            examples=["ee3c1c1e-0b0e-4d1a-9c7f-1f2b3c4d5e6f"],
+        ),
+    ]
+    sku: Annotated[
+        str | None,
+        Field(
+            default=None,
+            title="Only usage of this item",
+            description=(
+                "Restrict the result to one billing item, named by its SKU as /accounting/skus "
+                "lists them. An unknown SKU is not an error; it simply matches nothing."
+            ),
+            examples=["cpu-seconds"],
+        ),
+    ]
+    group_by: Annotated[
+        frozenset[UsageDimension] | None,
+        Field(
+            default=None,
+            alias="group-by",
+            title="Dimensions to break the totals down by",
+            description=(
+                "Which dimensions each aggregated total is broken down by, beside the period "
+                "itself: any of 'user', 'sku' and 'workspace', comma-separated or repeated. "
+                "Omit the parameter for 'sku,workspace'. A dimension left out is reported as "
+                "null rather than as one of the several values the total now spans. Pass an "
+                "empty value to total over the period alone. Only meaningful with "
+                "'time-aggregation', and rejected without it."
+            ),
+            examples=["user,sku", "workspace"],
+        ),
+    ]
 
     @field_validator("start", "end")
     @classmethod
     def _naive_timestamp_means_utc(cls, value: datetime | None) -> datetime | None:
         """A timestamp arriving without an offset is taken to be UTC."""
         return datetime_default_to_utc(value)
+
+    @field_validator("group_by", mode="before")
+    @classmethod
+    def _split_dimensions(cls, value: object) -> object:
+        """Accept 'group-by=user,sku' as well as 'group-by=user&group-by=sku'.
+
+        FastAPI hands a set-typed parameter over as a list however it was spelled, so a
+        comma-separated value arrives as one element containing commas. Splitting every
+        element covers both spellings and the mixture of them. A bare string is accepted
+        too, so that the model validates the same way when it is built directly.
+        """
+
+        elements: tuple[object, ...]
+
+        if isinstance(value, str):
+            elements = (value,)
+        elif isinstance(value, list | tuple | set | frozenset):
+            elements = tuple(value)
+        else:
+            return value
+
+        return [part.strip() for element in elements for part in str(element).split(",") if part.strip()]
+
+    @model_validator(mode="after")
+    def _grouping_needs_aggregation(self) -> "UsageQuery":
+        """`group-by` says how totals are broken down, so it is meaningless without totals.
+
+        Rejected rather than ignored, for the same reason an unknown 'time-aggregation' is:
+        a caller who asked for a breakdown and silently got one row per event would read the
+        result as the breakdown.
+        """
+
+        if self.group_by is not None and self.time_aggregation is None:
+            raise ValueError("'group-by' needs 'time-aggregation', which is what produces the totals it groups")
+
+        return self
 
 
 class LedgerQuery(BaseModel):
@@ -197,6 +277,10 @@ class BillingEventAPIResult(BaseModel):
 
     Both figures for the same consumption: `quantity` is what was metered, `credits` is what
     it cost.
+
+    `item`, `workspace` and `user` are null when a total spans more than one value of them -
+    either because `group-by` left that dimension out, or, for `user`, because the usage is
+    nobody's in particular. One row per event always carries all three that it has.
     """
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
@@ -219,18 +303,39 @@ class BillingEventAPIResult(BaseModel):
         ),
     ]
     item: Annotated[
-        str,
+        str | None,
         Field(
+            default=None,
             validation_alias=AliasPath("event", "item", "sku"),
-            description="Item (SKU) consumed",
+            description=(
+                "Item (SKU) consumed. Null on an aggregate that 'group-by' did not break down "
+                "by SKU, where the total spans several of them."
+            ),
             examples=["wfcpu"],
         ),
     ]
-    workspace: Annotated[
-        str,
+    user: Annotated[
+        UUID | None,
         Field(
+            default=None,
+            validation_alias=AliasPath("event", "user"),
+            description=(
+                "User who consumed the resource. Null where no single user is responsible - "
+                "workspace storage, for instance - and on an aggregate that 'group-by' did "
+                "not break down by user."
+            ),
+            examples=["ee3c1c1e-0b0e-4d1a-9c7f-1f2b3c4d5e6f"],
+        ),
+    ]
+    workspace: Annotated[
+        str | None,
+        Field(
+            default=None,
             validation_alias=AliasPath("event", "workspace"),
-            description="Workspace which consumed the resource",
+            description=(
+                "Workspace which consumed the resource. Null on an aggregate that 'group-by' "
+                "did not break down by workspace, where the total spans several of them."
+            ),
             examples=["my-workspace"],
         ),
     ]

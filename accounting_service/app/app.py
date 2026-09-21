@@ -103,6 +103,9 @@ def get_workspace_usage_data(
         limit=query.limit,
         after=query.after,
         time_aggregation=query.time_aggregation,
+        user=query.user,
+        sku=query.sku,
+        group_by=query.group_by,
     )
 
     return [BillingEventAPIResult.model_validate(row) for row in usage]
@@ -235,6 +238,9 @@ def get_account_usage_data(
         limit=query.limit,
         after=query.after,
         time_aggregation=query.time_aggregation,
+        user=query.user,
+        sku=query.sku,
+        group_by=query.group_by,
     )
 
     return [BillingEventAPIResult.model_validate(row) for row in usage]
