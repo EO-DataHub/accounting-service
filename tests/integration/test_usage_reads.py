@@ -117,6 +117,21 @@ class TestTheUserFilter:
 
         assert [row["quantity"] for row in rows] == [2.0]
 
+    def test_it_does_not_imply_grouping_by_user(self, client: TestClient, usage: list[uuid.UUID]) -> None:
+        """`group-by` alone decides what a row reports, so a total narrowed to one user still
+        reports null for it. Asserted rather than assumed: the alternative - folding a filter
+        into the grouping - is a change a reader might make without noticing it is one.
+        """
+        rows = get(client, f"?time-aggregation=day&user={USER_A}")
+
+        assert sorted(row["quantity"] for row in rows) == [1.0, 2.0]
+        assert [row["user"] for row in rows] == [None, None]
+
+        (grouped,) = get(client, f"?time-aggregation=day&user={USER_A}&group-by=user")
+
+        assert grouped["quantity"] == 3.0
+        assert grouped["user"] == str(USER_A)
+
 
 class TestGroupingDimensions:
     def test_the_default_is_what_it_always_was(self, client: TestClient, usage: list[uuid.UUID]) -> None:

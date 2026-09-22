@@ -134,7 +134,8 @@ class UsageQuery(BaseModel):
             description=(
                 "Restrict the result to consumption attributed to one user. Usage that no user "
                 "is responsible for, such as workspace storage, is attributed to none and is "
-                "excluded by this filter."
+                "excluded by this filter. Filtering is not grouping: a total narrowed to one "
+                "user still reports 'user' as null unless 'group-by' names that dimension."
             ),
             examples=["ee3c1c1e-0b0e-4d1a-9c7f-1f2b3c4d5e6f"],
         ),
@@ -146,7 +147,9 @@ class UsageQuery(BaseModel):
             title="Only usage of this item",
             description=(
                 "Restrict the result to one billing item, named by its SKU as /accounting/skus "
-                "lists them. An unknown SKU is not an error; it simply matches nothing."
+                "lists them. An unknown SKU is not an error; it simply matches nothing. "
+                "Filtering is not grouping, though 'sku' is in the default set, so a total "
+                "reports the item only while 'group-by' still names it."
             ),
             examples=["cpu-seconds"],
         ),
@@ -161,9 +164,10 @@ class UsageQuery(BaseModel):
                 "Which dimensions each aggregated total is broken down by, beside the period "
                 "itself: any of 'user', 'sku' and 'workspace', comma-separated or repeated. "
                 "Omit the parameter for 'sku,workspace'. A dimension left out is reported as "
-                "null rather than as one of the several values the total now spans. Pass an "
-                "empty value to total over the period alone. Only meaningful with "
-                "'time-aggregation', and rejected without it."
+                "null rather than as one of the several values the total now spans - and also "
+                "where a filter has left it spanning one, because this parameter alone decides "
+                "what a row reports. Pass an empty value to total over the period alone. Only "
+                "meaningful with 'time-aggregation', and rejected without it."
             ),
             examples=["user,sku", "workspace", ""],
             json_schema_extra=GROUPING_SCHEMA,
@@ -301,9 +305,12 @@ class BillingEventAPIResult(BaseModel):
     Both figures for the same consumption: `quantity` is what was metered, `credits` is what
     it cost.
 
-    `item`, `workspace` and `user` are null when a total spans more than one value of them -
-    either because `group-by` left that dimension out, or, for `user`, because the usage is
-    nobody's in particular. One row per event always carries all three that it has.
+    `item`, `workspace` and `user` are null on an aggregate that `group-by` did not break
+    down by, and, for `user`, where the usage is nobody's in particular. `group-by` is the
+    only thing that decides which of them a row reports: a filter selects which events are
+    counted, so `?user=` narrows a total to one user without naming that user on the row.
+    Ask for `group-by=user` as well to see it. One row per event always carries all three
+    that it has.
     """
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
@@ -332,7 +339,8 @@ class BillingEventAPIResult(BaseModel):
             validation_alias=AliasPath("event", "item", "sku"),
             description=(
                 "Item (SKU) consumed. Null on an aggregate that 'group-by' did not break down "
-                "by SKU, where the total spans several of them."
+                "by SKU, whether the total spans several of them or a filter has left it "
+                "spanning one."
             ),
             examples=["wfcpu"],
         ),
@@ -345,7 +353,8 @@ class BillingEventAPIResult(BaseModel):
             description=(
                 "User who consumed the resource. Null where no single user is responsible - "
                 "workspace storage, for instance - and on an aggregate that 'group-by' did "
-                "not break down by user."
+                "not break down by user, including one the 'user' filter has narrowed to a "
+                "single user."
             ),
             examples=["ee3c1c1e-0b0e-4d1a-9c7f-1f2b3c4d5e6f"],
         ),
@@ -357,7 +366,8 @@ class BillingEventAPIResult(BaseModel):
             validation_alias=AliasPath("event", "workspace"),
             description=(
                 "Workspace which consumed the resource. Null on an aggregate that 'group-by' "
-                "did not break down by workspace, where the total spans several of them."
+                "did not break down by workspace, whether the total spans several of them or "
+                "the read is scoped to one."
             ),
             examples=["my-workspace"],
         ),
