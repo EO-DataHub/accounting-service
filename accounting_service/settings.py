@@ -23,7 +23,21 @@ class Settings(BaseSettings):
     USAGE_CACHE_TIMEOUT: int = 5
     GLOBAL_CACHE_TIMEOUT: int = 300
 
+    # The platform domain, e.g. https://test.eodatahub.org.uk - the same value injected
+    # elsewhere in the platform as platform.domain (see eodhp-argocd-deployment). Used to
+    # build the Keycloak JWKS endpoint for JWT signature verification. Required outside
+    # tests, which override the decode_jwt_token dependency rather than exercising this.
+    KEYCLOAK_BASE_URL: str | None = None
+    KEYCLOAK_REALM: str = "eodhp"
+
     model_config = {"env_file": env_file}
+
+    @property
+    def keycloak_certs_url(self) -> str | None:
+        if self.KEYCLOAK_BASE_URL is None:
+            return None
+
+        return f"{self.KEYCLOAK_BASE_URL}/keycloak/realms/{self.KEYCLOAK_REALM}/protocol/openid-connect/certs"
 
 
 @lru_cache
