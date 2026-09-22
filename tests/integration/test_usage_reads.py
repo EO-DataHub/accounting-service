@@ -24,6 +24,13 @@ DAY = datetime(2024, 3, 5, tzinfo=UTC)
 
 USER_A = uuid.UUID("aaaaaaaa-0000-4000-8000-000000000001")
 USER_B = uuid.UUID("bbbbbbbb-0000-4000-8000-000000000002")
+USER_C = uuid.UUID("cccccccc-0000-4000-8000-000000000003")
+
+# Ordered by the text of the UUID, which is how a total's MAX(uuid) is taken.
+LOW_UUID = uuid.UUID("00000000-0000-4000-8000-000000000001")
+CURSOR_UUID = uuid.UUID("00000000-0000-4000-8000-000000000002")
+HIGHER_UUID = uuid.UUID("ffffffff-0000-4000-8000-00000000000e")
+HIGH_UUID = uuid.UUID("ffffffff-0000-4000-8000-00000000000f")
 
 
 @pytest.fixture
@@ -226,3 +233,64 @@ class TestPagingSurvivesAReducedOrderingKey:
         )
 
         assert response.status_code == 404
+
+
+class TestPagingByUserIsStable:
+    """A total's UUID is a MAX over the events folded into it, so it grows as events arrive.
+    Every grouped dimension is therefore in the ordering key ahead of it, and user is the one
+    of them that can be null.
+    """
+
+    def test_an_event_arriving_mid_page_does_not_repeat_a_user(self, client: TestClient, db_session: Session) -> None:
+        """Without user in the key the order is the period and then the MAX(uuid) alone. The
+        event added here raises user A's maximum past user B's, which moved A behind the
+        cursor and returned it on both pages.
+        """
+        gen_billingitem_data(
+            db_session,
+            [
+                {"workspace": "ws1", "event_start": DAY, "user": USER_A, "quantity": 1.0, "uuid": LOW_UUID},
+                {"workspace": "ws1", "event_start": DAY, "user": USER_B, "quantity": 2.0, "uuid": CURSOR_UUID},
+                {"workspace": "ws1", "event_start": DAY, "user": USER_C, "quantity": 4.0, "uuid": HIGH_UUID},
+            ],
+        )
+        db_session.commit()
+
+        first = get(client, "?time-aggregation=day&group-by=user&limit=2")
+
+        assert [row["user"] for row in first] == [str(USER_A), str(USER_B)]
+
+        gen_billingitem_data(
+            db_session,
+            [{"workspace": "ws1", "event_start": DAY, "user": USER_A, "quantity": 8.0, "uuid": HIGHER_UUID}],
+        )
+        db_session.commit()
+
+        second = get(client, f"?time-aggregation=day&group-by=user&limit=2&after={first[-1]['uuid']}")
+
+        assert [row["user"] for row in second] == [str(USER_C)]
+
+    def test_paging_reaches_the_usage_no_user_is_responsible_for(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        """A null user sorts last and nothing sorts after it, so it is the page that a
+        comparison written for non-null values silently drops.
+        """
+        gen_billingitem_data(
+            db_session,
+            [
+                {"workspace": "ws1", "event_start": DAY, "user": USER_A, "quantity": 1.0},
+                {"workspace": "ws1", "event_start": DAY, "user": USER_B, "quantity": 2.0},
+                {"workspace": "ws1", "event_start": DAY, "user": None, "quantity": 4.0},
+            ],
+        )
+        db_session.commit()
+
+        seen: list[float] = []
+        query = "?time-aggregation=day&group-by=user&limit=1"
+
+        while page := get(client, query):
+            seen.extend(row["quantity"] for row in page)
+            query = f"?time-aggregation=day&group-by=user&limit=1&after={page[-1]['uuid']}"
+
+        assert seen == [1.0, 2.0, 4.0]

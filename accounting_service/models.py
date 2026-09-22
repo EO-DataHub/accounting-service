@@ -26,6 +26,7 @@ from sqlalchemy import (
     Uuid,
     and_,
     cast,
+    false,
     func,
     literal_column,
     null,
@@ -37,7 +38,7 @@ from sqlalchemy import (
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, aliased, selectinload
+from sqlalchemy.orm import Mapped, Session, aliased, selectinload
 from sqlalchemy.orm.strategy_options import _AbstractLoad
 from sqlmodel import Field as SQLModelField
 from sqlmodel import Relationship, SQLModel, col
@@ -494,20 +495,44 @@ USAGE_DIMENSION_ORDER = (UsageDimension.SKU, UsageDimension.USER, UsageDimension
 DEFAULT_USAGE_DIMENSIONS = frozenset({UsageDimension.SKU, UsageDimension.WORKSPACE})
 
 
-def _strictly_after(key: Sequence[tuple[ColumnElement[Any], Any]]) -> ColumnElement[bool]:
-    """Everything sorting after one row, over an ordering key of (column, that row's value).
+class _OrderKeyColumn(NamedTuple):
+    """One column of an ordering key: the column, how to read a row's value for it, and whether
+    that value can be NULL.
+
+    A nullable column is compared with NULL-aware operators, which PostgreSQL will not answer
+    from an index, so only mark one that no index leads with.
+    """
+
+    column: Mapped[Any]
+    read: Callable[[Any], Any]
+    nullable: bool = False
+
+
+def _strictly_after(key: Sequence[_OrderKeyColumn], row: "BillingEvent") -> ColumnElement[bool]:
+    """Everything sorting after `row`, over an ordering key of columns and how to read them.
 
     Spelled out as equality on each prefix rather than as a row-value comparison, because
     PostgreSQL will not use an index for `(a, b) > (:a, :b)` here.
+
+    ORDER BY puts NULLs last, so on a nullable column "after" is a greater value or a NULL, and
+    nothing at all sorts after a NULL.
     """
 
+    def same(element: _OrderKeyColumn) -> ColumnElement[bool]:
+        value = element.read(row)
+
+        return element.column.is_not_distinct_from(value) if element.nullable else element.column == value
+
+    def after(element: _OrderKeyColumn) -> ColumnElement[bool]:
+        value = element.read(row)
+
+        if not element.nullable:
+            return element.column > value
+
+        return or_(element.column > value, element.column.is_(None)) if value is not None else false()
+
     return or_(
-        *(
-            and_(
-                *(earlier_column == earlier_value for earlier_column, earlier_value in key[:position]), column_ > value
-            )
-            for position, (column_, value) in enumerate(key)
-        )
+        *(and_(*(same(earlier) for earlier in key[:position]), after(element)) for position, element in enumerate(key))
     )
 
 
@@ -691,8 +716,10 @@ class BillingEvent(SQLModel, table=True):
 
         # With no aggregation the raw table is the source of rows to filter, sort, page and
         # return. With aggregation it is a sub-SELECT computing the totals, and the UUID
-        # assigned is the lexicographically largest of the rows aggregated. That can misbehave
-        # on the last pages, because events arriving while paging change the maximum UUIDs.
+        # assigned is the lexicographically largest of the rows aggregated. An event arriving
+        # while a caller pages can therefore change a total's UUID, and `after` then names a
+        # row that no longer exists and raises. The order itself does not depend on it: see
+        # the ordering key below.
         if time_aggregation is not None:
             # Coerced rather than trusted: the value reaches SQL as a literal below, so the
             # closed set has to be enforced at runtime and not only in the type hints.
@@ -761,27 +788,40 @@ class BillingEvent(SQLModel, table=True):
         event_start_col = col(billingevent_src.event_start)
         event_end_col = col(billingevent_src.event_end)
         event_workspace = col(billingevent_src.workspace)
+        event_user = col(billingevent_src.user)
         event_uuid = col(billingevent_src.uuid)
         item_sku = col(BillingItem.sku)
 
         # A complete and certain order, so that `after` names exactly one place in it. A
         # dimension that was not grouped is NULL on every row, which orders nothing and cannot
         # be compared against, so it is left out of the key entirely.
+        #
+        # Every dimension that was grouped is in it, which makes the columns before the UUID
+        # the GROUP BY itself and so unique per row. The UUID has to be last and has to be
+        # there - `after` names a row by it - but it is a MAX over the rows folded into a
+        # total, so it grows as events arrive. A group whose place depended on it would move
+        # under a caller paging through, and be returned on two consecutive pages.
         grouped_workspace = time_aggregation is None or UsageDimension.WORKSPACE in dimensions
         grouped_sku = time_aggregation is None or UsageDimension.SKU in dimensions
+        # Aggregated only: a raw row is placed exactly by its own UUID already, and user is the
+        # one key column that can be NULL, which costs the paging comparison its index.
+        grouped_user = time_aggregation is not None and UsageDimension.USER in dimensions
 
-        order_key: list[tuple[Any, Callable[[Any], Any]]] = [
-            (event_start_col, lambda row: row.event_start),
-            (event_end_col, lambda row: row.event_end),
+        order_key: list[_OrderKeyColumn] = [
+            _OrderKeyColumn(event_start_col, lambda row: row.event_start),
+            _OrderKeyColumn(event_end_col, lambda row: row.event_end),
         ]
 
         if grouped_workspace:
-            order_key.append((event_workspace, lambda row: row.workspace))
+            order_key.append(_OrderKeyColumn(event_workspace, lambda row: row.workspace))
 
         if grouped_sku:
-            order_key.append((item_sku, lambda row: row.item.sku))
+            order_key.append(_OrderKeyColumn(item_sku, lambda row: row.item.sku))
 
-        order_key.append((event_uuid, lambda row: row.uuid))
+        if grouped_user:
+            order_key.append(_OrderKeyColumn(event_user, lambda row: row.user, nullable=True))
+
+        order_key.append(_OrderKeyColumn(event_uuid, lambda row: row.uuid))
 
         all_billing_events = select(billingevent_src, credits_col.label("credits")).options(
             selectinload(billingevent_src.item)  # pyright: ignore[reportArgumentType]
@@ -804,7 +844,7 @@ class BillingEvent(SQLModel, table=True):
                 charged, charged.c.billing_event_id == col(billingevent_src.uuid)
             ).where(*row_filters)
 
-        query = all_billing_events.order_by(*(column_ for column_, _ in order_key)).limit(limit)
+        query = all_billing_events.order_by(*(element.column for element in order_key)).limit(limit)
 
         if start is not None:
             query = query.where(event_start_col >= start)
@@ -823,7 +863,7 @@ class BillingEvent(SQLModel, table=True):
             # on the leading column that lets PostgreSQL use the index for it.
             query = query.where(
                 event_start_col >= after_be.event_start,
-                _strictly_after([(column_, read(after_be)) for column_, read in order_key]),
+                _strictly_after(order_key, after_be),
             )
 
         return (UsageRow(row[0], Decimal(row.credits or 0)) for row in session.execute(query))
