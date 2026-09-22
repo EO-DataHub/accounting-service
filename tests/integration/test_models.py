@@ -66,7 +66,7 @@ def gen_billingitem_data(
     db_session.add(models.BillingItem(uuid=item_uuids["testsku"], sku="testsku", name="test", unit="GB-h"))
 
     for event in events:
-        event_uuid = uuid.uuid4()
+        event_uuid = event.get("uuid", uuid.uuid4())
 
         start = event.get("event_start", fake.past_datetime("-30d", tzinfo=UTC))
         end = event.get("event_end", start + timedelta(minutes=5))
