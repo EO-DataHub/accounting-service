@@ -9,6 +9,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     PlainSerializer,
     field_validator,
     model_validator,
@@ -43,6 +44,27 @@ ExactDecimal = Annotated[Decimal, PlainSerializer(_plain_decimal, return_type=st
 # A timestamp guaranteed to be UTC-aware. Without the validator a naive value serialises with
 # no offset at all, which is a silently different wire format.
 UtcTimestamp = Annotated[datetime, AfterValidator(as_utc)]
+
+_DIMENSIONS = "|".join(UsageDimension)
+
+# What `group-by` accepts, published. Pydantic would generate the repeated spelling alone,
+# from the declared type, and an array cannot carry the empty value at all: an empty array
+# serialises to no parameter, which is not "the empty set" but "omitted", i.e. the default.
+# So a generated client could not ask for a total over the period alone, and the examples
+# were not valid instances of what was published. This replaces the generated `anyOf`,
+# leaving the title, description and examples beside it alone. The enum is inlined rather
+# than $ref'd, because the reference FastAPI would generate goes with the schema it
+# replaces. tests/test_api_models.py holds this to what _split_dimensions accepts.
+#
+# Annotated, because Field takes a JsonDict and the literal below infers as something
+# narrower.
+GROUPING_SCHEMA: dict[str, JsonValue] = {
+    "anyOf": [
+        {"type": "string", "pattern": rf"^ *$|^ *({_DIMENSIONS})( *, *({_DIMENSIONS}))* *$"},
+        {"type": "array", "uniqueItems": True, "items": {"type": "string", "enum": list(UsageDimension)}},
+        {"type": "null"},
+    ]
+}
 
 
 class UsageQuery(BaseModel):
@@ -143,7 +165,8 @@ class UsageQuery(BaseModel):
                 "empty value to total over the period alone. Only meaningful with "
                 "'time-aggregation', and rejected without it."
             ),
-            examples=["user,sku", "workspace"],
+            examples=["user,sku", "workspace", ""],
+            json_schema_extra=GROUPING_SCHEMA,
         ),
     ]
 
