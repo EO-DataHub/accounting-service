@@ -1,13 +1,34 @@
 from enum import IntEnum
+from functools import lru_cache
 from typing import Annotated, Any
 from uuid import UUID
 
 import jwt
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jwt import PyJWTError
+from jwt import PyJWKClient, PyJWTError
+
+from accounting_service.settings import get_settings
 
 bearer_scheme = HTTPBearer()
+
+# Matches the client IDs tokens for this platform are actually issued under, per the
+# reference implementation in eodh-ac-api/wf-catalogue-service.
+JWT_AUDIENCE = ["oauth2-proxy-workspaces", "oauth2-proxy", "account"]
+
+
+@lru_cache
+def _jwks_client() -> PyJWKClient:
+    """One client per process, so the JWKS document is cached rather than re-fetched from
+    Keycloak on every request. PyJWKClient does this caching internally, but only across
+    calls on the same instance.
+    """
+    settings = get_settings()
+    if not settings.keycloak_certs_url:
+        msg = "KEYCLOAK_BASE_URL must be set to verify JWTs"
+        raise RuntimeError(msg)
+
+    return PyJWKClient(settings.keycloak_certs_url)
 
 
 class MinTier(IntEnum):
@@ -84,9 +105,18 @@ def account_authz(account_id: UUID, token_payload: dict[str, Any]) -> UUID:
 
 def decode_jwt_token(credentials: Annotated[HTTPAuthorizationCredentials, Depends(bearer_scheme)]) -> dict[str, Any]:
     # As this is used in dependency injection, FastAPI handles most of the failure modes.
-    # Setting `verify_signature` to False assumes that it has been verified further upstream.
-    # TODO: This must be addressed because a forged token could be used and credits could be added without purchasing them.
+    #
+    # The signature is verified against Keycloak's own published key (fetched from
+    # KEYCLOAK_CERTS_URL), rather than trusting an upstream gateway to have checked it: a
+    # gateway sitting in front of the public path does not cover traffic that reaches this
+    # service directly from elsewhere on the cluster network.
     try:
-        return jwt.decode(credentials.credentials, options={"verify_signature": False}, algorithms=["RS256"])
+        signing_key = _jwks_client().get_signing_key_from_jwt(credentials.credentials)
+        return jwt.decode(
+            credentials.credentials,
+            signing_key.key,
+            audience=JWT_AUDIENCE,
+            algorithms=["RS256"],
+        )
     except PyJWTError as e:
         raise HTTPException(status_code=401, detail="Invalid JWT token") from e

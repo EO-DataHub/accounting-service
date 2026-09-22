@@ -30,7 +30,7 @@ dependencies = [
     "pydantic-settings",
     "click",
     "opentelemetry-instrumentation-fastapi",
-    "pyjwt",
+    "pyjwt[crypto]",
     "eodhp-utils",
     "pyyaml",
     "rich",
