@@ -13,12 +13,15 @@ the handlers use them and that response_model validation passes. The field-level
 are here.
 """
 
+import re
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 
+from accounting_service.app.app import app
 from accounting_service.app.models import (
     BillingEventAPIResult,
     BillingItemAPIResult,
@@ -393,6 +396,63 @@ class TestUsageQueryGrouping:
 
     def test_aggregation_without_grouping_is_the_default(self) -> None:
         assert UsageQuery.model_validate({"time-aggregation": "day"}).group_by is None
+
+
+def published_group_by_schema() -> dict[str, Any]:
+    """The `group-by` parameter as /openapi.json publishes it.
+
+    No database: building the spec reads the routes and the models, nothing else. The
+    parameter is the same on both usage-data endpoints, so the first one found will do.
+    """
+
+    for path in app.openapi()["paths"].values():
+        for operation in path.values():
+            for parameter in operation.get("parameters", []):
+                if parameter["name"] == "group-by":
+                    return parameter["schema"]
+
+    raise AssertionError("no group-by parameter is published")
+
+
+class TestGroupingIsPublishedAsItIsAccepted:
+    """A generated client knows only the schema, and the declared type published an array of
+    dimensions alone. An array cannot carry the empty value - an empty one serialises to no
+    parameter at all, which reads as omitted, i.e. the default - so "total over the period
+    alone" was reachable only by writing the request by hand.
+    """
+
+    @staticmethod
+    def string_spelling() -> str:
+        (branch,) = (b for b in published_group_by_schema()["anyOf"] if b.get("type") == "string")
+
+        return branch["pattern"]
+
+    @pytest.mark.parametrize("spelling", ["", "user", "user,sku", "user, sku", "user,sku,workspace"])
+    def test_what_the_schema_admits_is_accepted(self, spelling: str) -> None:
+        """Soundness, which is the direction a generated client depends on. Not the converse:
+        the validator also forgives a trailing comma, and publishing that would be odd.
+        """
+        assert re.fullmatch(self.string_spelling(), spelling), f"{spelling!r} is not published as valid"
+
+        UsageQuery.model_validate({"time-aggregation": "day", "group-by": spelling})
+
+    @pytest.mark.parametrize("bad", ["period", "account", "SKU"])
+    def test_a_dimension_that_is_not_one_is_not_expressible_either(self, bad: str) -> None:
+        assert re.fullmatch(self.string_spelling(), bad) is None
+
+    def test_the_examples_are_instances_of_it(self) -> None:
+        """They were not: an array schema with string examples, one of them not even a
+        dimension. Swagger UI renders those into its array widget, and a generator that
+        validates its examples rejects them.
+        """
+        for example in published_group_by_schema()["examples"]:
+            assert re.fullmatch(self.string_spelling(), example), f"example {example!r} is not valid"
+
+    def test_the_repeated_spelling_still_lists_every_dimension(self) -> None:
+        """Inlined rather than $ref'd, so this is what holds it to UsageDimension."""
+        (branch,) = (b for b in published_group_by_schema()["anyOf"] if b.get("type") == "array")
+
+        assert branch["items"]["enum"] == list(UsageDimension)
 
 
 class TestUsageQueryFilters:
