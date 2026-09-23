@@ -11,6 +11,7 @@ from accounting_service.ingester.messager import (
     ConsumptionSampleRateIngesterMessager,
     WorkspaceSettingsIngesterMessager,
 )
+from accounting_service.ingester.topics import TopicMessagers, messagers_by_topic, split_topics
 
 
 def load_config_file(filename: str = "/etc/eodh/accounting.conf") -> None:
@@ -32,17 +33,57 @@ def load_config_file(filename: str = "/etc/eodh/accounting.conf") -> None:
 @click.option("-v", "--verbose", count=True)
 @click.option("--pulsar-url")
 @click.option("--config-file", default="/etc/eodh/accounting.conf")
-def cli(takeover: bool, verbose: int, config_file: str, pulsar_url: str | None = None) -> None:
+@click.option(
+    "--billing-events-topic",
+    "billing_events_topics",
+    envvar="PULSAR_TOPIC_BILLING_EVENTS",
+    default="billing-events",
+    callback=split_topics,
+    show_default=True,
+    show_envvar=True,
+    help="Topic to read billing events from. A comma-separated list reads all of them.",
+)
+@click.option(
+    "--workspace-settings-topic",
+    "workspace_settings_topics",
+    envvar="PULSAR_TOPIC_WORKSPACE_SETTINGS",
+    default="workspace-settings",
+    callback=split_topics,
+    show_default=True,
+    show_envvar=True,
+    help="Topic to read workspace settings from. A comma-separated list reads all of them.",
+)
+@click.option(
+    "--consumption-rate-samples-topic",
+    "consumption_rate_samples_topics",
+    envvar="PULSAR_TOPIC_CONSUMPTION_RATE_SAMPLES",
+    default="billing-events-consumption-rate-samples",
+    callback=split_topics,
+    show_default=True,
+    show_envvar=True,
+    help="Topic to read consumption rate samples from. A comma-separated list reads all of them.",
+)
+def cli(
+    takeover: bool,
+    verbose: int,
+    config_file: str,
+    billing_events_topics: list[str],
+    workspace_settings_topics: list[str],
+    consumption_rate_samples_topics: list[str],
+    pulsar_url: str | None = None,
+) -> None:
     setup_logging(verbosity=verbose)
     log_component_version("accounting-service")
 
     load_config_file(config_file)
 
-    messagers: dict[str, Any] = {
-        "billing-events": AccountingIngesterMessager(),
-        "workspace-settings": WorkspaceSettingsIngesterMessager(),
-        "billing-events-consumption-rate-samples": ConsumptionSampleRateIngesterMessager(),
-    }
+    messagers: TopicMessagers[Any] = messagers_by_topic(
+        [
+            (billing_events_topics, AccountingIngesterMessager()),
+            (workspace_settings_topics, WorkspaceSettingsIngesterMessager()),
+            (consumption_rate_samples_topics, ConsumptionSampleRateIngesterMessager()),
+        ]
+    )
     run(
         messagers,
         "accounting-ingester",

@@ -60,6 +60,18 @@ Set `SQL_DRIVER` to `postgresql+psycopg`, even if you normally use SQLite. Some 
 
 # Management of this Component
 
+## Pulsar topics
+
+The ingester reads three topics, each set by an environment variable (or the matching command line option):
+
+| Variable | Default |
+|---|---|
+| `PULSAR_TOPIC_BILLING_EVENTS` | `billing-events` |
+| `PULSAR_TOPIC_WORKSPACE_SETTINGS` | `workspace-settings` |
+| `PULSAR_TOPIC_CONSUMPTION_RATE_SAMPLES` | `billing-events-consumption-rate-samples` |
+
+Each takes a comma-separated list, so while a topic moves to another namespace the ingester can read both, for example `billing-events,persistent://public/billing/billing-events`. Topics for different messages must not end in the same name, because messages are routed by the last part of the topic name.
+
 ## Adding BillingItems (SKUs) and credit rates
 
 ### Add or update a billing item
