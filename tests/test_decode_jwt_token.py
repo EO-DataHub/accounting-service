@@ -69,7 +69,7 @@ def _credentials(token: str) -> types.SimpleNamespace:
     return types.SimpleNamespace(credentials=token)
 
 
-def _token(key: RSAPrivateKey, aud: str = "account", **claims: object) -> str:
+def _token(key: RSAPrivateKey, aud: str = "eodh", **claims: object) -> str:
     return jwt.encode({"sub": "test-user", "aud": aud, **claims}, key, algorithm="RS256")
 
 
@@ -96,7 +96,7 @@ def test_a_forged_signature_is_rejected() -> None:
     including one that is not cryptographically valid at all - was accepted.
     """
     header = jwt.utils.base64url_encode(b'{"alg":"RS256","typ":"JWT"}').decode()
-    payload = jwt.utils.base64url_encode(b'{"sub":"attacker","workspaces-owned":["geodowd"],"aud":"account"}').decode()
+    payload = jwt.utils.base64url_encode(b'{"sub":"attacker","workspaces-owned":["geodowd"],"aud":"eodh"}').decode()
     forged_signature = jwt.utils.base64url_encode(b"not-a-real-signature").decode()
     forged_token = f"{header}.{payload}.{forged_signature}"
 
