@@ -133,7 +133,7 @@ fallback-version = "0.0.0"
 package = true
 
 [tool.uv.sources]
-eodhp-utils = { git = "https://github.com/UKEODHP/eodhp-utils", tag = "v0.1.15" }
+eodhp-utils = { git = "https://github.com/UKEODHP/eodhp-utils", rev = "59ef22aad39a60e454ee99214f0e3435e159bdd1" }
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib"]
