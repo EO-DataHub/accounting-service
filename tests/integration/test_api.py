@@ -579,6 +579,106 @@ def test_pricing_policy_api_is_404_when_nothing_is_configured(db_session: Sessio
     assert response.json() == {"detail": "No pricing policy has been configured"}
 
 
+def _two_policies(session: Session) -> None:
+    """One priced from 2024, one from 2025, the second configured after the first."""
+    session.add(models.BillingItem(uuid=uuid.uuid4(), sku="sku1", name="Item a", unit="GBh"))
+    session.flush()
+
+    _a_policy(
+        session,
+        version=1,
+        valid_from=datetime(2024, 1, 16, tzinfo=UTC),
+        rate="2.34",
+        configured_at=datetime(2024, 1, 10, tzinfo=UTC),
+    )
+    _a_policy(
+        session,
+        version=2,
+        valid_from=datetime(2025, 6, 1, tzinfo=UTC),
+        rate="5.00",
+        configured_at=datetime(2025, 5, 20, tzinfo=UTC),
+    )
+
+
+class TestReadingThePolicyAtAnInstant:
+    """`at` answers what priced usage then, rather than what prices it now.
+
+    T11 left version history unserved as an audit read rather than a product one. This is
+    that read, one instant at a time, and the role is what keeps the distinction.
+    """
+
+    def test_it_serves_the_policy_in_force_then(self, db_session: Session, client: TestClient) -> None:
+        _two_policies(db_session)
+
+        response = client.get("/accounting/pricing-policy?at=2024-06-01T00:00:00Z", headers=AUTH_HEADERS)
+
+        assert response.status_code == 200
+        assert response.json()["version"] == 1
+        assert response.json()["rates"] == [{"sku": "sku1", "credits_per_unit": "2.34"}]
+
+    def test_omitting_it_still_serves_the_policy_in_force_now(self, db_session: Session, client: TestClient) -> None:
+        _two_policies(db_session)
+
+        response = client.get("/accounting/pricing-policy", headers=AUTH_HEADERS)
+
+        assert response.status_code == 200
+        assert response.json()["version"] == 2
+
+    def test_an_instant_before_every_policy_is_priced_by_the_earliest(
+        self, db_session: Session, client: TestClient
+    ) -> None:
+        """D10, and resolution's rule rather than this endpoint's: usage recorded before any
+        policy covered it is priced by the first one, so asking about that time answers the
+        same way rather than 404ing.
+        """
+        _two_policies(db_session)
+
+        response = client.get("/accounting/pricing-policy?at=1999-01-01T00:00:00Z", headers=AUTH_HEADERS)
+
+        assert response.status_code == 200
+        assert response.json()["version"] == 1
+
+    def test_a_timestamp_with_no_offset_is_read_as_utc(self, db_session: Session, client: TestClient) -> None:
+        _two_policies(db_session)
+
+        response = client.get("/accounting/pricing-policy?at=2024-06-01T00:00:00", headers=AUTH_HEADERS)
+
+        assert response.status_code == 200
+        assert response.json()["version"] == 1
+
+    def test_it_is_refused_without_the_hub_admin_role(
+        self,
+        db_session: Session,
+        client: TestClient,
+        authenticate_as: Callable[[dict[str, Any]], None],
+    ) -> None:
+        """Refused, not ignored. A caller told today's rates in answer to a question about
+        January would read them as January's.
+        """
+        _two_policies(db_session)
+        authenticate_as(TOKEN_MEMBER)
+
+        response = client.get("/accounting/pricing-policy?at=2024-06-01T00:00:00Z", headers=AUTH_HEADERS)
+
+        assert response.status_code == 401
+        assert response.json() == {"detail": "'at' is restricted to hub admins"}
+
+    def test_the_read_without_it_is_open_to_any_token(
+        self,
+        db_session: Session,
+        client: TestClient,
+        authenticate_as: Callable[[dict[str, Any]], None],
+    ) -> None:
+        """The product read is unchanged: the role guards the parameter, not the endpoint."""
+        _two_policies(db_session)
+        authenticate_as(TOKEN_STRANGER)
+
+        response = client.get("/accounting/pricing-policy", headers=AUTH_HEADERS)
+
+        assert response.status_code == 200
+        assert response.json()["version"] == 2
+
+
 # Every route this service serves, as of the decision that nothing is anonymously readable.
 # Listed rather than discovered so that adding an endpoint means adding a line here, and a
 # route that reaches production without authorisation cannot do so quietly.

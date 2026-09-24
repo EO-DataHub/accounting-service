@@ -1,11 +1,13 @@
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import Depends, Response
+from fastapi import Depends, HTTPException, Query, Response
 
-from accounting_service.app.authz import MinTier, account_authz, decode_jwt_token, workspace_authz
+from accounting_service.app.authz import MinTier, account_authz, decode_jwt_token, is_hub_admin, workspace_authz
 from accounting_service.settings import get_settings
+from accounting_service.timestamps import datetime_default_to_utc
 
 TokenDep = Annotated[dict[str, Any], Depends(decode_jwt_token)]
 
@@ -32,6 +34,40 @@ def require_token(token_payload: TokenDep) -> dict[str, Any]:
     Nothing here is anonymously readable, which is the whole of the rule.
     """
     return token_payload
+
+
+def pricing_instant(
+    token_payload: TokenDep,
+    at: Annotated[
+        datetime | None,
+        Query(
+            title="Instant to resolve the policy at",
+            description=(
+                "Serve the policy that priced usage at this RFC 3339 instant rather than the "
+                "one pricing usage now. A timestamp with no offset is read as UTC. Restricted "
+                "to hub admins: what prices usage now is the product read, and what priced it "
+                "on some past date is an audit one."
+            ),
+            examples=["2025-02-12T13:34:22Z"],
+        ),
+    ] = None,
+) -> datetime:
+    """The instant a pricing read resolves at: `at` where it is given, otherwise now.
+
+    Refused rather than ignored for a token without the role, because a caller who asked
+    what priced usage in January and was silently told today's rates would read the answer
+    as January's.
+    """
+
+    at = datetime_default_to_utc(at)
+
+    if at is None:
+        return datetime.now(UTC)
+
+    if not is_hub_admin(token_payload):
+        raise HTTPException(status_code=401, detail="'at' is restricted to hub admins")
+
+    return at
 
 
 def cache_control(max_age: int, *, vary: str) -> Callable[[Response], None]:

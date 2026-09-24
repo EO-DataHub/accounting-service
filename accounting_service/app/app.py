@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from accounting_service.app.authz import MinTier
 from accounting_service.app.dependencies import (
     global_data_cache,
+    pricing_instant,
     require_account,
     require_token,
     require_workspace,
@@ -304,17 +305,26 @@ def get_prices(session: SessionDep) -> list[BillingItemRateAPIResult]:
 
 @app.get(
     "/accounting/pricing-policy",
-    summary="Return the pricing policy in force",
+    summary="Return the pricing policy in force, or the one in force at a given instant",
     dependencies=[Depends(require_token), Depends(global_data_cache)],
 )
-def get_pricing_policy(session: SessionDep) -> PricingPolicyAPIResult:
+def get_pricing_policy(
+    session: SessionDep, at: Annotated[datetime, Depends(pricing_instant)]
+) -> PricingPolicyAPIResult:
     """Returns the whole rate card that prices usage now: every SKU's credits per unit and
     every category multiplier.
 
     `/accounting/prices` serves the same rates one row per SKU, without the multipliers or the
     default category.
+
+    A hub admin may pass `at` to read the policy that priced usage at some other instant. Two
+    things follow from resolution (D10) rather than from this endpoint: an instant before
+    every policy is priced by the earliest one rather than being a 404, and an instant in the
+    future answers from the policies configured so far. Neither answer is immutable - a
+    backdated policy configured tomorrow changes what priced usage yesterday - so this is
+    cached for as briefly as the read of the policy in force.
     """
-    policy = PricingPolicy.resolve(session, datetime.now(UTC))
+    policy = PricingPolicy.resolve(session, at)
 
     if policy is None:
         raise HTTPException(
