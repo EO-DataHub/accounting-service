@@ -496,6 +496,44 @@ def test_prices_api_is_empty_when_no_policy_is_configured(db_session: Session, c
     assert response.json() == []
 
 
+class TestReadingThePricesAtAnInstant:
+    """The same `at` as on /accounting/pricing-policy, through the same dependency.
+
+    What resolution does with an instant is asserted there. What these two ask is that the
+    parameter reaches this route as well, and that the role does too - a handler that took
+    `at` and never passed it on would leave the other endpoint's tests passing.
+    """
+
+    def test_it_serves_the_rates_in_force_then(self, db_session: Session, client: TestClient) -> None:
+        _two_policies(db_session)
+
+        response = client.get("/accounting/prices?at=2024-06-01T00:00:00Z", headers=AUTH_HEADERS)
+
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "sku": "sku1",
+                "credits_per_unit": "2.34",
+                "valid_from": "2024-01-16T00:00:00Z",
+                "policy_version": 1,
+            }
+        ]
+
+    def test_it_is_refused_without_the_hub_admin_role(
+        self,
+        db_session: Session,
+        client: TestClient,
+        authenticate_as: Callable[[dict[str, Any]], None],
+    ) -> None:
+        _two_policies(db_session)
+        authenticate_as(TOKEN_MEMBER)
+
+        response = client.get("/accounting/prices?at=2024-06-01T00:00:00Z", headers=AUTH_HEADERS)
+
+        assert response.status_code == 401
+        assert response.json() == {"detail": "'at' is restricted to hub admins"}
+
+
 def _a_policy(
     session: Session,
     *,

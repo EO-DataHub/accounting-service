@@ -277,14 +277,21 @@ def get_item(session: SessionDep, sku: str) -> BillingItemAPIResult:
 
 @app.get(
     "/accounting/prices",
-    summary="Return the current EO DataHub credit rates",
+    summary="Return the EO DataHub credit rates, current or at a given instant",
     dependencies=[Depends(require_token), Depends(global_data_cache)],
 )
-def get_prices(session: SessionDep) -> list[BillingItemRateAPIResult]:
+def get_prices(
+    session: SessionDep, at: Annotated[datetime, Depends(pricing_instant)]
+) -> list[BillingItemRateAPIResult]:
     """Returns the credits charged per unit for every SKU, in SKU order. The unit is defined
     in the billing item the rate relates to.
+
+    A hub admin may pass `at` to read the rates that priced usage at some other instant. It
+    resolves exactly as it does on `/accounting/pricing-policy`, which serves the same rates
+    with the multipliers and the default category beside them; each row here reports the
+    `valid_from` and `policy_version` it came from, so the answer says which policy gave it.
     """
-    policy = PricingPolicy.resolve(session, datetime.now(UTC))
+    policy = PricingPolicy.resolve(session, at)
 
     if policy is None:
         return []
