@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from accounting_service.app.authz import MinTier
 from accounting_service.app.dependencies import (
     global_data_cache,
+    pricing_instant,
     require_account,
     require_token,
     require_workspace,
@@ -103,6 +104,9 @@ def get_workspace_usage_data(
         limit=query.limit,
         after=query.after,
         time_aggregation=query.time_aggregation,
+        user=query.user,
+        sku=query.sku,
+        group_by=query.group_by,
     )
 
     return [BillingEventAPIResult.model_validate(row) for row in usage]
@@ -235,6 +239,9 @@ def get_account_usage_data(
         limit=query.limit,
         after=query.after,
         time_aggregation=query.time_aggregation,
+        user=query.user,
+        sku=query.sku,
+        group_by=query.group_by,
     )
 
     return [BillingEventAPIResult.model_validate(row) for row in usage]
@@ -270,14 +277,21 @@ def get_item(session: SessionDep, sku: str) -> BillingItemAPIResult:
 
 @app.get(
     "/accounting/prices",
-    summary="Return the current EO DataHub credit rates",
+    summary="Return the EO DataHub credit rates, current or at a given instant",
     dependencies=[Depends(require_token), Depends(global_data_cache)],
 )
-def get_prices(session: SessionDep) -> list[BillingItemRateAPIResult]:
+def get_prices(
+    session: SessionDep, at: Annotated[datetime, Depends(pricing_instant)]
+) -> list[BillingItemRateAPIResult]:
     """Returns the credits charged per unit for every SKU, in SKU order. The unit is defined
     in the billing item the rate relates to.
+
+    A hub admin may pass `at` to read the rates that priced usage at some other instant. It
+    resolves exactly as it does on `/accounting/pricing-policy`, which serves the same rates
+    with the multipliers and the default category beside them; each row here reports the
+    `valid_from` and `policy_version` it came from, so the answer says which policy gave it.
     """
-    policy = PricingPolicy.resolve(session, datetime.now(UTC))
+    policy = PricingPolicy.resolve(session, at)
 
     if policy is None:
         return []
@@ -298,17 +312,26 @@ def get_prices(session: SessionDep) -> list[BillingItemRateAPIResult]:
 
 @app.get(
     "/accounting/pricing-policy",
-    summary="Return the pricing policy in force",
+    summary="Return the pricing policy in force, or the one in force at a given instant",
     dependencies=[Depends(require_token), Depends(global_data_cache)],
 )
-def get_pricing_policy(session: SessionDep) -> PricingPolicyAPIResult:
+def get_pricing_policy(
+    session: SessionDep, at: Annotated[datetime, Depends(pricing_instant)]
+) -> PricingPolicyAPIResult:
     """Returns the whole rate card that prices usage now: every SKU's credits per unit and
     every category multiplier.
 
     `/accounting/prices` serves the same rates one row per SKU, without the multipliers or the
     default category.
+
+    A hub admin may pass `at` to read the policy that priced usage at some other instant. Two
+    things follow from resolution (D10) rather than from this endpoint: an instant before
+    every policy is priced by the earliest one rather than being a 404, and an instant in the
+    future answers from the policies configured so far. Neither answer is immutable - a
+    backdated policy configured tomorrow changes what priced usage yesterday - so this is
+    cached for as briefly as the read of the policy in force.
     """
-    policy = PricingPolicy.resolve(session, datetime.now(UTC))
+    policy = PricingPolicy.resolve(session, at)
 
     if policy is None:
         raise HTTPException(

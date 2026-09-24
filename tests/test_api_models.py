@@ -13,17 +13,21 @@ the handlers use them and that response_model validation passes. The field-level
 are here.
 """
 
+import re
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
-from uuid import uuid4
+from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
 
+from accounting_service.app.app import app
 from accounting_service.app.models import (
     BillingEventAPIResult,
     BillingItemAPIResult,
     BillingItemRateAPIResult,
     PricingPolicyAPIResult,
+    UsageQuery,
 )
 from accounting_service.models import (
     BillingEvent,
@@ -31,6 +35,7 @@ from accounting_service.models import (
     PricingPolicy,
     PricingPolicyCategoryMultiplier,
     PricingPolicyRate,
+    UsageDimension,
     UsageRow,
 )
 
@@ -46,6 +51,7 @@ def an_event(
     event_end: datetime = datetime(2025, 6, 15, 12, 15, tzinfo=UTC),
     workspace: str = "my-workspace",
     quantity: float = 1.5,
+    user: UUID | None = None,
 ) -> BillingEvent:
     """Spelled out rather than taking **overrides, so the arguments keep their types.
 
@@ -59,6 +65,7 @@ def an_event(
         event_start=event_start,
         event_end=event_end,
         item_id=item.uuid,
+        user=user,
         workspace=workspace,
         quantity=quantity,
         item=item,
@@ -115,6 +122,34 @@ class TestBillingEventAPIResult:
         assert result.uuid == event.uuid
         assert result.workspace == "other-workspace"
         assert result.quantity == 42.5
+
+    def test_the_user_comes_across(self) -> None:
+        user = uuid4()
+
+        result = BillingEventAPIResult.model_validate(a_usage_row(an_event(user=user)))
+
+        assert result.user == user
+
+    def test_usage_nobody_is_responsible_for_reports_no_user(self) -> None:
+        """Workspace storage, for instance: metered against the workspace and against no
+        one in it. Null is the answer, not an omission.
+        """
+        result = BillingEventAPIResult.model_validate(a_usage_row(an_event(user=None)))
+
+        assert result.user is None
+
+    @pytest.mark.parametrize("ungrouped", ["item", "workspace", "user"])
+    def test_a_dimension_an_aggregate_spans_is_null_rather_than_missing(self, ungrouped: str) -> None:
+        """What `group-by` leaves out comes back from the query as NULL, and has to survive
+        response validation as null. Before grouping was selectable, `item` and `workspace`
+        were required, so this is the assertion that they are not any more.
+        """
+        event = an_event()
+        setattr(event, ungrouped, None)
+
+        result = BillingEventAPIResult.model_validate(a_usage_row(event))
+
+        assert getattr(result, ungrouped) is None
 
     def test_a_timestamp_with_an_offset_is_converted_to_utc(self) -> None:
         """Not relabelled. The connection can hand back an aware value in any timezone, and
@@ -304,3 +339,145 @@ class TestPricingPolicyAPIResult:
         `billing-admin` is the audit path, and T19 is where an audit trail lands.
         """
         assert gone not in PricingPolicyAPIResult.model_fields
+
+
+class TestUsageQueryGrouping:
+    """`group-by` is the parameter that decides an aggregate's shape, so its parsing is the
+    contract. Pydantic is what rejects a bad one, and FastAPI turns that into a 422.
+    """
+
+    def test_omitting_it_is_not_the_same_as_asking_for_nothing(self) -> None:
+        """None means "the default set"; the empty set means "total over the period alone".
+        Collapsing the two would make the default unexpressible.
+        """
+        # model_validate({}) rather than UsageQuery(): the defaults live inside Field()
+        # within Annotated, which pyright does not read as a default for the constructor.
+        assert UsageQuery.model_validate({}).group_by is None
+
+        query = UsageQuery.model_validate({"time-aggregation": "day", "group-by": ""})
+
+        assert query.group_by == frozenset()
+
+    def test_comma_separated(self) -> None:
+        query = UsageQuery.model_validate({"time-aggregation": "day", "group-by": "user,sku"})
+
+        assert query.group_by == frozenset({UsageDimension.USER, UsageDimension.SKU})
+
+    def test_repeated(self) -> None:
+        """How FastAPI spells a set-typed query parameter by default."""
+        query = UsageQuery.model_validate({"time-aggregation": "day", "group-by": ["user", "sku"]})
+
+        assert query.group_by == frozenset({UsageDimension.USER, UsageDimension.SKU})
+
+    def test_repeated_and_comma_separated_together(self) -> None:
+        query = UsageQuery.model_validate({"time-aggregation": "day", "group-by": ["user,sku", "workspace"]})
+
+        assert query.group_by == frozenset({UsageDimension.USER, UsageDimension.SKU, UsageDimension.WORKSPACE})
+
+    def test_surrounding_space_is_ignored(self) -> None:
+        query = UsageQuery.model_validate({"time-aggregation": "day", "group-by": "user, sku"})
+
+        assert query.group_by == frozenset({UsageDimension.USER, UsageDimension.SKU})
+
+    @pytest.mark.parametrize("bad", ["period", "account", "SKU"])
+    def test_a_dimension_that_is_not_one_is_rejected(self, bad: str) -> None:
+        """A closed set, like `time-aggregation`. Silently ignoring an unknown dimension
+        would hand back a breakdown by something other than what was asked for.
+        """
+        with pytest.raises(ValueError, match="group-by"):
+            UsageQuery.model_validate({"time-aggregation": "day", "group-by": bad})
+
+    def test_grouping_without_aggregation_is_rejected(self) -> None:
+        """There are no totals to group. Rejected rather than ignored, because one row per
+        event looks enough like a breakdown to be read as one.
+        """
+        with pytest.raises(ValueError, match="time-aggregation"):
+            UsageQuery.model_validate({"group-by": "user"})
+
+    def test_aggregation_without_grouping_is_the_default(self) -> None:
+        assert UsageQuery.model_validate({"time-aggregation": "day"}).group_by is None
+
+
+def published_group_by_schema() -> dict[str, Any]:
+    """The `group-by` parameter as /openapi.json publishes it.
+
+    No database: building the spec reads the routes and the models, nothing else. The
+    parameter is the same on both usage-data endpoints, so the first one found will do.
+    """
+
+    for path in app.openapi()["paths"].values():
+        for operation in path.values():
+            for parameter in operation.get("parameters", []):
+                if parameter["name"] == "group-by":
+                    return parameter["schema"]
+
+    raise AssertionError("no group-by parameter is published")
+
+
+class TestGroupingIsPublishedAsItIsAccepted:
+    """A generated client knows only the schema, and the declared type published an array of
+    dimensions alone. An array cannot carry the empty value - an empty one serialises to no
+    parameter at all, which reads as omitted, i.e. the default - so "total over the period
+    alone" was reachable only by writing the request by hand.
+    """
+
+    @staticmethod
+    def string_spelling() -> str:
+        (branch,) = (b for b in published_group_by_schema()["anyOf"] if b.get("type") == "string")
+
+        return branch["pattern"]
+
+    @pytest.mark.parametrize("spelling", ["", "user", "user,sku", "user, sku", "user,sku,workspace"])
+    def test_what_the_schema_admits_is_accepted(self, spelling: str) -> None:
+        """Soundness, which is the direction a generated client depends on. Not the converse:
+        the validator also forgives a trailing comma, and publishing that would be odd.
+        """
+        assert re.fullmatch(self.string_spelling(), spelling), f"{spelling!r} is not published as valid"
+
+        UsageQuery.model_validate({"time-aggregation": "day", "group-by": spelling})
+
+    @pytest.mark.parametrize("bad", ["period", "account", "SKU"])
+    def test_a_dimension_that_is_not_one_is_not_expressible_either(self, bad: str) -> None:
+        assert re.fullmatch(self.string_spelling(), bad) is None
+
+    def test_the_examples_are_instances_of_it(self) -> None:
+        """They were not: an array schema with string examples, one of them not even a
+        dimension. Swagger UI renders those into its array widget, and a generator that
+        validates its examples rejects them.
+        """
+        for example in published_group_by_schema()["examples"]:
+            assert re.fullmatch(self.string_spelling(), example), f"example {example!r} is not valid"
+
+    def test_the_repeated_spelling_still_lists_every_dimension(self) -> None:
+        """Inlined rather than $ref'd, so this is what holds it to UsageDimension."""
+        (branch,) = (b for b in published_group_by_schema()["anyOf"] if b.get("type") == "array")
+
+        assert branch["items"]["enum"] == list(UsageDimension)
+
+
+class TestUsageQueryFilters:
+    def test_user_and_sku_default_to_unfiltered(self) -> None:
+        query = UsageQuery.model_validate({})
+
+        assert query.user is None
+        assert query.sku is None
+
+    def test_they_parse(self) -> None:
+        user = uuid4()
+
+        query = UsageQuery.model_validate({"user": str(user), "sku": "cpu-seconds"})
+
+        assert query.user == user
+        assert query.sku == "cpu-seconds"
+
+    def test_a_user_that_is_not_a_uuid_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="user"):
+            UsageQuery.model_validate({"user": "somebody"})
+
+    def test_they_need_no_aggregation(self) -> None:
+        """Unlike `group-by`: filtering selects which events are counted, which means the
+        same thing whether or not they are then totalled.
+        """
+        query = UsageQuery.model_validate({"user": str(uuid4()), "sku": "cpu-seconds"})
+
+        assert query.time_aggregation is None

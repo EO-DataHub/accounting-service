@@ -810,6 +810,53 @@ class TestUsageDataReportsCredits:
         assert row["quantity"] == 5400.0
         assert Decimal(row["credits"]) == Decimal("5.4")
 
+    def test_a_wider_grouping_still_totals_the_credits_it_folds_in(
+        self,
+        client: TestClient,
+        db_session: Session,
+        db_session_factory: sessionmaker[Session],
+        policy: PricingPolicy,
+    ) -> None:
+        """T12. Credits are joined in per event before the GROUP BY, so collapsing a
+        dimension has to carry them along rather than drop them with the column.
+        """
+        messager = AccountingIngesterMessager(session_factory=db_session_factory)
+        messager.consume(bemsg_to_pulsar_msg(a_usage_message(quantity=3600.0)))
+        messager.consume(bemsg_to_pulsar_msg(a_usage_message(quantity=1800.0)))
+
+        (row,) = client.get(f"/workspaces/{WORKSPACE}/accounting/usage-data?time-aggregation=day&group-by=").json()
+
+        assert row["quantity"] == 5400.0
+        assert Decimal(row["credits"]) == Decimal("5.4")
+        assert row["item"] is None
+        assert row["workspace"] is None
+
+    def test_grouping_by_user_splits_the_credits_between_them(
+        self,
+        client: TestClient,
+        db_session: Session,
+        db_session_factory: sessionmaker[Session],
+        policy: PricingPolicy,
+    ) -> None:
+        """The dimension nothing populates yet (T6's producer work is the same gap), so this
+        drives it from messages that do carry a user rather than waiting for one that will.
+        """
+        messager = AccountingIngesterMessager(session_factory=db_session_factory)
+
+        first = a_usage_message(quantity=3600.0)
+        first.user = str(uuid4())
+        messager.consume(bemsg_to_pulsar_msg(first))
+
+        second = a_usage_message(quantity=1800.0)
+        second.user = str(uuid4())
+        messager.consume(bemsg_to_pulsar_msg(second))
+
+        rows = client.get(f"/workspaces/{WORKSPACE}/accounting/usage-data?time-aggregation=day&group-by=user").json()
+
+        assert sorted((row["user"], Decimal(row["credits"])) for row in rows) == sorted(
+            [(first.user, Decimal("3.6")), (second.user, Decimal("1.8"))]
+        )
+
     def test_a_grant_never_appears_as_usage(
         self, client: TestClient, db_session: Session, policy: PricingPolicy
     ) -> None:
