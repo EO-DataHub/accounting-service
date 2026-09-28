@@ -4,7 +4,7 @@ annotations, so `cls.sku == sku` types as a `bool` rather than as a SQL expressi
 
 import logging
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -16,14 +16,20 @@ from pydantic_core import PydanticUndefined
 from sqlalchemy import (
     TIMESTAMP,
     CheckConstraint,
+    ColumnElement,
     CursorResult,
     Index,
     MetaData,
-    Numeric,
+    String,
+    Text,
     UniqueConstraint,
+    Uuid,
     and_,
-    column,
+    cast,
+    false,
     func,
+    literal_column,
+    null,
     or_,
     select,
     text,
@@ -32,7 +38,7 @@ from sqlalchemy import (
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, aliased, selectinload
+from sqlalchemy.orm import Mapped, Session, aliased, selectinload
 from sqlalchemy.orm.strategy_options import _AbstractLoad
 from sqlmodel import Field as SQLModelField
 from sqlmodel import Relationship, SQLModel, col
@@ -467,6 +473,69 @@ class TimeAggregation(StrEnum):
     MONTH = "month"
 
 
+class UsageDimension(StrEnum):
+    """Dimensions that aggregated usage can be broken down by, beside the period itself.
+
+    A dimension that is not grouped is reported as NULL rather than as one of the values it
+    spans, because an aggregated row covers all of them. Period is not a member: it is
+    carried by `TimeAggregation`, which decides whether there is any aggregation at all.
+    """
+
+    USER = "user"
+    SKU = "sku"
+    WORKSPACE = "workspace"
+
+
+# The order dimensions are written into a GROUP BY, so that one request always compiles to
+# one statement whatever order the caller's set iterates in.
+USAGE_DIMENSION_ORDER = (UsageDimension.SKU, UsageDimension.USER, UsageDimension.WORKSPACE)
+
+# What the usage reads grouped by before grouping was selectable. It stays the default so
+# that a caller who does not ask keeps the shape it already had.
+DEFAULT_USAGE_DIMENSIONS = frozenset({UsageDimension.SKU, UsageDimension.WORKSPACE})
+
+
+class _OrderKeyColumn(NamedTuple):
+    """One column of an ordering key: the column, how to read a row's value for it, and whether
+    that value can be NULL.
+
+    A nullable column is compared with NULL-aware operators, which PostgreSQL will not answer
+    from an index, so only mark one that no index leads with.
+    """
+
+    column: Mapped[Any]
+    read: Callable[[Any], Any]
+    nullable: bool = False
+
+
+def _strictly_after(key: Sequence[_OrderKeyColumn], row: "BillingEvent") -> ColumnElement[bool]:
+    """Everything sorting after `row`, over an ordering key of columns and how to read them.
+
+    Spelled out as equality on each prefix rather than as a row-value comparison, because
+    PostgreSQL will not use an index for `(a, b) > (:a, :b)` here.
+
+    ORDER BY puts NULLs last, so on a nullable column "after" is a greater value or a NULL, and
+    nothing at all sorts after a NULL.
+    """
+
+    def same(element: _OrderKeyColumn) -> ColumnElement[bool]:
+        value = element.read(row)
+
+        return element.column.is_not_distinct_from(value) if element.nullable else element.column == value
+
+    def after(element: _OrderKeyColumn) -> ColumnElement[bool]:
+        value = element.read(row)
+
+        if not element.nullable:
+            return element.column > value
+
+        return or_(element.column > value, element.column.is_(None)) if value is not None else false()
+
+    return or_(
+        *(and_(*(same(earlier) for earlier in key[:position]), after(element)) for position, element in enumerate(key))
+    )
+
+
 class PagingCursorNotFound(Exception):
     """Raised when paging from a row that does not exist.
 
@@ -578,24 +647,41 @@ class BillingEvent(SQLModel, table=True):
         after: UUID | None = None,
         limit: int = 5_000,
         time_aggregation: TimeAggregation | None = None,
+        user: UUID | None = None,
+        sku: str | None = None,
+        group_by: frozenset[UsageDimension] | None = None,
     ) -> Iterator[UsageRow]:
         """
         Find and return BillingEvents matching some criteria, each with what it cost.
 
         For paging, `after` should be the UUID of the last billing event on the previous page.
 
-        time_aggregation gives daily or monthly totals for each SKU+workspace pair. Anything
-        outside TimeAggregation raises ValueError rather than being ignored.
+        time_aggregation gives totals per period for each combination of the grouping
+        dimensions. Anything outside TimeAggregation raises ValueError rather than being
+        ignored.
+
+        group_by names those dimensions and defaults to DEFAULT_USAGE_DIMENSIONS. A dimension
+        left out is not returned as well as not grouped: it comes back NULL, because one
+        aggregated row spans several values of it and reporting any single one would be a
+        lie. Grouping only means something over totals, so group_by without time_aggregation
+        raises ValueError. The empty set totals over the period alone.
+
+        `workspace`, `account`, `user` and `sku` select which events are counted, and apply
+        before aggregation - they have to, because the column a filter tests may be NULL
+        afterwards. `start` and `end` apply after it, so they bound whole periods rather than
+        the events inside them. That asymmetry predates the filters and is left alone here.
 
         Credits come from the ledger through a per-event sub-SELECT rather than from a direct
         join. One event carries one debit and may carry several corrections, so joining the
         ledger rows in would fan out and multiply `SUM(quantity)` by the number of rows. See
         `UsageRow` for what the figure means.
         """
+        if group_by is not None and time_aggregation is None:
+            raise ValueError("group_by describes how totals are grouped, so it needs time_aggregation")
+
+        dimensions = DEFAULT_USAGE_DIMENSIONS if group_by is None else frozenset(group_by)
+
         # What one event cost: every ledger row referencing it, summed, one row per event.
-        # Both branches below need this and neither can share a spelling with the other - the
-        # aggregated branch has to fold credits in before its own GROUP BY, which puts the
-        # sub-SELECT inside the text(). Change one and change the other.
         charged = (
             select(
                 col(CreditLedgerTransaction.billing_event_id).label("billing_event_id"),
@@ -606,64 +692,90 @@ class BillingEvent(SQLModel, table=True):
             .subquery()
         )
 
+        # Row-level selection, written once against the table itself. Both branches below can
+        # use it unchanged: the aggregated one puts it inside the sub-SELECT, and the raw one
+        # has the table as its source anyway. `account` and `sku` are IN rather than joins so
+        # that neither branch has to carry a join that exists only to filter.
+        row_filters: list[Any] = []
+
+        if workspace is not None:
+            row_filters.append(col(cls.workspace) == workspace)
+
+        if account is not None:
+            row_filters.append(
+                col(cls.workspace).in_(
+                    select(col(WorkspaceAccount.workspace)).where(col(WorkspaceAccount.account) == account)
+                )
+            )
+
+        if user is not None:
+            row_filters.append(col(cls.user) == user)
+
+        if sku is not None:
+            row_filters.append(col(cls.item_id).in_(select(col(BillingItem.uuid)).where(col(BillingItem.sku) == sku)))
+
         # With no aggregation the raw table is the source of rows to filter, sort, page and
         # return. With aggregation it is a sub-SELECT computing the totals, and the UUID
-        # assigned is the lexicographically largest of the rows aggregated. That can misbehave
-        # on the last pages, because events arriving while paging change the maximum UUIDs.
+        # assigned is the lexicographically largest of the rows aggregated. An event arriving
+        # while a caller pages can therefore change a total's UUID, and `after` then names a
+        # row that no longer exists and raises. The order itself does not depend on it: see
+        # the ordering key below.
         if time_aggregation is not None:
-            # Coerced rather than trusted: the value is interpolated into the SQL below, so the
+            # Coerced rather than trusted: the value reaches SQL as a literal below, so the
             # closed set has to be enforced at runtime and not only in the type hints.
             period = TimeAggregation(time_aggregation).value
 
-            events = str(cls.__tablename__)
-            ledger = str(CreditLedgerTransaction.__tablename__)
+            # PostgreSQL's timezone(zone, timestamptz) is what `AT TIME ZONE` compiles to, so
+            # the month and day aggregate indexes on this table still match these expressions
+            # and the GROUP BY still reads in index order with no sort.
+            #
+            # `pg_indexes` prints the two spellings differently, which makes it look as though
+            # they diverge. They do not: the planner ignores that difference, and EXPLAIN gives
+            # the same GroupAggregate at the same cost either way. Compare plans, not text.
+            period_start = func.date_trunc(period, func.timezone("UTC", col(cls.event_start)))
+            period_end = period_start + literal_column(f"'1 {period}'::interval")
 
-            period_start_expr = f"date_trunc('{period}', {events}.event_start AT TIME ZONE 'UTC')"
-            period_end_expr = f"{period_start_expr} + '1 {period}'::interval"
-            uuid_expr = f"CAST(MAX(CAST({events}.uuid AS TEXT)) AS UUID)"
+            # A dimension that is grouped reports its own column; one that is not reports NULL,
+            # cast so that the subquery's type matches the table column it stands in for.
+            projections: dict[UsageDimension, Any] = {
+                UsageDimension.SKU: col(cls.item_id) if UsageDimension.SKU in dimensions else cast(null(), Uuid),
+                UsageDimension.USER: col(cls.user) if UsageDimension.USER in dimensions else cast(null(), Uuid),
+                UsageDimension.WORKSPACE: (
+                    col(cls.workspace) if UsageDimension.WORKSPACE in dimensions else cast(null(), String)
+                ),
+            }
 
-            # The LEFT JOIN is to one row per event, not to the ledger itself: an event carries
+            # The outer join is to one row per event, not to the ledger itself: an event carries
             # one debit and may carry corrections, and joining those in directly would repeat
             # each event's quantity once per ledger row.
-            select_aggregated_events = text(
-                f"""
-SELECT {uuid_expr} as uuid,
-       {period_start_expr} AS event_start,
-       {period_end_expr} AS event_end,
-       {events}.item_id,
-       NULL AS user,
-       {events}.workspace,
-       SUM({events}.quantity) AS quantity,
-       -COALESCE(SUM(charged.credits), 0) AS credits
-FROM {events}
-LEFT JOIN (
-    SELECT billing_event_id, SUM(credits) AS credits
-    FROM {ledger}
-    WHERE billing_event_id IS NOT NULL
-    GROUP BY billing_event_id
-) charged ON charged.billing_event_id = {events}.uuid
-GROUP BY 2, 3, 4, 6
-"""
+            aggregate = (
+                select(
+                    cast(func.max(cast(col(cls.uuid), Text)), Uuid).label("uuid"),
+                    period_start.label("event_start"),
+                    period_end.label("event_end"),
+                    projections[UsageDimension.SKU].label("item_id"),
+                    projections[UsageDimension.USER].label("user"),
+                    projections[UsageDimension.WORKSPACE].label("workspace"),
+                    func.sum(col(cls.quantity)).label("quantity"),
+                    (-func.coalesce(func.sum(charged.c.credits), 0)).label("credits"),
+                )
+                .outerjoin(charged, charged.c.billing_event_id == col(cls.uuid))
+                # USAGE_DIMENSION_ORDER rather than `dimensions`, so that the GROUP BY a given
+                # request produces does not vary with set iteration order.
+                .group_by(
+                    period_start,
+                    period_end,
+                    *(projections[dimension] for dimension in USAGE_DIMENSION_ORDER if dimension in dimensions),
+                )
+                .where(*row_filters)
             )
 
-            # The table's own columns, not the ORM attributes. `.columns()` describes the result
-            # of the text above, so a Column is what it wants, and col() hands back `Mapped[...]`.
-            # `credits` is not a BillingEvent column, so it is declared here rather than taken
-            # from the table.
-            table = SQLModel.metadata.tables[str(cls.__tablename__)]
-            select_aggregated_events = select_aggregated_events.columns(
-                table.c.uuid,
-                table.c.event_start,
-                table.c.event_end,
-                table.c.item_id,
-                table.c.user,
-                table.c.workspace,
-                table.c.quantity,
-                column("credits", Numeric),
-            )
-
-            aggregated = select_aggregated_events.subquery()
-            billingevent_src = aliased(BillingEvent, aggregated)
+            aggregated = aggregate.subquery()
+            # adapt_on_names because the period columns are computed, not selected: a
+            # `date_trunc(...) AS event_start` does not proxy `billing_event.event_start`, so
+            # the default identity match leaves it pointing at the base table and the query
+            # loses its FROM. Matching on the labels above is what makes the alias line up.
+            billingevent_src = aliased(BillingEvent, aggregated, adapt_on_names=True)
             credits_col = aggregated.c.credits
         else:
             billingevent_src = cls
@@ -671,55 +783,74 @@ GROUP BY 2, 3, 4, 6
             # ledger stores it. NULL is an event with no ledger row at all.
             credits_col = -func.coalesce(charged.c.credits, 0)
 
-        # The join exists for the ordering and paging predicates below, which compare
-        # BillingItem.sku. It does not populate `item`, so reading event.item.sku on the way out
-        # cost one query per row. selectinload rather than contains_eager, which would reuse the
-        # join and then depend on a join that exists only for ordering.
-        #
         # Column handles for everything below, named once so the paging comparison reads as the
         # tuple comparison it is.
-        event_start = col(billingevent_src.event_start)
-        event_end = col(billingevent_src.event_end)
+        event_start_col = col(billingevent_src.event_start)
+        event_end_col = col(billingevent_src.event_end)
         event_workspace = col(billingevent_src.workspace)
+        event_user = col(billingevent_src.user)
         event_uuid = col(billingevent_src.uuid)
         item_sku = col(BillingItem.sku)
 
-        all_billing_events = (
-            select(billingevent_src, credits_col.label("credits"))
-            .join(BillingItem, col(BillingItem.uuid) == col(billingevent_src.item_id))
-            .options(selectinload(billingevent_src.item))  # pyright: ignore[reportArgumentType]
+        # A complete and certain order, so that `after` names exactly one place in it. A
+        # dimension that was not grouped is NULL on every row, which orders nothing and cannot
+        # be compared against, so it is left out of the key entirely.
+        #
+        # Every dimension that was grouped is in it, which makes the columns before the UUID
+        # the GROUP BY itself and so unique per row. The UUID has to be last and has to be
+        # there - `after` names a row by it - but it is a MAX over the rows folded into a
+        # total, so it grows as events arrive. A group whose place depended on it would move
+        # under a caller paging through, and be returned on two consecutive pages.
+        grouped_workspace = time_aggregation is None or UsageDimension.WORKSPACE in dimensions
+        grouped_sku = time_aggregation is None or UsageDimension.SKU in dimensions
+        # Aggregated only: a raw row is placed exactly by its own UUID already, and user is the
+        # one key column that can be NULL, which costs the paging comparison its index.
+        grouped_user = time_aggregation is not None and UsageDimension.USER in dimensions
+
+        order_key: list[_OrderKeyColumn] = [
+            _OrderKeyColumn(event_start_col, lambda row: row.event_start),
+            _OrderKeyColumn(event_end_col, lambda row: row.event_end),
+        ]
+
+        if grouped_workspace:
+            order_key.append(_OrderKeyColumn(event_workspace, lambda row: row.workspace))
+
+        if grouped_sku:
+            order_key.append(_OrderKeyColumn(item_sku, lambda row: row.item.sku))
+
+        if grouped_user:
+            order_key.append(_OrderKeyColumn(event_user, lambda row: row.user, nullable=True))
+
+        order_key.append(_OrderKeyColumn(event_uuid, lambda row: row.uuid))
+
+        all_billing_events = select(billingevent_src, credits_col.label("credits")).options(
+            selectinload(billingevent_src.item)  # pyright: ignore[reportArgumentType]
         )
 
-        # The aggregated branch has already folded credits in, so only the raw one joins.
+        # The join exists for the ordering and paging predicates, which compare BillingItem.sku.
+        # It does not populate `item`, so reading event.item.sku on the way out cost one query
+        # per row; selectinload above rather than contains_eager, which would reuse the join and
+        # then depend on a join that exists only for ordering. With SKU ungrouped there is no
+        # item_id to join on, and an inner join would discard every row.
+        if grouped_sku:
+            all_billing_events = all_billing_events.join(
+                BillingItem, col(BillingItem.uuid) == col(billingevent_src.item_id)
+            )
+
+        # The aggregated branch has already folded credits in, and already applied row_filters
+        # inside the sub-SELECT. Only the raw one does either out here.
         if time_aggregation is None:
             all_billing_events = all_billing_events.outerjoin(
                 charged, charged.c.billing_event_id == col(billingevent_src.uuid)
-            )
+            ).where(*row_filters)
 
-        # We need a complete and certain order so that the 'after' parameter works.
-        query = all_billing_events.order_by(
-            event_start,
-            event_end,
-            event_workspace,
-            item_sku,
-            event_uuid,
-        )
-
-        query = query.limit(limit)
-
-        if workspace is not None:
-            query = query.where(event_workspace == workspace)
-
-        if account is not None:
-            query = query.join(WorkspaceAccount, col(WorkspaceAccount.workspace) == event_workspace).where(
-                col(WorkspaceAccount.account) == account
-            )
+        query = all_billing_events.order_by(*(element.column for element in order_key)).limit(limit)
 
         if start is not None:
-            query = query.where(event_start >= start)
+            query = query.where(event_start_col >= start)
 
         if end is not None:
-            query = query.where(event_end < end)
+            query = query.where(event_end_col < end)
 
         if after is not None:
             # Equivalent to session.get(cls, after), but works when billingevent_src is an alias.
@@ -728,36 +859,11 @@ GROUP BY 2, 3, 4, 6
             if after_be is None:
                 raise AfterBillingEventNotFound(f"No records matching after={after} found")
 
-            # Everything strictly after `after_be` in the ordering above: a lexicographic
-            # comparison over (event_start, event_end, workspace, sku, uuid), spelled out
-            # because PostgreSQL cannot use the index for a row-value comparison here.
+            # Everything strictly after `after_be` in the ordering above, plus a redundant bound
+            # on the leading column that lets PostgreSQL use the index for it.
             query = query.where(
-                event_start >= after_be.event_start,
-                or_(
-                    event_start > after_be.event_start,
-                    and_(
-                        event_start == after_be.event_start,
-                        event_end > after_be.event_end,
-                    ),
-                    and_(
-                        event_start == after_be.event_start,
-                        event_end == after_be.event_end,
-                        event_workspace > after_be.workspace,
-                    ),
-                    and_(
-                        event_start == after_be.event_start,
-                        event_end == after_be.event_end,
-                        event_workspace == after_be.workspace,
-                        item_sku > after_be.item.sku,
-                    ),
-                    and_(
-                        event_start == after_be.event_start,
-                        event_end == after_be.event_end,
-                        event_workspace == after_be.workspace,
-                        item_sku == after_be.item.sku,
-                        event_uuid > after,
-                    ),
-                ),
+                event_start_col >= after_be.event_start,
+                _strictly_after(order_key, after_be),
             )
 
         return (UsageRow(row[0], Decimal(row.credits or 0)) for row in session.execute(query))
