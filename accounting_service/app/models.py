@@ -77,7 +77,10 @@ class UsageQuery(BaseModel):
         Field(
             default=None,
             title="Start timestamp (RFC8601 timestamp)",
-            description="Only billing events which ended after this time are included",
+            description=(
+                "Only billing events which ended after this time are included. With "
+                "'time-aggregation', the period this time falls in is included whole."
+            ),
             examples=["2025-02-12T13:34:22Z"],
         ),
     ]
@@ -86,7 +89,11 @@ class UsageQuery(BaseModel):
         Field(
             default=None,
             title="End timestamp (RFC8601 timestamp)",
-            description="Only billing events which started before this time are included",
+            description=(
+                "Only billing events which started before this time are included. With "
+                "'time-aggregation', every period starting before this time is included whole, "
+                "so an end on a period boundary does not include the period it starts."
+            ),
             examples=["2025-02-15T13:34:22Z"],
         ),
     ]

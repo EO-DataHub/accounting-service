@@ -46,7 +46,7 @@ from sqlmodel import Relationship, SQLModel, col
 from accounting_service.configuration import ConfiguredItem
 from accounting_service.consumption import ConsumptionWindow, RateSample, estimate_consumption
 from accounting_service.pricing import ConfiguredPolicy, PolicyFingerprint, PricedUsage, RateCard
-from accounting_service.timestamps import as_utc, datetime_default_to_utc
+from accounting_service.timestamps import as_naive_utc, as_utc, datetime_default_to_utc
 
 # The naming convention is set on SQLModel's own MetaData so that indexes, unique constraints,
 # check constraints, foreign keys and primary keys all get deterministic names. Alembic matches
@@ -693,8 +693,11 @@ class BillingEvent(SQLModel, table=True):
 
         `workspace`, `account`, `user` and `sku` select which events are counted, and apply
         before aggregation - they have to, because the column a filter tests may be NULL
-        afterwards. `start` and `end` apply after it, so they bound whole periods rather than
-        the events inside them. That asymmetry predates the filters and is left alone here.
+        afterwards. `start` and `end` apply after it, and return every row overlapping
+        `[start, end)`: an event if any of its duration falls in the range, and a period whole
+        if any of it does. So a range from mid-February to mid-May returns all of January to
+        June by quarter, and all of February to May by month. `end` is exclusive, so an `end`
+        on a period boundary does not bring in the period it starts.
 
         Credits come from the ledger through a per-event sub-SELECT rather than from a direct
         join. One event carries one debit and may carry several corrections, so joining the
@@ -802,11 +805,20 @@ class BillingEvent(SQLModel, table=True):
             # loses its FROM. Matching on the labels above is what makes the alias line up.
             billingevent_src = aliased(BillingEvent, aggregated, adapt_on_names=True)
             credits_col = aggregated.c.credits
+
+            # The period columns are UTC wall-clock time with no zone, so the bounds are made
+            # the same; see as_naive_utc. The first period included is the one `start` falls
+            # in, which is where `period_first` begins.
+            lower = None if start is None else as_naive_utc(start)
+            upper = None if end is None else as_naive_utc(end)
+            period_first = None if lower is None else func.date_trunc(period.value, lower)
         else:
             billingevent_src = cls
             # Negated and defaulted here rather than in the sub-SELECT, which stays as the
             # ledger stores it. NULL is an event with no ledger row at all.
             credits_col = -func.coalesce(charged.c.credits, 0)
+
+            lower, upper, period_first = start, end, None
 
         # Column handles for everything below, named once so the paging comparison reads as the
         # tuple comparison it is.
@@ -871,11 +883,17 @@ class BillingEvent(SQLModel, table=True):
 
         query = all_billing_events.order_by(*(element.column for element in order_key)).limit(limit)
 
-        if start is not None:
-            query = query.where(event_start_col >= start)
+        # Overlap with [start, end), for an event and a period alike.
+        if lower is not None:
+            query = query.where(event_end_col > lower)
 
-        if end is not None:
-            query = query.where(event_end_col < end)
+        if upper is not None:
+            query = query.where(event_start_col < upper)
+
+        # Redundant with the overlap test, and there for the index: the end of a period is only
+        # the second column of its aggregate index, and this bounds the first.
+        if period_first is not None:
+            query = query.where(event_start_col >= period_first)
 
         if after is not None:
             # Equivalent to session.get(cls, after), but works when billingevent_src is an alias.
