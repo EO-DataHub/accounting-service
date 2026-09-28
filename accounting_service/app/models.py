@@ -120,10 +120,12 @@ class UsageQuery(BaseModel):
             title="Time aggregation of results",
             description=(
                 "Optionally aggregate usage information into totals for the given time periods - "
-                "'day' or 'month'. Omit the parameter for no aggregation; any other value, "
-                "including an empty one, is rejected."
+                "'day', 'week', 'month' or 'quarter'. Periods are calendar ones in UTC: a week "
+                "starts on Monday, and a quarter on 1 January, April, July or October. Omit the "
+                "parameter for no aggregation; any other value, including an empty one, is "
+                "rejected."
             ),
-            examples=["day", "month"],
+            examples=["day", "week", "month", "quarter"],
         ),
     ]
     user: Annotated[

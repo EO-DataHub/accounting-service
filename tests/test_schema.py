@@ -13,7 +13,7 @@ from sqlalchemy.dialects import postgresql
 from sqlmodel import Field, SQLModel
 
 from accounting_service import models  # noqa: F401  (importing registers the tables)
-from accounting_service.models import aware_timestamp
+from accounting_service.models import TimeAggregation, aware_timestamp
 
 PG = postgresql.dialect()
 
@@ -137,14 +137,15 @@ def test_check_constraints_are_named() -> None:
     assert not unnamed, f"unnamed check constraints: {unnamed}"
 
 
-@pytest.mark.parametrize("expected", ["billingevent_day_aggregate_index", "billingevent_month_aggregate_index"])
-def test_the_hand_managed_expression_indexes_are_declared(expected: str) -> None:
-    """These two are excluded from autogenerate, so nothing else notices if they go.
+@pytest.mark.parametrize("period", list(TimeAggregation))
+def test_the_hand_managed_expression_indexes_are_declared(period: TimeAggregation) -> None:
+    """One per period, excluded from autogenerate, so nothing else notices if they go.
 
     `include_object` in alembic/env.py hides them from comparison *and* from rendering, so
     `alembic check` reports clean when they are missing. See the comment on
     UNCOMPARED_INDEXES there.
     """
+    expected = f"billingevent_{period.value}_aggregate_index"
     declared = {str(index.name) for index in SQLModel.metadata.tables["billing_event"].indexes if index.name}
 
     assert expected in declared, f"{expected} is not declared; declared indexes are {sorted(declared)}"

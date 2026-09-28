@@ -352,3 +352,47 @@ def test_consumption_estimation_reads_the_samples_and_hands_them_to_the_estimato
 
     ############# Behaviour check
     assert consumption == 9962.5
+
+
+# 2025-03-31 is a Monday and the last day of Q1, so these three events fall in two weeks and in
+# two quarters, split differently: the week boundary sits between the first and second, the
+# quarter boundary between the second and third.
+PERIOD_BOUNDARY_EVENTS = [
+    {"event_start": datetime(2025, 3, 30, 23, 0, 0, tzinfo=UTC), "quantity": 1},
+    {"event_start": datetime(2025, 3, 31, 0, 0, 0, tzinfo=UTC), "quantity": 2},
+    {"event_start": datetime(2025, 4, 1, 0, 0, 0, tzinfo=UTC), "quantity": 4},
+]
+
+
+@pytest.mark.parametrize(
+    ("period", "expected"),
+    [
+        pytest.param(
+            models.TimeAggregation.WEEK,
+            [
+                (datetime(2025, 3, 24, tzinfo=UTC), datetime(2025, 3, 31, tzinfo=UTC), 1),
+                (datetime(2025, 3, 31, tzinfo=UTC), datetime(2025, 4, 7, tzinfo=UTC), 6),
+            ],
+            id="week",
+        ),
+        pytest.param(
+            models.TimeAggregation.QUARTER,
+            [
+                (datetime(2025, 1, 1, tzinfo=UTC), datetime(2025, 4, 1, tzinfo=UTC), 3),
+                (datetime(2025, 4, 1, tzinfo=UTC), datetime(2025, 7, 1, tzinfo=UTC), 4),
+            ],
+            id="quarter",
+        ),
+    ],
+)
+def test_weeks_start_on_monday_and_quarters_are_calendar_quarters(
+    db_session: Session, period: models.TimeAggregation, expected: list[tuple[datetime, datetime, float]]
+) -> None:
+    gen_billingitem_data(db_session, PERIOD_BOUNDARY_EVENTS)
+    db_session.flush()
+
+    rows = models.BillingEvent.find_billing_events(db_session, time_aggregation=period)
+
+    assert [
+        (row.event.event_start_utc, row.event.event_end_utc, float(row.event.quantity)) for row in rows
+    ] == expected

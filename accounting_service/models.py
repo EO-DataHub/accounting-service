@@ -470,7 +470,45 @@ class TimeAggregation(StrEnum):
     """Periods that usage data can be totalled over."""
 
     DAY = "day"
+    WEEK = "week"
     MONTH = "month"
+    QUARTER = "quarter"
+
+    @property
+    def interval(self) -> str:
+        """The length of one period, as PostgreSQL interval input.
+
+        Each period is a calendar one in UTC, starting where `date_trunc` puts it: a week at
+        Monday 00:00, a quarter on 1 January, April, July or October. PostgreSQL has no
+        quarter unit for intervals, which is why this is spelled out rather than derived from
+        the value.
+        """
+        match self:
+            case TimeAggregation.DAY:
+                return "1 day"
+            case TimeAggregation.WEEK:
+                return "1 week"
+            case TimeAggregation.MONTH:
+                return "1 month"
+            case TimeAggregation.QUARTER:
+                return "3 months"
+
+
+def _aggregate_index(period: TimeAggregation) -> Index:
+    """The index that lets `find_billing_events` total over `period` in index order.
+
+    Its expressions must be the ones that query groups by, so both are built from the same
+    `TimeAggregation` rather than written out twice.
+    """
+    period_start = f"date_trunc('{period.value}', event_start AT TIME ZONE 'UTC')"
+
+    return Index(
+        f"billingevent_{period.value}_aggregate_index",
+        text(period_start),
+        text(f"({period_start} + '{period.interval}'::interval)"),
+        "workspace",
+        "item_id",
+    )
 
 
 class UsageDimension(StrEnum):
@@ -615,25 +653,12 @@ class BillingEvent(SQLModel, table=True):
             "event_start",
         ),
         CheckConstraint("event_start <= event_end", name="start_before_end"),
-        # The next two are listed in UNCOMPARED_INDEXES in alembic/env.py, because PostgreSQL
-        # normalises the expressions and Alembic then reports them as changed forever. That
-        # exclusion also stops autogenerate emitting them, so they are written by hand in the
-        # baseline migration: change one here and you must change the migration too, because
-        # `alembic check` reports clean when they are missing.
-        Index(
-            "billingevent_month_aggregate_index",
-            text("date_trunc('month', event_start AT TIME ZONE 'UTC')"),
-            text("(date_trunc('month', event_start AT TIME ZONE 'UTC') + '1 month'::interval)"),
-            "workspace",
-            "item_id",
-        ),
-        Index(
-            "billingevent_day_aggregate_index",
-            text("date_trunc('day', event_start AT TIME ZONE 'UTC')"),
-            text("(date_trunc('day', event_start AT TIME ZONE 'UTC') + '1 day'::interval)"),
-            "workspace",
-            "item_id",
-        ),
+        # One per TimeAggregation. These are listed in UNCOMPARED_INDEXES in alembic/env.py,
+        # because PostgreSQL normalises the expressions and Alembic then reports them as
+        # changed forever. That exclusion also stops autogenerate emitting them, so they are
+        # written by hand in the migrations: add a period, or change one here, and you must
+        # write the revision too, because `alembic check` reports clean when they are missing.
+        *(_aggregate_index(period) for period in TimeAggregation),
     )
 
     @classmethod
@@ -723,17 +748,17 @@ class BillingEvent(SQLModel, table=True):
         if time_aggregation is not None:
             # Coerced rather than trusted: the value reaches SQL as a literal below, so the
             # closed set has to be enforced at runtime and not only in the type hints.
-            period = TimeAggregation(time_aggregation).value
+            period = TimeAggregation(time_aggregation)
 
             # PostgreSQL's timezone(zone, timestamptz) is what `AT TIME ZONE` compiles to, so
-            # the month and day aggregate indexes on this table still match these expressions
-            # and the GROUP BY still reads in index order with no sort.
+            # the aggregate indexes from `_aggregate_index` still match these expressions and
+            # the GROUP BY still reads in index order with no sort.
             #
             # `pg_indexes` prints the two spellings differently, which makes it look as though
             # they diverge. They do not: the planner ignores that difference, and EXPLAIN gives
             # the same GroupAggregate at the same cost either way. Compare plans, not text.
-            period_start = func.date_trunc(period, func.timezone("UTC", col(cls.event_start)))
-            period_end = period_start + literal_column(f"'1 {period}'::interval")
+            period_start = func.date_trunc(period.value, func.timezone("UTC", col(cls.event_start)))
+            period_end = period_start + literal_column(f"'{period.interval}'::interval")
 
             # A dimension that is grouped reports its own column; one that is not reports NULL,
             # cast so that the subquery's type matches the table column it stands in for.
