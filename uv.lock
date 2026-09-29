@@ -62,7 +62,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "debugpy", specifier = ">=1.8.21" },
+    { name = "debugpy", specifier = "==1.8.21" },
     { name = "faker" },
     { name = "httpx2" },
     { name = "pre-commit" },
