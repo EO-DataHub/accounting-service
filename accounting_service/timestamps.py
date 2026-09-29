@@ -16,6 +16,16 @@ def as_utc(dt: datetime) -> datetime:
     return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).astimezone(UTC)
 
 
+def as_naive_utc(dt: datetime) -> datetime:
+    """Return `dt` as UTC wall-clock time with no offset, treating a naive value as UTC.
+
+    For comparing against a TIMESTAMP WITHOUT TIME ZONE column that holds UTC. Compared aware,
+    PostgreSQL converts the column using the session's TimeZone, which is not necessarily UTC.
+    """
+
+    return as_utc(dt).replace(tzinfo=None)
+
+
 def datetime_default_to_utc(dt: datetime | None) -> datetime | None:
     """Label a naive datetime as UTC without moving it. Passes None and aware values through.
 

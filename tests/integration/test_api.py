@@ -194,6 +194,30 @@ def test_page_after_unknown_event_produces_404(db_session: Session, client: Test
                 ],
             ],
         ),
+        # 2025-01-01 is a Wednesday, so its week starts in the previous year.
+        pytest.param(
+            "week",
+            100,
+            [
+                [
+                    {"event_start": "2024-12-30T00:00:00Z", "item": "sku1", "quantity": 1.31},
+                    {"event_start": "2024-12-30T00:00:00Z", "item": "sku2", "quantity": 0.2},
+                    {"event_start": "2025-01-27T00:00:00Z", "item": "sku1", "quantity": 0.4},
+                ],
+                [],
+            ],
+        ),
+        pytest.param(
+            "quarter",
+            100,
+            [
+                [
+                    {"event_start": "2025-01-01T00:00:00Z", "item": "sku1", "quantity": 1.71},
+                    {"event_start": "2025-01-01T00:00:00Z", "item": "sku2", "quantity": 0.2},
+                ],
+                [],
+            ],
+        ),
         pytest.param(
             "month",
             100,
@@ -302,7 +326,8 @@ def test_workspace_usage_data_correctly_time_aggregated(
         for i in range(len(response_json)):
             print(f"{response_json[i]=}, {expected_json[i]=}")
             assert response_json[i]["item"] == expected_json[i]["item"]
-            assert response_json[i]["quantity"] == expected_json[i]["quantity"]
+            # Approximate: quantity is a float, and SUM adds in no fixed order.
+            assert response_json[i]["quantity"] == pytest.approx(expected_json[i]["quantity"])
             assert response_json[i]["event_start"] == expected_json[i]["event_start"]
 
 

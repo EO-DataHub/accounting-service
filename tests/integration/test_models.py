@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from eodhp_utils.pulsar import messages
 from faker import Faker
+from sqlalchemy import text
 from sqlalchemy.orm.session import Session
 
 from accounting_service import models
@@ -352,3 +353,147 @@ def test_consumption_estimation_reads_the_samples_and_hands_them_to_the_estimato
 
     ############# Behaviour check
     assert consumption == 9962.5
+
+
+# 2025-03-31 is a Monday and the last day of Q1, so these three events fall in two weeks and in
+# two quarters, split differently: the week boundary sits between the first and second, the
+# quarter boundary between the second and third.
+PERIOD_BOUNDARY_EVENTS = [
+    {"event_start": datetime(2025, 3, 30, 23, 0, 0, tzinfo=UTC), "quantity": 1},
+    {"event_start": datetime(2025, 3, 31, 0, 0, 0, tzinfo=UTC), "quantity": 2},
+    {"event_start": datetime(2025, 4, 1, 0, 0, 0, tzinfo=UTC), "quantity": 4},
+]
+
+
+@pytest.mark.parametrize(
+    ("period", "expected"),
+    [
+        pytest.param(
+            models.TimeAggregation.WEEK,
+            [
+                (datetime(2025, 3, 24, tzinfo=UTC), datetime(2025, 3, 31, tzinfo=UTC), 1),
+                (datetime(2025, 3, 31, tzinfo=UTC), datetime(2025, 4, 7, tzinfo=UTC), 6),
+            ],
+            id="week",
+        ),
+        pytest.param(
+            models.TimeAggregation.QUARTER,
+            [
+                (datetime(2025, 1, 1, tzinfo=UTC), datetime(2025, 4, 1, tzinfo=UTC), 3),
+                (datetime(2025, 4, 1, tzinfo=UTC), datetime(2025, 7, 1, tzinfo=UTC), 4),
+            ],
+            id="quarter",
+        ),
+    ],
+)
+def test_weeks_start_on_monday_and_quarters_are_calendar_quarters(
+    db_session: Session, period: models.TimeAggregation, expected: list[tuple[datetime, datetime, float]]
+) -> None:
+    gen_billingitem_data(db_session, PERIOD_BOUNDARY_EVENTS)
+    db_session.flush()
+
+    rows = models.BillingEvent.find_billing_events(db_session, time_aggregation=period)
+
+    assert [
+        (row.event.event_start_utc, row.event.event_end_utc, float(row.event.quantity)) for row in rows
+    ] == expected
+
+
+# One event on the 10th of each month from December 2025 to July 2026, so that every month and
+# quarter a range could touch has something in it, and so do those either side.
+MONTHLY_EVENTS = [
+    {"event_start": datetime(year, month, 10, tzinfo=UTC), "quantity": 1}
+    for year, month in [(2025, 12), *((2026, month) for month in range(1, 8))]
+]
+
+
+def period_starts(
+    db_session: Session, period: models.TimeAggregation, start: datetime | None, end: datetime | None
+) -> list[tuple[datetime, float]]:
+    rows = models.BillingEvent.find_billing_events(db_session, time_aggregation=period, start=start, end=end)
+
+    return [(row.event.event_start_utc, float(row.event.quantity)) for row in rows]
+
+
+@pytest.mark.parametrize(
+    ("period", "expected"),
+    [
+        pytest.param(
+            models.TimeAggregation.MONTH,
+            [(datetime(2026, month, 1, tzinfo=UTC), 1) for month in range(2, 6)],
+            id="month",
+        ),
+        pytest.param(
+            models.TimeAggregation.QUARTER,
+            [(datetime(2026, 1, 1, tzinfo=UTC), 3), (datetime(2026, 4, 1, tzinfo=UTC), 3)],
+            id="quarter",
+        ),
+    ],
+)
+def test_a_range_includes_every_period_it_overlaps_whole(
+    db_session: Session, period: models.TimeAggregation, expected: list[tuple[datetime, float]]
+) -> None:
+    gen_billingitem_data(db_session, MONTHLY_EVENTS)
+    db_session.flush()
+
+    assert (
+        period_starts(db_session, period, datetime(2026, 2, 14, tzinfo=UTC), datetime(2026, 5, 23, tzinfo=UTC))
+        == expected
+    )
+
+
+def test_a_range_ending_on_a_period_boundary_excludes_the_period_it_starts(db_session: Session) -> None:
+    gen_billingitem_data(db_session, MONTHLY_EVENTS)
+    db_session.flush()
+
+    assert period_starts(db_session, models.TimeAggregation.QUARTER, None, datetime(2026, 4, 1, tzinfo=UTC)) == [
+        (datetime(2025, 10, 1, tzinfo=UTC), 1),
+        (datetime(2026, 1, 1, tzinfo=UTC), 3),
+    ]
+
+
+def test_a_range_starting_on_a_period_boundary_excludes_the_period_before(db_session: Session) -> None:
+    gen_billingitem_data(db_session, MONTHLY_EVENTS)
+    db_session.flush()
+
+    assert period_starts(db_session, models.TimeAggregation.QUARTER, datetime(2026, 4, 1, tzinfo=UTC), None) == [
+        (datetime(2026, 4, 1, tzinfo=UTC), 3),
+        (datetime(2026, 7, 1, tzinfo=UTC), 1),
+    ]
+
+
+def test_period_bounds_do_not_depend_on_the_session_time_zone(db_session: Session) -> None:
+    """The period columns carry no zone. Compared against an aware bound, PostgreSQL would read
+    them in the session's TimeZone, and in New York January would end at 05:00 UTC on
+    1 February and so overlap a range starting at midnight.
+    """
+    gen_billingitem_data(db_session, MONTHLY_EVENTS)
+    db_session.flush()
+    # LOCAL, so that it ends with the test's transaction.
+    db_session.execute(text("SET LOCAL TIME ZONE 'America/New_York'"))
+
+    assert period_starts(
+        db_session, models.TimeAggregation.MONTH, datetime(2026, 2, 1, tzinfo=UTC), datetime(2026, 3, 1, tzinfo=UTC)
+    ) == [(datetime(2026, 2, 1, tzinfo=UTC), 1)]
+
+
+def test_an_event_is_included_if_any_of_it_falls_in_the_range(db_session: Session) -> None:
+    def at(hour: int) -> datetime:
+        return datetime(2026, 1, 1, hour, tzinfo=UTC)
+
+    event_uuids, _account_uuids, _item_uuids = gen_billingitem_data(
+        db_session,
+        [
+            {"event_start": at(5), "event_end": at(7)},  # ends exactly at start
+            {"event_start": at(6), "event_end": at(8)},  # straddles start
+            {"event_start": at(8), "event_end": at(9)},  # inside
+            {"event_start": at(9), "event_end": at(11)},  # straddles end
+            {"event_start": at(9), "event_end": at(10)},  # ends exactly at end
+            {"event_start": at(10), "event_end": at(11)},  # starts exactly at end
+        ],
+    )
+    db_session.flush()
+
+    rows = models.BillingEvent.find_billing_events(db_session, start=at(7), end=at(10))
+
+    assert {row.event.uuid for row in rows} == set(event_uuids[1:5])

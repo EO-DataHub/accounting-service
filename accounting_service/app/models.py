@@ -77,7 +77,10 @@ class UsageQuery(BaseModel):
         Field(
             default=None,
             title="Start timestamp (RFC8601 timestamp)",
-            description="Only billing events which ended after this time are included",
+            description=(
+                "Only billing events which ended after this time are included. With "
+                "'time-aggregation', the period this time falls in is included whole."
+            ),
             examples=["2025-02-12T13:34:22Z"],
         ),
     ]
@@ -86,7 +89,11 @@ class UsageQuery(BaseModel):
         Field(
             default=None,
             title="End timestamp (RFC8601 timestamp)",
-            description="Only billing events which started before this time are included",
+            description=(
+                "Only billing events which started before this time are included. With "
+                "'time-aggregation', every period starting before this time is included whole, "
+                "so an end on a period boundary does not include the period it starts."
+            ),
             examples=["2025-02-15T13:34:22Z"],
         ),
     ]
@@ -120,10 +127,12 @@ class UsageQuery(BaseModel):
             title="Time aggregation of results",
             description=(
                 "Optionally aggregate usage information into totals for the given time periods - "
-                "'day' or 'month'. Omit the parameter for no aggregation; any other value, "
-                "including an empty one, is rejected."
+                "'day', 'week', 'month' or 'quarter'. Periods are calendar ones in UTC: a week "
+                "starts on Monday, and a quarter on 1 January, April, July or October. Omit the "
+                "parameter for no aggregation; any other value, including an empty one, is "
+                "rejected."
             ),
-            examples=["day", "month"],
+            examples=["day", "week", "month", "quarter"],
         ),
     ]
     user: Annotated[

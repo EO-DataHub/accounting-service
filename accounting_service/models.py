@@ -46,7 +46,7 @@ from sqlmodel import Relationship, SQLModel, col
 from accounting_service.configuration import ConfiguredItem
 from accounting_service.consumption import ConsumptionWindow, RateSample, estimate_consumption
 from accounting_service.pricing import ConfiguredPolicy, PolicyFingerprint, PricedUsage, RateCard
-from accounting_service.timestamps import as_utc, datetime_default_to_utc
+from accounting_service.timestamps import as_naive_utc, as_utc, datetime_default_to_utc
 
 # The naming convention is set on SQLModel's own MetaData so that indexes, unique constraints,
 # check constraints, foreign keys and primary keys all get deterministic names. Alembic matches
@@ -470,7 +470,45 @@ class TimeAggregation(StrEnum):
     """Periods that usage data can be totalled over."""
 
     DAY = "day"
+    WEEK = "week"
     MONTH = "month"
+    QUARTER = "quarter"
+
+    @property
+    def interval(self) -> str:
+        """The length of one period, as PostgreSQL interval input.
+
+        Each period is a calendar one in UTC, starting where `date_trunc` puts it: a week at
+        Monday 00:00, a quarter on 1 January, April, July or October. PostgreSQL has no
+        quarter unit for intervals, which is why this is spelled out rather than derived from
+        the value.
+        """
+        match self:
+            case TimeAggregation.DAY:
+                return "1 day"
+            case TimeAggregation.WEEK:
+                return "1 week"
+            case TimeAggregation.MONTH:
+                return "1 month"
+            case TimeAggregation.QUARTER:
+                return "3 months"
+
+
+def _aggregate_index(period: TimeAggregation) -> Index:
+    """The index that lets `find_billing_events` total over `period` in index order.
+
+    Its expressions must be the ones that query groups by, so both are built from the same
+    `TimeAggregation` rather than written out twice.
+    """
+    period_start = f"date_trunc('{period.value}', event_start AT TIME ZONE 'UTC')"
+
+    return Index(
+        f"billingevent_{period.value}_aggregate_index",
+        text(period_start),
+        text(f"({period_start} + '{period.interval}'::interval)"),
+        "workspace",
+        "item_id",
+    )
 
 
 class UsageDimension(StrEnum):
@@ -615,25 +653,12 @@ class BillingEvent(SQLModel, table=True):
             "event_start",
         ),
         CheckConstraint("event_start <= event_end", name="start_before_end"),
-        # The next two are listed in UNCOMPARED_INDEXES in alembic/env.py, because PostgreSQL
-        # normalises the expressions and Alembic then reports them as changed forever. That
-        # exclusion also stops autogenerate emitting them, so they are written by hand in the
-        # baseline migration: change one here and you must change the migration too, because
-        # `alembic check` reports clean when they are missing.
-        Index(
-            "billingevent_month_aggregate_index",
-            text("date_trunc('month', event_start AT TIME ZONE 'UTC')"),
-            text("(date_trunc('month', event_start AT TIME ZONE 'UTC') + '1 month'::interval)"),
-            "workspace",
-            "item_id",
-        ),
-        Index(
-            "billingevent_day_aggregate_index",
-            text("date_trunc('day', event_start AT TIME ZONE 'UTC')"),
-            text("(date_trunc('day', event_start AT TIME ZONE 'UTC') + '1 day'::interval)"),
-            "workspace",
-            "item_id",
-        ),
+        # One per TimeAggregation. These are listed in UNCOMPARED_INDEXES in alembic/env.py,
+        # because PostgreSQL normalises the expressions and Alembic then reports them as
+        # changed forever. That exclusion also stops autogenerate emitting them, so they are
+        # written by hand in the migrations: add a period, or change one here, and you must
+        # write the revision too, because `alembic check` reports clean when they are missing.
+        *(_aggregate_index(period) for period in TimeAggregation),
     )
 
     @classmethod
@@ -668,8 +693,11 @@ class BillingEvent(SQLModel, table=True):
 
         `workspace`, `account`, `user` and `sku` select which events are counted, and apply
         before aggregation - they have to, because the column a filter tests may be NULL
-        afterwards. `start` and `end` apply after it, so they bound whole periods rather than
-        the events inside them. That asymmetry predates the filters and is left alone here.
+        afterwards. `start` and `end` apply after it, and return every row overlapping
+        `[start, end)`: an event if any of its duration falls in the range, and a period whole
+        if any of it does. So a range from mid-February to mid-May returns all of January to
+        June by quarter, and all of February to May by month. `end` is exclusive, so an `end`
+        on a period boundary does not bring in the period it starts.
 
         Credits come from the ledger through a per-event sub-SELECT rather than from a direct
         join. One event carries one debit and may carry several corrections, so joining the
@@ -723,17 +751,17 @@ class BillingEvent(SQLModel, table=True):
         if time_aggregation is not None:
             # Coerced rather than trusted: the value reaches SQL as a literal below, so the
             # closed set has to be enforced at runtime and not only in the type hints.
-            period = TimeAggregation(time_aggregation).value
+            period = TimeAggregation(time_aggregation)
 
             # PostgreSQL's timezone(zone, timestamptz) is what `AT TIME ZONE` compiles to, so
-            # the month and day aggregate indexes on this table still match these expressions
-            # and the GROUP BY still reads in index order with no sort.
+            # the aggregate indexes from `_aggregate_index` still match these expressions and
+            # the GROUP BY still reads in index order with no sort.
             #
             # `pg_indexes` prints the two spellings differently, which makes it look as though
             # they diverge. They do not: the planner ignores that difference, and EXPLAIN gives
             # the same GroupAggregate at the same cost either way. Compare plans, not text.
-            period_start = func.date_trunc(period, func.timezone("UTC", col(cls.event_start)))
-            period_end = period_start + literal_column(f"'1 {period}'::interval")
+            period_start = func.date_trunc(period.value, func.timezone("UTC", col(cls.event_start)))
+            period_end = period_start + literal_column(f"'{period.interval}'::interval")
 
             # A dimension that is grouped reports its own column; one that is not reports NULL,
             # cast so that the subquery's type matches the table column it stands in for.
@@ -777,11 +805,20 @@ class BillingEvent(SQLModel, table=True):
             # loses its FROM. Matching on the labels above is what makes the alias line up.
             billingevent_src = aliased(BillingEvent, aggregated, adapt_on_names=True)
             credits_col = aggregated.c.credits
+
+            # The period columns are UTC wall-clock time with no zone, so the bounds are made
+            # the same; see as_naive_utc. The first period included is the one `start` falls
+            # in, which is where `period_first` begins.
+            lower = None if start is None else as_naive_utc(start)
+            upper = None if end is None else as_naive_utc(end)
+            period_first = None if lower is None else func.date_trunc(period.value, lower)
         else:
             billingevent_src = cls
             # Negated and defaulted here rather than in the sub-SELECT, which stays as the
             # ledger stores it. NULL is an event with no ledger row at all.
             credits_col = -func.coalesce(charged.c.credits, 0)
+
+            lower, upper, period_first = start, end, None
 
         # Column handles for everything below, named once so the paging comparison reads as the
         # tuple comparison it is.
@@ -846,11 +883,17 @@ class BillingEvent(SQLModel, table=True):
 
         query = all_billing_events.order_by(*(element.column for element in order_key)).limit(limit)
 
-        if start is not None:
-            query = query.where(event_start_col >= start)
+        # Overlap with [start, end), for an event and a period alike.
+        if lower is not None:
+            query = query.where(event_end_col > lower)
 
-        if end is not None:
-            query = query.where(event_end_col < end)
+        if upper is not None:
+            query = query.where(event_start_col < upper)
+
+        # Redundant with the overlap test, and there for the index: the end of a period is only
+        # the second column of its aggregate index, and this bounds the first.
+        if period_first is not None:
+            query = query.where(event_start_col >= period_first)
 
         if after is not None:
             # Equivalent to session.get(cls, after), but works when billingevent_src is an alias.
