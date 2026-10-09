@@ -26,6 +26,7 @@ from sqlalchemy import (
     Uuid,
     and_,
     cast,
+    except_,
     false,
     func,
     literal_column,
@@ -122,6 +123,26 @@ class WorkspaceAccount(SQLModel, table=True):
 
         assert isinstance(result, CursorResult)  # Makes mypy happy
         return result.rowcount > 0
+
+    @classmethod
+    def known_workspaces(cls, session: Session, *, unmapped: bool = False) -> list[str]:
+        """Every workspace this service has heard of, sorted.
+
+        A workspace becomes known by sending usage or by having its `workspace-settings` message
+        recorded, and either can happen without the other. This table holds only the second, so
+        on its own it is not the list.
+
+        With `unmapped`, only the workspaces that have sent usage but have no account here, and
+        whose usage therefore cannot be tied to an account.
+        """
+        usage = [
+            select(col(BillingEvent.workspace)),
+            select(col(BillableResourceConsumptionRateSample.workspace)),
+        ]
+        mapped = select(col(cls.workspace))
+        known = except_(union(*usage), mapped) if unmapped else union(*usage, mapped)
+
+        return sorted(session.execute(known).scalars())
 
 
 class WorkspaceCategory(SQLModel, table=True):

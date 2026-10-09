@@ -149,6 +149,23 @@ GET /workspaces/my-workspace/accounting/ledger/{transaction}
 
 The ledger lists every movement as recorded, including reversals. The usage endpoints below net a reversal against the charge it corrects and show neither.
 
+### List workspaces
+
+```commandline
+uv run billing-admin workspaces
+uv run billing-admin workspaces --unmapped
+```
+
+The first lists every workspace that has sent usage or has an account mapping, one name per line and nothing else, so it can drive a loop:
+
+```commandline
+for workspace in $(uv run billing-admin workspaces); do
+    uv run billing-admin ledger "$workspace"
+done
+```
+
+The second lists only workspaces with usage but no account mapping. Their usage is recorded and priced but cannot be tied to an account. Errors go to stderr, so a failure cannot be read as a list of workspace names.
+
 ### Grant credits
 
 ```commandline

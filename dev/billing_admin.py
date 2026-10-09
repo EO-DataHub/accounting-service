@@ -20,6 +20,7 @@ from accounting_service.pricing import RateCard, UnratedSKUError, price_usage
 from accounting_service.timestamps import as_utc
 
 console = Console(stderr=False)
+error_console = Console(stderr=True)
 
 
 def handle_errors(fn: Callable) -> Callable:
@@ -27,6 +28,9 @@ def handle_errors(fn: Callable) -> Callable:
 
     Raise ValueError for a business-rule violation (bad input, SKU not found) and it prints in
     red and exits non-zero, as does an unexpected SQLAlchemyError, rather than a traceback.
+
+    The message goes to stderr. `workspaces` output is fed to shell loops, and an error on
+    stdout would be split into words and treated as workspace names by whatever the loop runs.
     """
 
     @wraps(fn)
@@ -34,7 +38,7 @@ def handle_errors(fn: Callable) -> Callable:
         try:
             fn(*args, **kwargs)
         except (ValueError, SQLAlchemyError) as e:
-            console.print(f"[red]{e}[/red]")
+            error_console.print(f"[red]{e}[/red]")
             raise SystemExit(1) from None
 
     return wrapper
@@ -45,7 +49,7 @@ def handle_errors(fn: Callable) -> Callable:
 @click.rich_config(help_config=click.RichHelpConfiguration(text_markup="markdown", width=79))
 def cli(ctx: click.Context) -> None:
     """
-    Inspect billing items and credit rates, grant credits, and read the ledger.
+    Inspect billing items and credit rates, list workspaces, grant credits, and read the ledger.
 
     Rates are not set here. A pricing policy covers every rate at once (D3) and is minted by
     loading the configuration document, which is reviewed and versioned.
@@ -282,6 +286,27 @@ def set_category(session: Session, workspace: str, category: str, by: str | None
             f"under the default category {policy.default_category}. Configured: "
             f"{', '.join(sorted(configured))}[/yellow]"
         )
+
+
+# noinspection unresolved-references
+@cli.command("workspaces")
+@click.pass_obj
+@click.option("--unmapped", is_flag=True, help="Only workspaces with usage but no account mapping")
+@handle_errors
+def list_workspaces(session: Session, unmapped: bool) -> None:
+    """
+    Lists every workspace this service has heard of, one name per line.
+
+    A workspace is listed if it has sent usage or its account mapping has been recorded. The
+    output is bare names with no header or formatting, so it can drive a shell loop, eg.
+    `for workspace in $(uv run billing-admin workspaces); do ...; done`.
+
+    `--unmapped` lists only workspaces whose usage cannot be tied to an account, because no
+    `workspace-settings` message for them has been recorded.
+    """
+    for workspace in models.WorkspaceAccount.known_workspaces(session, unmapped=unmapped):
+        # click.echo rather than Rich, which would wrap long names and read [brackets] as markup.
+        click.echo(workspace)
 
 
 # noinspection unresolved-references

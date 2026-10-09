@@ -1,7 +1,8 @@
-"""Tests for the admin CLI's update-item and recharge commands.
+"""Tests for the admin CLI's update-item, recharge and workspaces commands.
 
 `update-item` because it is the command the strict configuration document forced a change on,
-and `recharge` because it writes to the ledger. `add-item` sends a complete entry and is not
+`recharge` because it writes to the ledger, and `workspaces` because shell scripts parse its
+output. `add-item` sends a complete entry and is not
 covered here, and never was. `set-price` is gone: a rate belongs to a policy covering every
 SKU at once, so there is no single price to set.
 
@@ -14,6 +15,7 @@ import io
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from uuid import uuid4
 
 import click
 import pytest
@@ -23,10 +25,12 @@ from sqlmodel import col
 
 from accounting_service import db
 from accounting_service.models import (
+    BillableResourceConsumptionRateSample,
     BillingEvent,
     BillingItem,
     CreditLedgerTransaction,
     TransactionType,
+    WorkspaceAccount,
 )
 from dev import billing_admin
 
@@ -106,6 +110,18 @@ def test_update_item_needs_at_least_one_field(run_command: Callable[..., None], 
 def test_update_item_rejects_an_unknown_sku(run_command: Callable[..., None]) -> None:
     with pytest.raises(SystemExit):
         run_command(billing_admin.update_item, sku="never-configured", name="n", unit=None)
+
+
+def test_an_error_goes_to_stderr_and_leaves_stdout_empty(
+    run_command: Callable[..., None], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Output is fed to shell loops, which would read an error on stdout as workspace names."""
+    with pytest.raises(SystemExit):
+        run_command(billing_admin.update_item, sku="never-configured", name="n", unit=None)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "never-configured" in captured.err
 
 
 RECHARGE_WORKSPACE = "recharge-test-workspace"
@@ -299,3 +315,60 @@ class TestRecharge:
         recharge(batch=2, commit=True)
 
         assert [len(debits_for(db_session, event)) for event in events] == [1] * 7
+
+
+class TestWorkspaces:
+    """Listing every workspace the service has heard of, from usage as well as from mappings."""
+
+    @pytest.fixture
+    def known(self, db_session: Session, stored_item: BillingItem) -> None:
+        """One workspace heard of each way, and one heard of twice.
+
+        `event-only` and `sample-only` have usage and no mapping, `mapped-only` has a mapping
+        and no usage, and `both` has an event and a mapping.
+        """
+        when = datetime(2025, 6, 1, tzinfo=UTC)
+
+        for workspace in ("event-only", "both"):
+            db_session.add(
+                BillingEvent(  # pyright: ignore[reportCallIssue]
+                    event_start=when,
+                    event_end=when + timedelta(hours=1),
+                    item_id=stored_item.uuid,
+                    workspace=workspace,
+                    quantity=1.0,
+                )
+            )
+
+        db_session.add(
+            BillableResourceConsumptionRateSample(  # pyright: ignore[reportCallIssue]
+                sample_time=when, item_id=stored_item.uuid, workspace="sample-only", rate=1.0
+            )
+        )
+
+        for workspace in ("mapped-only", "both"):
+            WorkspaceAccount.record_mapping(db_session, uuid4(), workspace)
+
+        db_session.flush()
+
+    def listed(self, run_command: Callable[..., None], capsys: pytest.CaptureFixture[str], **arguments: object) -> str:
+        run_command(billing_admin.list_workspaces, **arguments)
+        return capsys.readouterr().out
+
+    @pytest.mark.usefixtures("known")
+    def test_every_source_is_listed_once_one_name_per_line(
+        self, run_command: Callable[..., None], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert self.listed(run_command, capsys, unmapped=False) == "both\nevent-only\nmapped-only\nsample-only\n"
+
+    @pytest.mark.usefixtures("known")
+    def test_unmapped_lists_only_usage_with_no_account(
+        self, run_command: Callable[..., None], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert self.listed(run_command, capsys, unmapped=True) == "event-only\nsample-only\n"
+
+    def test_nothing_known_prints_nothing(
+        self, run_command: Callable[..., None], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No header and no "none found" line, so a loop over the output runs zero times."""
+        assert self.listed(run_command, capsys, unmapped=False) == ""
