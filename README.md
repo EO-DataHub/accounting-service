@@ -154,6 +154,7 @@ The ledger lists every movement as recorded, including reversals. The usage endp
 ```commandline
 uv run billing-admin workspaces
 uv run billing-admin workspaces --unmapped
+uv run billing-admin workspaces --ungranted
 ```
 
 The first lists every workspace that has sent usage or has an account mapping, one name per line and nothing else, so it can drive a loop:
@@ -165,6 +166,16 @@ done
 ```
 
 The second lists only workspaces with usage but no account mapping. Their usage is recorded and priced but cannot be tied to an account. Errors go to stderr, so a failure cannot be read as a list of workspace names.
+
+The third leaves out every workspace that has ever had a grant, including a grant that was later reversed. The service has no creation date for a workspace, so this is how to find new workspaces that have no credits. Check the list, then grant to each one:
+
+```commandline
+for workspace in $(uv run billing-admin workspaces --ungranted); do
+    uv run billing-admin grant --workspace "$workspace" --amount 1000 --reason "Welcome"
+done
+```
+
+A workspace drops off the list once it has a grant. If the loop fails partway, run it again and it grants only to the workspaces it missed. `--ungranted` and `--unmapped` can be used together.
 
 ### Grant credits
 
