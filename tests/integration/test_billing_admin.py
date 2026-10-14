@@ -326,6 +326,8 @@ class TestWorkspaces:
 
         `event-only` and `sample-only` have usage and no mapping, `mapped-only` has a mapping
         and no usage, and `both` has an event and a mapping.
+
+        `mapped-only` has a grant, and `event-only` has a grant that was reversed.
         """
         when = datetime(2025, 6, 1, tzinfo=UTC)
 
@@ -349,6 +351,23 @@ class TestWorkspaces:
         for workspace in ("mapped-only", "both"):
             WorkspaceAccount.record_mapping(db_session, uuid4(), workspace)
 
+        CreditLedgerTransaction.record_grant(db_session, workspace="mapped-only", credits=Decimal(100), reason="r")
+
+        clawed_back = CreditLedgerTransaction.record_grant(
+            db_session, workspace="event-only", credits=Decimal(100), reason="r"
+        )
+        db_session.flush()
+        db_session.add(
+            CreditLedgerTransaction(  # pyright: ignore[reportCallIssue]
+                workspace="event-only",
+                transaction_type=TransactionType.REVERSAL,
+                credits=-clawed_back.credits,
+                reverses_id=clawed_back.uuid,
+                reason="r",
+                occurred_at=when,
+            )
+        )
+
         db_session.flush()
 
     def listed(self, run_command: Callable[..., None], capsys: pytest.CaptureFixture[str], **arguments: object) -> str:
@@ -359,16 +378,48 @@ class TestWorkspaces:
     def test_every_source_is_listed_once_one_name_per_line(
         self, run_command: Callable[..., None], capsys: pytest.CaptureFixture[str]
     ) -> None:
-        assert self.listed(run_command, capsys, unmapped=False) == "both\nevent-only\nmapped-only\nsample-only\n"
+        assert (
+            self.listed(run_command, capsys, unmapped=False, ungranted=False)
+            == "both\nevent-only\nmapped-only\nsample-only\n"
+        )
 
     @pytest.mark.usefixtures("known")
     def test_unmapped_lists_only_usage_with_no_account(
         self, run_command: Callable[..., None], capsys: pytest.CaptureFixture[str]
     ) -> None:
-        assert self.listed(run_command, capsys, unmapped=True) == "event-only\nsample-only\n"
+        assert self.listed(run_command, capsys, unmapped=True, ungranted=False) == "event-only\nsample-only\n"
 
     def test_nothing_known_prints_nothing(
         self, run_command: Callable[..., None], capsys: pytest.CaptureFixture[str]
     ) -> None:
         """No header and no "none found" line, so a loop over the output runs zero times."""
-        assert self.listed(run_command, capsys, unmapped=False) == ""
+        assert self.listed(run_command, capsys, unmapped=False, ungranted=False) == ""
+
+    @pytest.mark.usefixtures("known")
+    def test_ungranted_leaves_out_every_workspace_with_a_grant_even_a_reversed_one(
+        self, run_command: Callable[..., None], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A reversal is a deliberate clawback, and granting again would undo it."""
+        assert self.listed(run_command, capsys, unmapped=False, ungranted=True) == "both\nsample-only\n"
+
+    @pytest.mark.usefixtures("known")
+    def test_ungranted_and_unmapped_combine(
+        self, run_command: Callable[..., None], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert self.listed(run_command, capsys, unmapped=True, ungranted=True) == "sample-only\n"
+
+    def test_a_debit_does_not_count_as_a_grant(
+        self,
+        db_session: Session,
+        run_command: Callable[..., None],
+        recharge: Callable[..., None],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A new workspace may already have been charged for usage, and still needs its grant."""
+        a_policy_rating(db_session, "ungranted-sku", "0.5")
+        event = an_event(db_session, "ungranted-sku", when=datetime(2025, 6, 1, tzinfo=UTC))
+        recharge(commit=True)
+        capsys.readouterr()
+        assert len(debits_for(db_session, event)) == 1
+
+        assert self.listed(run_command, capsys, unmapped=False, ungranted=True) == f"{RECHARGE_WORKSPACE}\n"

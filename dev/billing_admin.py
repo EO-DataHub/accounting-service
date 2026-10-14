@@ -292,8 +292,9 @@ def set_category(session: Session, workspace: str, category: str, by: str | None
 @cli.command("workspaces")
 @click.pass_obj
 @click.option("--unmapped", is_flag=True, help="Only workspaces with usage but no account mapping")
+@click.option("--ungranted", is_flag=True, help="Leave out workspaces that have ever had a grant")
 @handle_errors
-def list_workspaces(session: Session, unmapped: bool) -> None:
+def list_workspaces(session: Session, unmapped: bool, ungranted: bool) -> None:
     """
     Lists every workspace this service has heard of, one name per line.
 
@@ -303,8 +304,14 @@ def list_workspaces(session: Session, unmapped: bool) -> None:
 
     `--unmapped` lists only workspaces whose usage cannot be tied to an account, because no
     `workspace-settings` message for them has been recorded.
+
+    `--ungranted` leaves out every workspace with a grant in the ledger, even one later
+    reversed. Use it to find new workspaces and pass the list to `grant`. A workspace drops off
+    the list once it has a grant, so if the loop fails partway, running it again grants only
+    to the workspaces it missed. The two flags combine.
     """
-    for workspace in models.WorkspaceAccount.known_workspaces(session, unmapped=unmapped):
+    workspaces = models.WorkspaceAccount.known_workspaces(session, unmapped=unmapped, ungranted=ungranted)
+    for workspace in workspaces:
         # click.echo rather than Rich, which would wrap long names and read [brackets] as markup.
         click.echo(workspace)
 
