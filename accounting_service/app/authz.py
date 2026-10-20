@@ -94,6 +94,14 @@ def workspace_authz(workspace: str, token_payload: dict[str, Any], min_tier: Min
     return workspace
 
 
+def hub_admin_authz(token_payload: dict[str, Any]) -> dict[str, Any]:
+    """For reads that span every workspace, so that no workspace tier can grant them."""
+    if not is_hub_admin(token_payload):
+        raise HTTPException(status_code=401, detail="Must be a hub admin")
+
+    return token_payload
+
+
 def account_authz(account_id: UUID, token_payload: dict[str, Any]) -> UUID:
     if is_hub_admin(token_payload):
         return account_id

@@ -751,6 +751,7 @@ EVERY_ROUTE = {
     "GET /workspaces/{workspace}/accounting/ledger",
     "GET /workspaces/{workspace}/accounting/ledger/{transaction}",
     "GET /accounts/{account_id}/accounting/usage-data",
+    "GET /accounting/usage-data",
     "GET /accounting/skus",
     "GET /accounting/skus/{sku}",
     "GET /accounting/prices",

@@ -18,6 +18,7 @@ from fastapi import HTTPException
 from accounting_service.app.authz import (
     MinTier,
     account_authz,
+    hub_admin_authz,
     is_hub_admin,
     resolve_workspace_tier,
     workspace_authz,
@@ -153,6 +154,18 @@ class TestWorkspaceAuthz:
             workspace_authz("workspace1", TOKEN_MEMBER, MinTier.OWNER)
 
         assert stranger.value.detail != outranked.value.detail
+
+
+class TestHubAdminAuthz:
+    def test_a_hub_admin_is_allowed(self) -> None:
+        assert hub_admin_authz(TOKEN_HUB_ADMIN) is TOKEN_HUB_ADMIN
+
+    @pytest.mark.parametrize("token", [TOKEN_OWNER, TOKEN_ADMIN, TOKEN_MEMBER, TOKEN_NO_REALM_ACCESS])
+    def test_no_workspace_tier_is_enough(self, token: dict[str, Any]) -> None:
+        with pytest.raises(HTTPException) as raised:
+            hub_admin_authz(token)
+
+        assert raised.value.status_code == 401
 
 
 class TestAccountAuthz:

@@ -1,4 +1,4 @@
-"""Filtering and grouping on the two usage-data endpoints (T12).
+"""Filtering and grouping on the usage-data endpoints (T12), and the estate-wide one (T25).
 
 Here rather than in tests/ because the questions are ones only PostgreSQL answers: what a
 GROUP BY collapses, what a filter removes before it collapses, and whether paging still
@@ -10,7 +10,8 @@ credits is asserted in test_credit_ledger.py where the policy fixtures live.
 """
 
 import uuid
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -18,6 +19,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 from accounting_service import models
+from tests.conftest import TOKEN_MEMBER, TOKEN_OWNER
 from tests.integration.test_models import gen_billingitem_data
 
 DAY = datetime(2024, 3, 5, tzinfo=UTC)
@@ -204,6 +206,51 @@ class TestGroupingDimensions:
         rows = get(client, "?time-aggregation=day&group-by=user,sku,workspace")
 
         assert sorted(row["quantity"] for row in rows) == [1.0, 2.0, 4.0]
+
+
+class TestUsageAcrossEveryWorkspace:
+    """The hub-admin overview (T25): the same read with nothing selecting the workspaces."""
+
+    def test_a_series_per_workspace(self, client: TestClient, db_session: Session) -> None:
+        """No workspace here shares an account, so only the estate-wide read sees both."""
+        gen_billingitem_data(
+            db_session,
+            [
+                {"workspace": "ws1", "event_start": DAY, "sku": "sku1", "quantity": 1.0},
+                {"workspace": "ws1", "event_start": DAY + timedelta(days=1), "sku": "sku2", "quantity": 2.0},
+                {"workspace": "ws2", "event_start": DAY, "sku": "sku1", "quantity": 4.0},
+            ],
+        )
+        db_session.commit()
+
+        response = client.get("/accounting/usage-data?time-aggregation=day&group-by=workspace")
+
+        assert response.status_code == 200, response.text
+        assert sorted((row["workspace"], row["event_start"], row["quantity"]) for row in response.json()) == [
+            ("ws1", "2024-03-05T00:00:00Z", 1.0),
+            ("ws1", "2024-03-06T00:00:00Z", 2.0),
+            ("ws2", "2024-03-05T00:00:00Z", 4.0),
+        ]
+
+    def test_the_filters_apply_as_they_do_per_workspace(self, client: TestClient, usage: list[uuid.UUID]) -> None:
+        response = client.get(f"/accounting/usage-data?time-aggregation=day&group-by=workspace&user={USER_A}")
+
+        assert response.status_code == 200, response.text
+        assert sorted((row["workspace"], row["quantity"]) for row in response.json()) == [("ws1", 3.0), ("ws2", 8.0)]
+
+    @pytest.mark.parametrize("token", [TOKEN_OWNER, TOKEN_MEMBER])
+    def test_no_workspace_tier_reaches_it(
+        self,
+        client: TestClient,
+        authenticate_as: Callable[[dict[str, Any]], None],
+        token: dict[str, Any],
+    ) -> None:
+        authenticate_as(token)
+
+        response = client.get("/accounting/usage-data")
+
+        assert response.status_code == 401
+        assert response.json() == {"detail": "Must be a hub admin"}
 
 
 class TestGroupingIsRejectedWhereItMeansNothing:
