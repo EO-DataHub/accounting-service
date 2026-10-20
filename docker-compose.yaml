@@ -60,7 +60,7 @@ services:
     #   docker compose up                        -> db, migrate, api
     #   docker compose --profile messaging up    -> everything
     profiles: ["messaging"]
-    image: apachepulsar/pulsar:4.2.5@sha256:34954c978ecf26808243091495660c8feda6d40241a3ff77aa17bc49f93041a1
+    image: apachepulsar/pulsar:5.0.0@sha256:7222f3199a0b2418abde9ce0906862598415b19b494ae185db189938cfc43fd3
     command: bin/pulsar standalone
     volumes:
       - pulsardata:/pulsar/data
