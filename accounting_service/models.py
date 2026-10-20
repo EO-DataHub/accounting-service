@@ -125,7 +125,7 @@ class WorkspaceAccount(SQLModel, table=True):
         return result.rowcount > 0
 
     @classmethod
-    def known_workspaces(cls, session: Session, *, unmapped: bool = False) -> list[str]:
+    def known_workspaces(cls, session: Session, *, unmapped: bool = False, ungranted: bool = False) -> list[str]:
         """Every workspace this service has heard of, sorted.
 
         A workspace becomes known by sending usage or by having its `workspace-settings` message
@@ -134,6 +134,10 @@ class WorkspaceAccount(SQLModel, table=True):
 
         With `unmapped`, only the workspaces that have sent usage but have no account here, and
         whose usage therefore cannot be tied to an account.
+
+        With `ungranted`, leave out every workspace that has ever had a grant. This service has
+        no creation date for a workspace, so "never granted" is how a new one is found. A
+        reversed grant still counts, so a deliberate clawback is not undone by granting again.
         """
         usage = [
             select(col(BillingEvent.workspace)),
@@ -141,6 +145,12 @@ class WorkspaceAccount(SQLModel, table=True):
         ]
         mapped = select(col(cls.workspace))
         known = except_(union(*usage), mapped) if unmapped else union(*usage, mapped)
+
+        if ungranted:
+            granted = select(col(CreditLedgerTransaction.workspace)).where(
+                col(CreditLedgerTransaction.transaction_type) == TransactionType.GRANT
+            )
+            known = except_(known.subquery().select(), granted)
 
         return sorted(session.execute(known).scalars())
 
