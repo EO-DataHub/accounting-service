@@ -122,7 +122,7 @@ GET /accounting/pricing-policy
 
 `prices` is one row per SKU. `pricing-policy` is the whole rate card as one version - every rate, every category multiplier and the default category. Version history is not served; `billing-admin ls my-sku` is the way to read it.
 
-Both need a token, as every endpoint here does. Neither looks at its claims: the rates in force are the same for every caller, but they are not public.
+Both need a token, as every endpoint here does apart from `/accounting/health`. Neither looks at its claims: the rates in force are the same for every caller, but they are not public.
 
 ## Credits and the ledger
 

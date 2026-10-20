@@ -35,6 +35,8 @@ balance.
   recent transactions and its balance. All three are privileged writes with no HTTP endpoint
   yet, reachable by anyone who can reach the database - the same footing as the rest of that
   tool.
+- **New: `GET /accounting/health`.** Unauthenticated liveness check for probes; touches
+  nothing.
 
 ### Earlier in this release
 

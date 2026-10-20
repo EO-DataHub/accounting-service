@@ -742,7 +742,7 @@ class TestReadingThePolicyAtAnInstant:
         assert response.json()["version"] == 2
 
 
-# Every route this service serves, as of the decision that nothing is anonymously readable.
+# Every route this service serves that needs a token.
 # Listed rather than discovered so that adding an endpoint means adding a line here, and a
 # route that reaches production without authorisation cannot do so quietly.
 EVERY_ROUTE = {
@@ -757,6 +757,9 @@ EVERY_ROUTE = {
     "GET /accounting/pricing-policy",
 }
 
+# Answer without a token; each carries no data.
+PUBLIC_ROUTES = {"GET /accounting/health"}
+
 
 def _fill(path: str) -> str:
     """A concrete URL for a route template.
@@ -769,8 +772,8 @@ def _fill(path: str) -> str:
     return re.sub(r"\{(\w+)\}", lambda match: named.get(match.group(1), str(uuid.uuid4())), path)
 
 
-def test_no_endpoint_is_readable_without_a_token(db_session: Session, client: TestClient) -> None:
-    """Nothing this service serves is anonymously readable.
+def test_only_public_routes_answer_without_a_token(db_session: Session, client: TestClient) -> None:
+    """Nothing this service serves is anonymously readable except the data-free public routes.
 
     The rates and the SKU list were open until the rule was settled; they are not now. The
     workspace and account endpoints reach `decode_jwt_token` through their own authorisation
@@ -788,13 +791,19 @@ def test_no_endpoint_is_readable_without_a_token(db_session: Session, client: Te
         for method in (route.methods or set()) - {"HEAD", "OPTIONS"}
     }
 
-    assert served == EVERY_ROUTE
+    assert served == EVERY_ROUTE | PUBLIC_ROUTES
 
     for route in sorted(EVERY_ROUTE):
         method, path = route.split(" ", 1)
         response = client.request(method, _fill(path))
 
         assert response.status_code == 401, f"{route} answered {response.status_code} without a token"
+
+    for route in sorted(PUBLIC_ROUTES):
+        method, path = route.split(" ", 1)
+        response = client.request(method, path)
+
+        assert response.status_code == 200, f"{route} answered {response.status_code} without a token"
 
 
 def test_usage_data_query_count_does_not_grow_with_the_page(

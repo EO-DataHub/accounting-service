@@ -14,6 +14,7 @@ from fastapi import (
     Path,
     Query,
     Request,
+    Response,
 )
 from fastapi.responses import JSONResponse
 
@@ -64,7 +65,7 @@ SessionDep = Annotated[Session, Depends(get_session)]
 
 app = FastAPI(root_path=root_path)
 
-FastAPIInstrumentor.instrument_app(app)
+FastAPIInstrumentor.instrument_app(app, excluded_urls="/accounting/health$")
 
 
 @app.exception_handler(PagingCursorNotFound)
@@ -75,6 +76,13 @@ def handle_paging_cursor_not_found(_request: Request, exc: PagingCursorNotFound)
     """
 
     return JSONResponse(status_code=HTTPStatus.NOT_FOUND, content={"detail": str(exc)})
+
+
+@app.get("/accounting/health", include_in_schema=False)
+async def get_health(response: Response) -> dict[str, str]:
+    """Liveness for kubelet probes and the uptime check. Public, so it reads nothing and says nothing."""
+    response.headers["Cache-Control"] = "no-store"
+    return {"status": "ok"}
 
 
 @app.get(

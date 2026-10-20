@@ -29,9 +29,9 @@ def require_token(token_payload: TokenDep) -> dict[str, Any]:
     """Assert a token was presented, without asking anything of its claims.
 
     For data that is the same for every caller but is not public. Every endpoint this service
-    serves now needs a token: the ones with a workspace or an account in the path reach
-    `decode_jwt_token` through their own authorisation dependency, and the rest carry this.
-    Nothing here is anonymously readable, which is the whole of the rule.
+    serves needs a token except `/accounting/health`, which carries no data: the ones with a
+    workspace or an account in the path reach `decode_jwt_token` through their own
+    authorisation dependency, and the rest carry this.
     """
     return token_payload
 
