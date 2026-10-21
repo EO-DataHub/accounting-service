@@ -68,9 +68,14 @@ GROUPING_SCHEMA: dict[str, JsonValue] = {
 
 
 class UsageQuery(BaseModel):
-    """The query parameters shared by both usage-data endpoints."""
+    """The query parameters shared by the three usage-data endpoints.
 
-    model_config = ConfigDict(populate_by_name=True)
+    An unknown parameter is a 422. Ignoring one returns an unfiltered answer, so a request
+    that misspells a filter, or names one the endpoint does not have, such as `workspace` on
+    `/accounting/usage-data`, is wrong without showing it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     start: Annotated[
         datetime | None,
@@ -232,9 +237,12 @@ class LedgerQuery(BaseModel):
     Deliberately not UsageQuery. They share three parameters by coincidence rather than by
     contract: a ledger row is a movement of credits and has no period to aggregate over, and
     `type` has no counterpart in a usage read.
+
+    An unknown parameter is a 422, as on UsageQuery: a misspelled `?typ=grant` would
+    otherwise return every kind of movement.
     """
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     transaction_type: Annotated[
         TransactionType | None,

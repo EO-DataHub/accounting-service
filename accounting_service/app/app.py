@@ -259,10 +259,12 @@ def get_usage_data(
 ) -> list[BillingEventAPIResult]:
     """Returns resource consumption data for every workspace, for hub admins (T25).
 
-    The same query as the workspace and account reads with nothing selecting the workspaces,
-    so the same parameters drill down from here to one workspace.
+    The same query as the workspace and account reads with nothing selecting the workspaces.
     `?time-aggregation=day&group-by=workspace` gives one series per workspace: summing a
     series ranks the workspaces, and charting them shows where usage spikes.
+
+    There is no workspace filter here. To drill down to one workspace, send the same
+    parameters to `/workspaces/{workspace}/accounting/usage-data`.
     """
 
     usage: Iterator[UsageRow] = BillingEvent.find_billing_events(
