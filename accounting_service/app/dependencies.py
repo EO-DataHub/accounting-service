@@ -5,7 +5,14 @@ from uuid import UUID
 
 from fastapi import Depends, HTTPException, Query, Response
 
-from accounting_service.app.authz import MinTier, account_authz, decode_jwt_token, is_hub_admin, workspace_authz
+from accounting_service.app.authz import (
+    MinTier,
+    account_authz,
+    decode_jwt_token,
+    hub_admin_authz,
+    is_hub_admin,
+    workspace_authz,
+)
 from accounting_service.settings import get_settings
 from accounting_service.timestamps import datetime_default_to_utc
 
@@ -23,6 +30,10 @@ def require_workspace(min_tier: MinTier = MinTier.MEMBER) -> Callable[..., str]:
 
 def require_account(account_id: UUID, token_payload: TokenDep) -> UUID:
     return account_authz(account_id, token_payload)
+
+
+def require_hub_admin(token_payload: TokenDep) -> dict[str, Any]:
+    return hub_admin_authz(token_payload)
 
 
 def require_token(token_payload: TokenDep) -> dict[str, Any]:

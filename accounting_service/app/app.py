@@ -26,6 +26,7 @@ from accounting_service.app.dependencies import (
     global_data_cache,
     pricing_instant,
     require_account,
+    require_hub_admin,
     require_token,
     require_workspace,
     usage_data_cache,
@@ -234,6 +235,40 @@ def get_account_usage_data(
     usage: Iterator[UsageRow] = BillingEvent.find_billing_events(
         session,
         account=account_id,
+        start=query.start,
+        end=query.end,
+        limit=query.limit,
+        after=query.after,
+        time_aggregation=query.time_aggregation,
+        user=query.user,
+        sku=query.sku,
+        group_by=query.group_by,
+    )
+
+    return [BillingEventAPIResult.model_validate(row) for row in usage]
+
+
+@app.get(
+    "/accounting/usage-data",
+    summary="Get resource consumption data across every workspace",
+    dependencies=[Depends(require_hub_admin), Depends(usage_data_cache)],
+)
+def get_usage_data(
+    session: SessionDep,
+    query: Annotated[UsageQuery, Query()],
+) -> list[BillingEventAPIResult]:
+    """Returns resource consumption data for every workspace, for hub admins (T25).
+
+    The same query as the workspace and account reads with nothing selecting the workspaces.
+    `?time-aggregation=day&group-by=workspace` gives one series per workspace: summing a
+    series ranks the workspaces, and charting them shows where usage spikes.
+
+    There is no workspace filter here. To drill down to one workspace, send the same
+    parameters to `/workspaces/{workspace}/accounting/usage-data`.
+    """
+
+    usage: Iterator[UsageRow] = BillingEvent.find_billing_events(
+        session,
         start=query.start,
         end=query.end,
         limit=query.limit,

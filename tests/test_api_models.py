@@ -26,6 +26,7 @@ from accounting_service.app.models import (
     BillingEventAPIResult,
     BillingItemAPIResult,
     BillingItemRateAPIResult,
+    LedgerQuery,
     PricingPolicyAPIResult,
     UsageQuery,
 )
@@ -398,11 +399,44 @@ class TestUsageQueryGrouping:
         assert UsageQuery.model_validate({"time-aggregation": "day"}).group_by is None
 
 
+class TestUsageQueryUnknownParameters:
+    """FastAPI ignores a query parameter it does not know, so an unknown filter returns the
+    unfiltered answer. Forbidding extras turns that into a 422.
+    """
+
+    @pytest.mark.parametrize("unknown", ["workspace", "group_by_", "users"])
+    def test_an_unknown_parameter_is_rejected(self, unknown: str) -> None:
+        """`workspace` is the case that prompted this: `/accounting/usage-data` has no
+        workspace filter, and ignoring it returned every workspace.
+        """
+        with pytest.raises(ValueError, match=unknown):
+            UsageQuery.model_validate({unknown: "x"})
+
+    def test_a_field_name_is_not_unknown(self) -> None:
+        """`populate_by_name` admits the field name beside the alias, so forbidding extras
+        must not reject it.
+        """
+        assert UsageQuery.model_validate({"time_aggregation": "day"}).time_aggregation is not None
+
+
+class TestLedgerQueryUnknownParameters:
+    """The same rule as on the usage reads, for the same reason."""
+
+    @pytest.mark.parametrize("unknown", ["typ", "types", "workspace"])
+    def test_an_unknown_parameter_is_rejected(self, unknown: str) -> None:
+        """A misspelled `type` would otherwise return every kind of movement."""
+        with pytest.raises(ValueError, match=unknown):
+            LedgerQuery.model_validate({unknown: "grant"})
+
+    def test_a_field_name_is_not_unknown(self) -> None:
+        assert LedgerQuery.model_validate({"transaction_type": "grant"}).transaction_type is not None
+
+
 def published_group_by_schema() -> dict[str, Any]:
     """The `group-by` parameter as /openapi.json publishes it.
 
     No database: building the spec reads the routes and the models, nothing else. The
-    parameter is the same on both usage-data endpoints, so the first one found will do.
+    parameter is the same on every usage-data endpoint, so the first one found will do.
     """
 
     for path in app.openapi()["paths"].values():
