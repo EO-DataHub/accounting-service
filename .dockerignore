@@ -31,6 +31,9 @@ htmlcov
 
 # Development tools and docs
 Makefile
+# The API with token verification off (T24). Compose mounts dev/, so local runs still
+# have it; no released image should.
+dev/local_api.py
 .pre-commit-config.yaml
 CHANGELOG.md
 

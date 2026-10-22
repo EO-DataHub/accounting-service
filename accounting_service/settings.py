@@ -1,6 +1,7 @@
 import os
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 from sqlalchemy import URL
 
@@ -25,19 +26,34 @@ class Settings(BaseSettings):
 
     # The platform domain, e.g. https://test.eodatahub.org.uk - the same value injected
     # elsewhere in the platform as platform.domain (see eodhp-argocd-deployment). Used to
-    # build the Keycloak JWKS endpoint for JWT signature verification. Required outside
-    # tests, which override the decode_jwt_token dependency rather than exercising this.
+    # build the realm's issuer URL and JWKS endpoint for JWT verification. The API refuses
+    # to start without it; dev/local_api.py, which does not verify tokens, does not (T24).
     KEYCLOAK_BASE_URL: str | None = None
     KEYCLOAK_REALM: str = "eodhp"
 
     model_config = {"env_file": env_file}
 
+    @field_validator("KEYCLOAK_BASE_URL", mode="before")
+    @classmethod
+    def _normalise_base_url(cls, value: object) -> object:
+        """The issuer is compared with the token's `iss` exactly, so a trailing slash would
+        refuse every token, and an empty value (`KEYCLOAK_BASE_URL=` in an env file) would
+        pass the startup check and fail every request. Both are caught here instead.
+        """
+        if isinstance(value, str):
+            return value.strip().rstrip("/") or None
+
+        return value
+
     @property
-    def keycloak_certs_url(self) -> str | None:
+    def keycloak_issuer(self) -> str | None:
+        """The `iss` the realm's tokens carry. Keycloak's hostname is pinned to the platform
+        domain, so this does not vary with the URL a token was requested through.
+        """
         if self.KEYCLOAK_BASE_URL is None:
             return None
 
-        return f"{self.KEYCLOAK_BASE_URL}/keycloak/realms/{self.KEYCLOAK_REALM}/protocol/openid-connect/certs"
+        return f"{self.KEYCLOAK_BASE_URL}/keycloak/realms/{self.KEYCLOAK_REALM}"
 
 
 @lru_cache

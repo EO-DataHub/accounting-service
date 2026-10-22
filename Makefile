@@ -86,7 +86,13 @@ krestart:
 	kubectl rollout restart deployment.apps/accounting-api -n accounting
 	kubectl rollout restart deployment.apps/accounting-ingester -n accounting
 
+# Token verification is off: mint a token with `uv run python -m dev.local_token`.
 .PHONY: run
 run:
+	${uv-run} uvicorn dev.local_api:app --reload
+
+# Verifies tokens against the realm at KEYCLOAK_BASE_URL, which must be set.
+.PHONY: run-verified
+run-verified:
 	${uv-run} uvicorn accounting_service.app.app:app --reload
 

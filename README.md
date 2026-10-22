@@ -44,6 +44,21 @@ For instance, to use `.testing.env` execute:
 APP_ENV=testing uv run ...
 ```
 
+### Tokens
+
+Every endpoint needs a bearer token. The deployed API verifies it against the Keycloak realm at `KEYCLOAK_BASE_URL`, and it does not start when that setting is unset.
+
+`make run` and `docker compose up` run `dev/local_api.py` instead. It takes the claims from the token without checking them, so you can call the API as anyone. Mint a token with `dev/local_token.py`:
+
+```commandline
+export TOKEN=$(uv run python -m dev.local_token --hub-admin)
+uv run python -m dev.local_token --member workspace1 --owner workspace2
+```
+
+`--hub-admin` passes every check. Use `--member`, `--admin` and `--owner` (each repeatable) and `--billing-account` to test the narrower tiers. These tokens are unsigned, so the real API refuses them.
+
+To verify tokens locally, set `KEYCLOAK_BASE_URL` to a deployed platform (for example `https://test.eodatahub.org.uk`), run `make run-verified`, and use a real token from that platform.
+
 ## Database migrations
 
 This service manages its schema with [Alembic](https://alembic.sqlalchemy.org/). Migrations live in `alembic/versions/`.
@@ -232,10 +247,10 @@ Environment variables take priority over `.env`, so this overrides whatever that
    uv run billing-admin ledger my-workspace
    ```
 
-4. Ask why the charge was what it was. Take the transaction ID from the table above. The endpoint needs a token; `http-client.env.json` holds an unsigned one for a hub admin, which passes every tier check.
+4. Ask why the charge was what it was. Take the transaction ID from the table above. The endpoint needs a token. A hub admin passes every tier check (see [Tokens](#tokens)).
 
    ```commandline
-   export TOKEN=$(python3 -c "import json;print(json.load(open('http-client.env.json'))['dev']['jwt'])")
+   export TOKEN=$(uv run python -m dev.local_token --hub-admin)
    curl -H "Authorization: Bearer $TOKEN" \
      localhost:8000/workspaces/my-workspace/accounting/ledger/$TRANSACTION
    ```
