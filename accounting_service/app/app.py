@@ -1,6 +1,7 @@
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from http import HTTPStatus
 from typing import Annotated
@@ -21,7 +22,7 @@ from fastapi.responses import JSONResponse
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from sqlalchemy.orm import Session
 
-from accounting_service.app.authz import MinTier
+from accounting_service.app.authz import MinTier, verifier
 from accounting_service.app.dependencies import (
     global_data_cache,
     pricing_instant,
@@ -63,7 +64,20 @@ root_path = os.environ.get("ROOT_PATH", "/api/")
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
-app = FastAPI(root_path=root_path)
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Build the token verifier now, so the API refuses to start without the settings it
+    needs rather than failing every request (T24).
+
+    dev/local_api.py replaces this lifespan, because it does not verify tokens. Anything
+    else added here must be added there too.
+    """
+    verifier()
+
+    yield
+
+
+app = FastAPI(root_path=root_path, lifespan=lifespan)
 
 FastAPIInstrumentor.instrument_app(app)
 
