@@ -22,6 +22,7 @@ from accounting_service.models import (
     TimeAggregation,
     TransactionType,
     UsageDimension,
+    WorkspaceSummary,
 )
 from accounting_service.pricing import price_usage
 from accounting_service.timestamps import as_utc, datetime_default_to_utc
@@ -305,6 +306,16 @@ class LedgerQuery(BaseModel):
         return datetime_default_to_utc(value)
 
 
+class NoQuery(BaseModel):
+    """For an endpoint that takes no parameters, so that sending one is a 422.
+
+    As on UsageQuery: `/accounting/workspaces?balance-below=10` would otherwise return the
+    whole list and look like a filter that matched everything.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
 # No shared base with BillingEvent: the response exposes `item` as a SKU string where the
 # table has a relationship, and `credits` is not on the table at all.
 #
@@ -533,6 +544,73 @@ class CreditBalanceAPIResult(BaseModel):
             examples=["2026-09-09T13:34:22Z"],
         ),
     ]
+
+
+class WorkspaceSummaryAPIResult(BaseModel):
+    """One workspace in the hub-admin list: who it is billed to, what it is priced under, what
+    it holds, and when it last used anything (T23).
+
+    Every workspace this service knows of is listed, including one that has never used
+    anything, which reports a balance of whatever it was granted and a null `last_usage`.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    workspace: Annotated[str, Field(description="The workspace", examples=["my-workspace"])]
+    account: Annotated[
+        UUID | None,
+        Field(
+            description="The billing account that owns the workspace. Null if it has not been recorded here",
+            examples=["4b48ebea-bdb8-4bb9-bce9-a7853ad3965d"],
+        ),
+    ]
+    category: Annotated[
+        str | None,
+        Field(
+            description=(
+                "The pricing category the workspace is charged under. Where none is assigned, "
+                "the default category of the policy in force, with 'category_assigned' false. "
+                "Null only if no category is assigned and no pricing policy is loaded."
+            ),
+            examples=["standard"],
+        ),
+    ]
+    category_assigned: Annotated[
+        bool,
+        Field(description="False when 'category' is the policy's default rather than an assignment"),
+    ]
+    balance: Annotated[
+        ExactDecimal,
+        Field(
+            description=(
+                "Credits available, as an exact decimal string. Negative if the workspace has "
+                "spent more than it holds."
+            ),
+            examples=["989.2"],
+        ),
+    ]
+    as_of: Annotated[
+        UtcTimestamp,
+        Field(description="When the balance was computed, the same for every row", examples=["2026-09-09T13:34:22Z"]),
+    ]
+    last_usage: Annotated[
+        UtcTimestamp | None,
+        Field(
+            description="The end of the latest usage recorded. Null if the workspace has never used anything",
+            examples=["2026-09-09T12:00:00Z"],
+        ),
+    ]
+    total_granted: Annotated[
+        ExactDecimal,
+        Field(
+            description="Every credit ever granted to the workspace, less any grant reversed, as an exact decimal string",
+            examples=["1000"],
+        ),
+    ]
+
+    @classmethod
+    def of(cls, summary: WorkspaceSummary, as_of: datetime) -> "WorkspaceSummaryAPIResult":
+        return cls(**summary._asdict(), as_of=as_of)
 
 
 class PricingExplanation(BaseModel):

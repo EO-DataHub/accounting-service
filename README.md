@@ -149,6 +149,14 @@ GET /workspaces/my-workspace/accounting/ledger/{transaction}
 
 The ledger lists every movement as recorded, including reversals. The usage endpoints below net a reversal against the charge it corrects and show neither.
 
+A hub admin can read every workspace at once:
+
+```commandline
+GET /accounting/workspaces
+```
+
+One row per workspace, sorted by name: its balance, billing account, pricing category, the end of its latest usage, and the credits granted to it less any grant reversed. A workspace with no category assigned reports the default category of the policy in force, with `category_assigned` false. The list is whole and takes no parameters; filtering by balance is left to the caller.
+
 ### List workspaces
 
 ```commandline
@@ -157,7 +165,7 @@ uv run billing-admin workspaces --unmapped
 uv run billing-admin workspaces --ungranted
 ```
 
-The first lists every workspace that has sent usage or has an account mapping, one name per line and nothing else, so it can drive a loop:
+The first lists every workspace that has sent usage, has an account mapping, has been granted credits or has been assigned a category, one name per line and nothing else, so it can drive a loop:
 
 ```commandline
 for workspace in $(uv run billing-admin workspaces); do

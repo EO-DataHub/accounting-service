@@ -17,6 +17,7 @@ from sqlalchemy import (
     TIMESTAMP,
     CheckConstraint,
     ColumnElement,
+    CompoundSelect,
     CursorResult,
     Index,
     MetaData,
@@ -128,9 +129,11 @@ class WorkspaceAccount(SQLModel, table=True):
     def known_workspaces(cls, session: Session, *, unmapped: bool = False, ungranted: bool = False) -> list[str]:
         """Every workspace this service has heard of, sorted.
 
-        A workspace becomes known by sending usage or by having its `workspace-settings` message
-        recorded, and either can happen without the other. This table holds only the second, so
-        on its own it is not the list.
+        A workspace becomes known by sending usage, by having its `workspace-settings` message
+        recorded, or by an admin granting it credits or assigning it a category, and any of
+        these can happen without the others. This table holds only the second, so on its own it
+        is not the list. A workspace granted credits before it has used anything is the case
+        the last two cover.
 
         With `unmapped`, only the workspaces that have sent usage but have no account here, and
         whose usage therefore cannot be tied to an account.
@@ -139,12 +142,26 @@ class WorkspaceAccount(SQLModel, table=True):
         no creation date for a workspace, so "never granted" is how a new one is found. A
         reversed grant still counts, so a deliberate clawback is not undone by granting again.
         """
+        return sorted(session.execute(cls.known_workspaces_query(unmapped=unmapped, ungranted=ungranted)).scalars())
+
+    @classmethod
+    def known_workspaces_query(cls, *, unmapped: bool = False, ungranted: bool = False) -> CompoundSelect:
+        """`known_workspaces` as a statement, one `workspace` column, for a query to build on."""
         usage = [
             select(col(BillingEvent.workspace)),
             select(col(BillableResourceConsumptionRateSample.workspace)),
         ]
         mapped = select(col(cls.workspace))
-        known = except_(union(*usage), mapped) if unmapped else union(*usage, mapped)
+
+        if unmapped:
+            known = except_(union(*usage), mapped)
+        else:
+            known = union(
+                *usage,
+                mapped,
+                select(col(CreditLedgerTransaction.workspace)),
+                select(col(WorkspaceCategory.workspace)),
+            )
 
         if ungranted:
             granted = select(col(CreditLedgerTransaction.workspace)).where(
@@ -152,7 +169,7 @@ class WorkspaceAccount(SQLModel, table=True):
             )
             known = except_(known.subquery().select(), granted)
 
-        return sorted(session.execute(known).scalars())
+        return known
 
 
 class WorkspaceCategory(SQLModel, table=True):
@@ -1657,3 +1674,112 @@ class CreditBalanceSnapshot(SQLModel, table=True):
             .scalars()
             .first()
         )
+
+
+class WorkspaceSummary(NamedTuple):
+    """One workspace as the hub-admin list reports it (T23).
+
+    `category` is what the workspace is priced under: its assignment, or the default category
+    of the policy in force when it has none, and `category_assigned` tells the two apart. It is
+    None only when nothing is assigned and no policy is loaded.
+    """
+
+    workspace: str
+    account: UUID | None
+    category: str | None
+    category_assigned: bool
+    balance: Decimal
+    last_usage: datetime | None
+    total_granted: Decimal
+
+
+def workspace_summaries(session: Session, at: datetime) -> list[WorkspaceSummary]:
+    """Every known workspace with its account, category, balance, last usage and net grants,
+    sorted by name.
+
+    One statement for the lot rather than `CreditLedgerTransaction.balance` per workspace, which
+    costs two queries each. The balance follows the same rule: the latest whole-pool snapshot,
+    plus every row recorded after it.
+
+    `total_granted` is grants less the reversals of grants, so a clawback reduces it. A reversal
+    of a debit is a usage correction and is left out.
+
+    `at` resolves the policy whose default category stands in for an unassigned workspace.
+    """
+    known = WorkspaceAccount.known_workspaces_query().subquery()
+
+    snapshot = (
+        select(
+            col(CreditBalanceSnapshot.workspace).label("workspace"),
+            col(CreditBalanceSnapshot.as_of).label("as_of"),
+            col(CreditBalanceSnapshot.balance).label("balance"),
+        )
+        .where(col(CreditBalanceSnapshot.user).is_(None))
+        .distinct(col(CreditBalanceSnapshot.workspace))
+        .order_by(col(CreditBalanceSnapshot.workspace), col(CreditBalanceSnapshot.as_of).desc())
+        .cte("latest_snapshot")
+    )
+
+    # One pass over the ledger gives both sums. The self-join finds what a reversal reverses,
+    # and is to at most one row, so it cannot repeat a row into either sum.
+    ledger = CreditLedgerTransaction
+    reversed_row = aliased(CreditLedgerTransaction)
+    after_snapshot = or_(snapshot.c.as_of.is_(None), col(ledger.recorded_at) > snapshot.c.as_of)
+    is_grant = or_(
+        col(ledger.transaction_type) == TransactionType.GRANT,
+        col(reversed_row.transaction_type) == TransactionType.GRANT,
+    )
+    movements = (
+        select(
+            col(ledger.workspace).label("workspace"),
+            func.sum(col(ledger.credits)).filter(after_snapshot).label("delta"),
+            func.sum(col(ledger.credits)).filter(is_grant).label("granted"),
+        )
+        .outerjoin(reversed_row, col(ledger.reverses_id) == col(reversed_row.uuid))
+        .outerjoin(snapshot, snapshot.c.workspace == col(ledger.workspace))
+        .group_by(col(ledger.workspace))
+        .subquery()
+    )
+
+    usage = (
+        select(
+            col(BillingEvent.workspace).label("workspace"),
+            func.max(col(BillingEvent.event_end)).label("last_usage"),
+        )
+        .group_by(col(BillingEvent.workspace))
+        .subquery()
+    )
+
+    rows = session.execute(
+        select(
+            known.c.workspace,
+            col(WorkspaceAccount.account),
+            col(WorkspaceCategory.category),
+            func.coalesce(snapshot.c.balance, 0) + func.coalesce(movements.c.delta, 0),
+            usage.c.last_usage,
+            func.coalesce(movements.c.granted, 0),
+        )
+        .select_from(known)
+        .outerjoin(WorkspaceAccount, col(WorkspaceAccount.workspace) == known.c.workspace)
+        .outerjoin(WorkspaceCategory, col(WorkspaceCategory.workspace) == known.c.workspace)
+        .outerjoin(snapshot, snapshot.c.workspace == known.c.workspace)
+        .outerjoin(movements, movements.c.workspace == known.c.workspace)
+        .outerjoin(usage, usage.c.workspace == known.c.workspace)
+        .order_by(known.c.workspace)
+    ).all()
+
+    policy = PricingPolicy.resolve(session, at)
+    default_category = policy.default_category if policy else None
+
+    return [
+        WorkspaceSummary(
+            workspace=workspace,
+            account=account,
+            category=category if category is not None else default_category,
+            category_assigned=category is not None,
+            balance=balance,
+            last_usage=last_usage,
+            total_granted=granted,
+        )
+        for workspace, account, category, balance, last_usage, granted in rows
+    ]

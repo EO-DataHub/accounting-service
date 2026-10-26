@@ -8,7 +8,7 @@ wrong.
 
 | Command | What it is for |
 |---|---|
-| `make test-unit` | 206 tests, no database, about a second. Run this on every change |
+| `make test-unit` | 210 tests, no database, about a second. Run this on every change |
 | `make test-integration` | The rest. Needs Docker; starts a throwaway PostgreSQL |
 | `make testonce` | Everything |
 | `make check` | The gate: ruff, format, pyright, validate-pyproject, check-migrations |
