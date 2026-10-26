@@ -298,8 +298,9 @@ def list_workspaces(session: Session, unmapped: bool, ungranted: bool) -> None:
     """
     Lists every workspace this service has heard of, one name per line.
 
-    A workspace is listed if it has sent usage or its account mapping has been recorded. The
-    output is bare names with no header or formatting, so it can drive a shell loop, eg.
+    A workspace is listed if it has sent usage, its account mapping has been recorded, or it has
+    been granted credits or assigned a category. The output is bare names with no header or
+    formatting, so it can drive a shell loop, eg.
     `for workspace in $(uv run billing-admin workspaces); do ...; done`.
 
     `--unmapped` lists only workspaces whose usage cannot be tied to an account, because no

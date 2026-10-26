@@ -39,6 +39,7 @@ from accounting_service.models import (
     PagingCursorNotFound,
     PricingPolicy,
     UsageRow,
+    workspace_summaries,
 )
 
 from .models import (
@@ -48,8 +49,10 @@ from .models import (
     CreditBalanceAPIResult,
     LedgerQuery,
     LedgerTransactionAPIResult,
+    NoQuery,
     PricingPolicyAPIResult,
     UsageQuery,
+    WorkspaceSummaryAPIResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -257,7 +260,7 @@ def get_usage_data(
     session: SessionDep,
     query: Annotated[UsageQuery, Query()],
 ) -> list[BillingEventAPIResult]:
-    """Returns resource consumption data for every workspace, for hub admins (T25).
+    """Returns resource consumption data for every workspace, for hub admins (T23).
 
     The same query as the workspace and account reads with nothing selecting the workspaces.
     `?time-aggregation=day&group-by=workspace` gives one series per workspace: summing a
@@ -280,6 +283,26 @@ def get_usage_data(
     )
 
     return [BillingEventAPIResult.model_validate(row) for row in usage]
+
+
+@app.get(
+    "/accounting/workspaces",
+    summary="List every workspace with its balance, account and category",
+    dependencies=[Depends(require_hub_admin), Depends(usage_data_cache)],
+)
+def get_workspaces(session: SessionDep, query: Annotated[NoQuery, Query()]) -> list[WorkspaceSummaryAPIResult]:
+    """Returns every workspace this service knows of, sorted by name, for hub admins (T23).
+
+    Unlike `/accounting/usage-data`, a workspace with no usage in a period is still listed, so
+    this is where an idle workspace or one about to run out shows up. The list is whole and
+    unfiltered; narrowing it by balance is left to the caller.
+
+    A workspace is known once it has sent usage, been mapped to an account, been granted
+    credits, or been assigned a category.
+    """
+    as_of = datetime.now(UTC)
+
+    return [WorkspaceSummaryAPIResult.of(summary, as_of) for summary in workspace_summaries(session, as_of)]
 
 
 @app.get(
