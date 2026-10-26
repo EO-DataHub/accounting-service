@@ -40,6 +40,10 @@ dependencies = [
     "sqlmodel>=0.0.42",
     "pyrefly>=0.60.0",
     "certifi>=2026.10.19",
+    # Not imported directly. Sets a floor on the transitive version to fix CVE-2026-114603
+    # (ReDoS in header parsing); opentelemetry-sdk pins an exact api version, so this also
+    # lifts the SDK and the instrumentation packages. Drop it once they require >=1.45.1.
+    "opentelemetry-api>=1.45.1",
 ]
 
 [dependency-groups]
