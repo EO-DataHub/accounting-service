@@ -40,6 +40,7 @@ dependencies = [
     "sqlmodel>=0.0.42",
     "pyrefly>=0.60.0",
     "certifi>=2026.10.19",
+    "opentelemetry-api>=1.45.1",
 ]
 
 [dependency-groups]
