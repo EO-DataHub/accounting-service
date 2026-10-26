@@ -27,8 +27,10 @@ from accounting_service.app.models import (
     BillingItemAPIResult,
     BillingItemRateAPIResult,
     LedgerQuery,
+    NoQuery,
     PricingPolicyAPIResult,
     UsageQuery,
+    WorkspaceSummaryAPIResult,
 )
 from accounting_service.models import (
     BillingEvent,
@@ -38,6 +40,7 @@ from accounting_service.models import (
     PricingPolicyRate,
     UsageDimension,
     UsageRow,
+    WorkspaceSummary,
 )
 
 
@@ -430,6 +433,66 @@ class TestLedgerQueryUnknownParameters:
 
     def test_a_field_name_is_not_unknown(self) -> None:
         assert LedgerQuery.model_validate({"transaction_type": "grant"}).transaction_type is not None
+
+
+class TestNoQuery:
+    def test_any_parameter_is_rejected(self) -> None:
+        """A filter `/accounting/workspaces` does not have would otherwise match everything."""
+        with pytest.raises(ValueError, match="balance-below"):
+            NoQuery.model_validate({"balance-below": "10"})
+
+
+def a_summary(**overrides: Any) -> WorkspaceSummary:  # noqa: ANN401 - each field has its own type
+    fields: dict[str, Any] = {
+        "workspace": "my-workspace",
+        "account": UUID("4b48ebea-bdb8-4bb9-bce9-a7853ad3965d"),
+        "category": "standard",
+        "category_assigned": True,
+        "balance": Decimal("989.20"),
+        "last_usage": datetime(2025, 6, 15, 12, 15, tzinfo=UTC),
+        "total_granted": Decimal(1000),
+    }
+    return WorkspaceSummary(**(fields | overrides))
+
+
+class TestWorkspaceSummaryAPIResult:
+    AS_OF = datetime(2025, 6, 16, 9, 0, tzinfo=UTC)
+
+    def test_decimals_are_exact_strings(self) -> None:
+        dumped = WorkspaceSummaryAPIResult.of(a_summary(balance=Decimal("-0.000000412")), self.AS_OF).model_dump(
+            mode="json"
+        )
+
+        assert dumped["balance"] == "-0.000000412"
+        assert dumped["total_granted"] == "1000"
+
+    def test_timestamps_are_utc(self) -> None:
+        """PostgreSQL hands back the connection's timezone, which need not be UTC: converted, not relabelled."""
+        plus_two = timezone(timedelta(hours=2))
+        dumped = WorkspaceSummaryAPIResult.of(
+            a_summary(last_usage=datetime(2025, 6, 15, 14, 15, tzinfo=plus_two)),
+            self.AS_OF.astimezone(plus_two),
+        ).model_dump(mode="json")
+
+        assert dumped["last_usage"] == "2025-06-15T12:15:00Z"
+        assert dumped["as_of"] == "2025-06-16T09:00:00Z"
+
+    def test_an_unknown_workspace_has_nulls_not_omissions(self) -> None:
+        """Never used, never mapped, no policy loaded: every key is still present."""
+        dumped = WorkspaceSummaryAPIResult.of(
+            a_summary(account=None, category=None, category_assigned=False, last_usage=None), self.AS_OF
+        ).model_dump(mode="json")
+
+        assert dumped == {
+            "workspace": "my-workspace",
+            "account": None,
+            "category": None,
+            "category_assigned": False,
+            "balance": "989.20",
+            "as_of": "2025-06-16T09:00:00Z",
+            "last_usage": None,
+            "total_granted": "1000",
+        }
 
 
 def published_group_by_schema() -> dict[str, Any]:
