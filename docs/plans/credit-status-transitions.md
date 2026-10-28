@@ -19,7 +19,7 @@ announcement, the allowance that defines "overdrawn", and the message contract t
 builds against.
 
 The terms *balance*, *allowance*, *default allowance*, *allowance override*, *overdrawn*, *in
-credit*, *credit status transition* and *budget* have one meaning each, defined in
+credit*, *credit status transition*, *suspended* and *budget* have one meaning each, defined in
 [`GLOSSARY.md`](../../GLOSSARY.md). This plan uses them in that meaning only.
 
 ## Goal
@@ -96,6 +96,8 @@ are proposals. A change to a name is a change to this plan.
 | `settle_credit_status(session, workspaces)` | Python | Records any transitions for the given workspaces. Does not commit (ADR 0003) |
 | `TransitionRelay.tick(session, producer)` | Python | Sends unpublished transitions and marks them published. The ingester calls it on a timer |
 | `TRANSITION_RELAY_INTERVAL` | Setting | Seconds between relay ticks. Default 5 |
+| `GET /workspaces/{workspace}/accounting/balance` | HTTP | Adds `allowance`, `allowance_source`, `status` and `status_since` to the existing response. Any member |
+| `GET /accounting/workspaces` | HTTP | Adds the same four fields to every row of the estate list from PR #67. `hub_admin` |
 
 ## Acceptance criteria
 
@@ -170,6 +172,21 @@ for other authorisation failures, which is 401 today.
   integration test.*
 - **P8.** The relay interval comes from `TRANSITION_RELAY_INTERVAL`, default 5 seconds.
 
+### Reads for the pages
+
+The hub-admin workspaces page shows every workspace's allowance and status. The workspace pages
+show the same for one workspace, and a later suspension banner (#247) reads them too.
+
+- **R1.** The balance response carries `allowance` and `allowance_source`, equal to what the
+  allowance read returns for the same workspace, with `allowance: null` when unlimited.
+- **R2.** The balance response carries `status`, the status of the workspace's latest
+  transition, or `in_credit` if it has none.
+- **R3.** The balance response carries `status_since`, the `at` of the latest transition, or
+  `null` if the workspace has none.
+- **R4.** Every row of `GET /accounting/workspaces` carries the same four fields with the same
+  values as the balance response for that workspace. The list is still one query for the estate,
+  not one per workspace.
+
 ### Go-live
 
 - **G1.** `billing-admin settle` without `--commit` prints the transitions it would record and
@@ -196,11 +213,14 @@ clean.
 4. **Allowance writes.** The `PUT` and `DELETE` endpoints, `set-allowance` and `clear-allowance`.
    Each settles before commit, and a change to the default settles every workspace without an
    override. *Criteria: A2–A8, A11, A12, S5–S7, S14, the allowance half of S10.*
-5. **Relay.** `TransitionRelay`, the ingester timer, the producer configuration and the setting.
+5. **Reads for the pages.** The four fields on the balance response and on `GET
+   /accounting/workspaces`. Starts after PR #67 merges. *Criteria: R1–R4.*
+6. **Relay.** `TransitionRelay`, the ingester timer, the producer configuration and the setting.
    *Criteria: P1–P8.*
-6. **Go-live sweep.** `billing-admin settle`. *Criteria: G1–G3.*
-7. **Documentation.** Update the eodhp-guide design docs: amend D4, D5 and D9, replace
-   `workspace_budget` and `budget_breach_notification` in the schema doc, set T16's status in
+7. **Go-live sweep.** `billing-admin settle`. *Criteria: G1–G3.*
+8. **Documentation.** Update the eodhp-guide design docs: amend D4, D5 and D9, replace
+   `workspace_budget` and `budget_breach_notification` in the schema doc, record in D4 that a
+   future block reads status over HTTP rather than from Pulsar, set T16's status in
    the scoping doc, and update `pending-backend-endpoints.md`. Add the setting and topic to the
    README, and mark this plan done.
 
@@ -209,8 +229,11 @@ clean.
 - **The consumer:** recipients, email, in-app banners. That is the other developer's work.
 - **The budget:** owner-set spending targets, warn-at thresholds, per-user thresholds and the
   alerts toggle. ADR 0001 defers them under that name.
-- **Blocking provisioning** when a workspace is overdrawn. The `status` message is what a future
-  block would consume.
+- **Suspending a workspace** when it is overdrawn. That is #247 in eodhp-sparkgeo-pm. Its design
+  has OPAL poll an internal endpoint, `GET /internal/suspended-workspaces`, rather than consume
+  the topic. That endpoint is a small later addition: it reads the latest transition per
+  workspace from the table this plan builds. Pulsar carries notifications (#221), and the
+  table is the source of truth for enforcement.
 - **Balance snapshots.** The covering index comes first. Snapshots are a separate task if the
   balance read is still slow at real volumes.
 - **Unpriced events.** A workspace with uncharged usage shows a higher balance than it should,

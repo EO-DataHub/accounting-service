@@ -46,3 +46,7 @@ of it.
 - The API and `billing-admin` hold no Pulsar producer. Their transitions wait for the ingester's
   next poll, so the ingester must be running for any transition to reach the topic.
 - Consumers deduplicate on the message `uuid`.
+- D4 expected a future block to consume this topic. The suspension design (#247 in
+  eodhp-sparkgeo-pm) instead has OPAL poll an internal endpoint. That endpoint reads the latest
+  transition per workspace from the same table, so the table, not the topic, is the source of
+  truth for enforcement. The topic is for notifications.

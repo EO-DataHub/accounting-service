@@ -39,6 +39,12 @@ _Avoid_: Recovered, solvent
 A workspace moving from in credit to overdrawn, or back. Every transition is announced.
 _Avoid_: Breach, alert, notification
 
+**Suspended**:
+Reserved for a future feature (#247 in eodhp-sparkgeo-pm): a workspace that the platform stops
+from starting new work because it is overdrawn. Overdrawn is the accounting fact; suspended is
+what the platform enforces about it.
+_Avoid_: Using it to mean overdrawn
+
 **Budget**:
 Reserved for a future feature: a spending target a workspace owner sets for themselves. Separate
 from the allowance, which the platform sets.
