@@ -40,6 +40,8 @@ allowance brings it back, they should hear that too. Nothing is blocked (D4).
   from the last recorded status, the service records a transition and publishes it.
 - Members of a workspace can read its effective allowance. Only a `hub_admin` can change an
   allowance, and every change needs a reason.
+- In the front end, a `hub_admin` sets or removes an override from a row action on the hub-admin
+  workspaces page, which asks for the reason. The default is set on the same page.
 
 ## Message contract
 
@@ -64,8 +66,11 @@ Guarantees:
 - **At least once.** A message can arrive more than once. Deduplicate on `uuid`.
 - **Ordered per workspace.** The messages for one workspace arrive in the order the service
   recorded them. There is no order across workspaces.
-- **Alternating.** For one workspace, `status` alternates between the two values. The first
-  message for a workspace is always `overdrawn`, because a workspace starts in credit.
+- **Each message is a change.** For one workspace, each message's `status` differs from the one
+  before it. With today's two values they alternate, and the first message for a workspace is
+  always `overdrawn`, because a workspace starts in credit.
+- **More statuses may follow.** A later release may add a value, such as one for a warn-at
+  threshold (#221). A consumer ignores a `status` it does not recognise.
 - **State, not event.** The latest message for a workspace is its current status. A consumer
   that restarts can rebuild its state from the latest message per workspace.
 - **Facts only.** The message names no recipients. Who to tell, and how, belongs to the
@@ -85,7 +90,7 @@ are proposals. A change to a name is a change to this plan.
 |---|---|---|
 | `GET /workspaces/{workspace}/accounting/allowance` | HTTP | `{allowance, source}`. `source` is `default` or `override`. `allowance` is `null` when unlimited. Any member |
 | `PUT /workspaces/{workspace}/accounting/allowance` | HTTP | Body `{allowance, reason}`. Sets an override. `allowance: null` sets it to unlimited. `hub_admin` |
-| `DELETE /workspaces/{workspace}/accounting/allowance` | HTTP | Body `{reason}`. Removes the override. `hub_admin` |
+| `DELETE /workspaces/{workspace}/accounting/allowance?reason=...` | HTTP | Removes the override. The reason is a query parameter, because some clients and proxies drop the body of a `DELETE`. `hub_admin` |
 | `GET /accounting/allowance/default` | HTTP | `{allowance}`. Any valid token |
 | `PUT /accounting/allowance/default` | HTTP | Body `{allowance, reason}`. `allowance` may not be `null`. `hub_admin` |
 | `billing-admin set-allowance WORKSPACE AMOUNT --reason` | CLI | Sets an override. `AMOUNT` may be `unlimited`. `--default` in place of a workspace sets the default, which may not be `unlimited` |
@@ -228,7 +233,9 @@ clean.
 
 - **The consumer:** recipients, email, in-app banners. That is the other developer's work.
 - **The budget:** owner-set spending targets, warn-at thresholds, per-user thresholds and the
-  alerts toggle. ADR 0001 defers them under that name.
+  alerts toggle. ADR 0001 defers them under that name. Until then, a "near limit" marker on the
+  hub-admin page is worked out by the page from `balance` and `allowance`, and nothing is
+  announced for it.
 - **Suspending a workspace** when it is overdrawn. That is #247 in eodhp-sparkgeo-pm. Its design
   has OPAL poll an internal endpoint, `GET /internal/suspended-workspaces`, rather than consume
   the topic. That endpoint is a small later addition: it reads the latest transition per
@@ -244,7 +251,7 @@ clean.
 
 1. Deploy the consumer, or accept that the first messages go to a topic with nobody reading it.
 2. Run `billing-admin recharge` to clear any backlog of unpriced events.
-3. Set the default allowance to the agreed figure.
+3. Check that the default allowance is 0, the agreed figure. The migration seeds it.
 4. Run `billing-admin settle` and read who would be announced.
 5. Run `billing-admin settle --commit`.
 
@@ -257,14 +264,13 @@ workspaces are likely to be announced as overdrawn in step 5.
 |---|---|
 | A new ledger writer forgets to settle, and its changes go unannounced | S10 lists every writer. A new writer adds a case to that test (ADR 0003) |
 | The balance read on every debit is slow for a workspace with a long ledger | The covering index makes it an index-only scan. Measure on the test database after stage 3 |
-| A low default announces most workspaces at release | Release steps 3 to 5: set the figure, dry-run, then commit |
+| A default of 0 announces most workspaces at release | Release steps 2 to 5: recharge, check the figure, dry-run, then commit |
 | The ingester is down, so no transition reaches the topic | Transitions wait in the outbox and go out when it restarts. Nothing is lost |
 | Lowering the default sends many messages at once | Expected. The consumer handles a burst on the topic |
 | A front end already built against the owner-set Budget page has no backend | ADR 0001 records the change. Tell the front-end team when this plan is agreed |
 
 ## Open questions
 
-- **The default figure at release.** Whoever owns credit policy decides it. The code seeds 0.
 - **Is the consumer live before release step 5?** If not, the go-live messages wait on the topic
   until it subscribes, if the subscription is created first, or are lost.
 - **Should the front-end team see the plan now,** given that it removes the owner's control of
