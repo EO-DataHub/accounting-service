@@ -8,21 +8,26 @@ here lets every other authorisation check in the app be bypassed with whatever c
 attacker likes.
 
 There is no private key for the real Keycloak instance, so most of these sign with a
-throwaway RSA keypair and mock _jwks_client() to hand back its public half, rather than
+throwaway RSA keypair and mock the verifier's JWKS client to hand back its public half, rather than
 calling the real endpoint over the network.
 """
 
 import types
 from collections.abc import Iterator
-from unittest.mock import patch
+from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock, patch
 
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from fastapi import HTTPException
+from jwt import PyJWKClientConnectionError
 
 from accounting_service.app import authz
+from accounting_service.settings import Settings
+
+ISSUER = "https://eodh.example/keycloak/realms/eodhp"
 
 PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
@@ -70,17 +75,40 @@ def _credentials(token: str) -> types.SimpleNamespace:
 
 
 def _token(key: RSAPrivateKey, aud: str = "eodh", **claims: object) -> str:
-    return jwt.encode({"sub": "test-user", "aud": aud, **claims}, key, algorithm="RS256")
+    """A token as Keycloak would issue it. Pass a claim as None to leave it out."""
+    defaults: dict[str, object] = {
+        "sub": "test-user",
+        "aud": aud,
+        "iss": ISSUER,
+        "exp": datetime.now(tz=UTC) + timedelta(minutes=5),
+    }
+    payload = {name: value for name, value in {**defaults, **claims}.items() if value is not None}
+    return jwt.encode(payload, key, algorithm="RS256")
+
+
+def _rejected(token: str) -> bool:
+    with pytest.raises(HTTPException) as raised:
+        authz.decode_jwt_token(_credentials(token))
+
+    return raised.value.status_code == 401
 
 
 @pytest.fixture(autouse=True)
-def mock_jwks() -> Iterator[None]:
+def keycloak_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """A realm at a fixed address, whatever .env holds, so ISSUER is the one expected."""
+    settings = Settings.model_construct(KEYCLOAK_BASE_URL="https://eodh.example")
+    monkeypatch.setattr(authz, "get_settings", lambda: settings)
+    authz.verifier.cache_clear()
+    yield
+    authz.verifier.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def signing_key(keycloak_settings: None) -> Iterator[MagicMock]:
     """Stands in for a real call to Keycloak: hands back our own throwaway public key."""
-    with patch.object(authz, "_jwks_client") as mock_client:
-        mock_client.return_value.get_signing_key_from_jwt.return_value = types.SimpleNamespace(
-            key=PRIVATE_KEY.public_key()
-        )
-        yield
+    with patch.object(authz.verifier().jwks, "get_signing_key_from_jwt") as get_signing_key:
+        get_signing_key.return_value = types.SimpleNamespace(key=PRIVATE_KEY.public_key())
+        yield get_signing_key
 
 
 def test_a_genuinely_signed_token_is_accepted() -> None:
@@ -127,6 +155,73 @@ def test_the_wrong_audience_is_rejected() -> None:
         authz.decode_jwt_token(_credentials(token))
 
     assert raised.value.status_code == 401
+
+
+def test_the_issuer_is_built_from_the_settings_that_build_the_jwks_url() -> None:
+    config = authz.verifier()
+
+    assert config.issuer == ISSUER
+    assert config.jwks.uri == f"{ISSUER}/protocol/openid-connect/certs"
+
+
+@pytest.mark.parametrize("base_url", ["https://eodh.example/", " https://eodh.example "])
+def test_the_base_url_is_normalised_so_the_issuer_matches(base_url: str) -> None:
+    """The issuer is compared exactly, so a stray slash would refuse every token."""
+    settings = Settings(_env_file=None, KEYCLOAK_BASE_URL=base_url)  # pyright: ignore[reportCallIssue]
+
+    assert settings.keycloak_issuer == ISSUER
+
+
+def test_an_empty_base_url_counts_as_unset() -> None:
+    """`KEYCLOAK_BASE_URL=` in an env file must stop the API starting, not pass the check."""
+    assert Settings(_env_file=None, KEYCLOAK_BASE_URL="").KEYCLOAK_BASE_URL is None  # pyright: ignore[reportCallIssue]
+
+
+def test_keycloak_unreachable_is_a_503_not_a_401(signing_key: MagicMock) -> None:
+    """A 401 tells the client its token is bad, so it refreshes or logs out over an outage."""
+    signing_key.side_effect = PyJWKClientConnectionError("connection refused")
+
+    with pytest.raises(HTTPException) as raised:
+        authz.decode_jwt_token(_credentials(_token(PRIVATE_KEY)))
+
+    assert raised.value.status_code == 503
+
+
+def test_another_realms_issuer_is_rejected() -> None:
+    """Signed by a key this service trusts, but issued for a different realm."""
+    assert _rejected(_token(PRIVATE_KEY, iss="https://eodh.example/keycloak/realms/master"))
+
+
+def test_a_token_without_an_issuer_is_rejected() -> None:
+    assert _rejected(_token(PRIVATE_KEY, iss=None))
+
+
+def test_a_token_without_an_expiry_is_rejected() -> None:
+    """PyJWT checks exp only when it is present unless told to require it."""
+    assert _rejected(_token(PRIVATE_KEY, exp=None))
+
+
+def test_a_token_expired_within_the_leeway_is_accepted() -> None:
+    token = _token(PRIVATE_KEY, exp=datetime.now(tz=UTC) - timedelta(seconds=5))
+
+    assert authz.decode_jwt_token(_credentials(token))["sub"] == "test-user"
+
+
+def test_a_token_expired_beyond_the_leeway_is_rejected() -> None:
+    expired = datetime.now(tz=UTC) - authz.JWT_LEEWAY - timedelta(seconds=30)
+
+    assert _rejected(_token(PRIVATE_KEY, exp=expired))
+
+
+def test_without_a_keycloak_url_verification_is_a_configuration_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing setting is the server's fault, not the caller's, so it is not a 401. The
+    API refuses to start in this state (tests/test_startup.py), so no request sees it.
+    """
+    monkeypatch.setattr(authz, "get_settings", lambda: Settings.model_construct())
+    authz.verifier.cache_clear()
+
+    with pytest.raises(RuntimeError, match="KEYCLOAK_BASE_URL"):
+        authz.verifier()
 
 
 def test_the_real_keycloak_jwks_document_parses_and_picks_the_signing_key() -> None:

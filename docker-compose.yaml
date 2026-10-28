@@ -23,6 +23,8 @@ x-app: &app
     - ./alembic:/app/alembic:ro
     - ./alembic.ini:/app/alembic.ini:ro
     - ./dev/accounting.conf:/etc/eodh/accounting.conf:ro
+    # The local API entrypoint, which switches token verification off.
+    - ./dev:/app/dev:ro
 
 services:
   db:
@@ -90,9 +92,11 @@ services:
   api:
     <<: *app
     # 'fastapi dev' reloads on change, which the source mount above makes
-    # useful. It binds loopback by default, hence --host.
+    # useful. It binds loopback by default, hence --host. There is no Keycloak
+    # here, so this runs dev/local_api.py, which does not verify tokens; mint
+    # one with `uv run python -m dev.local_token`.
     command: ["uv", "run", "--no-sync", "fastapi", "dev", "--host", "0.0.0.0",
-              "accounting_service/app/app.py"]
+              "dev/local_api.py"]
     depends_on:
       migrate: { condition: service_completed_successfully }
     ports:

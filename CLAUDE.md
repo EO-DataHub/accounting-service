@@ -8,12 +8,13 @@ wrong.
 
 | Command | What it is for |
 |---|---|
-| `make test-unit` | 206 tests, no database, about a second. Run this on every change |
+| `make test-unit` | 224 tests, no database, about a second. Run this on every change |
 | `make test-integration` | The rest. Needs Docker; starts a throwaway PostgreSQL |
 | `make testonce` | Everything |
 | `make check` | The gate: ruff, format, pyright, validate-pyproject, check-migrations |
 | `make check-migrations` | Applies every revision to an empty container, then `alembic check` |
-| `make run` | The API, with reload |
+| `make run` | The API, with reload and without token verification (`dev/local_api.py`) |
+| `make run-verified` | The real API. Needs `KEYCLOAK_BASE_URL` |
 | `make run-ingester` | Needs Pulsar on localhost:6650 |
 
 Run `make check` before reporting a change as done.
@@ -32,7 +33,8 @@ Run `make check` before reporting a change as done.
 - `app/` — routes, response models, authorisation, dependencies.
 - `ingester/` — Pulsar messagers.
 - `dev/` — `billing_admin.py` (admin CLI), `inject.py` (send test messages),
-  `check_migrations.py`, and `accounting.conf` for local runs.
+  `check_migrations.py`, `local_api.py` and `local_token.py` (see Tokens below), and
+  `accounting.conf` for local runs.
 
 ## Tests
 
@@ -85,6 +87,20 @@ should not again. Its module docstring records the three things `col()` cannot f
 `__tablename__`, `selectinload`, and building a row through a relationship - each suppressed
 on the line it occurs. Keep suppressions inline and rule-specific: one line with a reason
 beats a header covering a file.
+
+## Tokens
+
+The API verifies every token itself: RS256 against the realm's JWKS, the audience, `iss`,
+and a required `exp`, with 10 seconds of leeway. The lifespan builds the verifier
+(`authz.verifier()`), so the API refuses to start without `KEYCLOAK_BASE_URL`, whatever is
+in `dependency_overrides`. Keycloak being unreachable is a 503, not a 401.
+
+The only bypass is `dev/local_api.py`, which replaces the lifespan and overrides
+`decode_jwt_token` with `local_claims`, an unverified decode. Compose and `make run` use it,
+and `.dockerignore` keeps it out of the image. Keep the bypass an entrypoint. Do not make it
+a setting: a deployment can set any environment variable, but switching to this module means
+changing the container's command (T24). Importing it changes the shared app, so tests
+import `local_claims` from `dev/local_token.py` instead.
 
 ## Docker
 
