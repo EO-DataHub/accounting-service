@@ -36,5 +36,8 @@ defers the second as a future **budget** feature, under that name, with its own 
 - The UX Budget page, as designed, has no backend. Its limit is now a `hub_admin` setting, and
   its warn-at threshold and per-user thresholds wait for the budget feature.
 - Lowering the default can make many workspaces overdrawn at once, and each one is announced.
-- An allowance is never negative and has no "unlimited" value. Zero means "overdrawn as soon as
-  the balance is below zero".
+- An allowance is never negative. Zero means "overdrawn as soon as the balance is below zero".
+- An override may be unlimited, so that a `hub_admin` can exempt one workspace, such as an
+  internal or demonstration workspace. A workspace with an unlimited allowance is never
+  overdrawn, and a future suspension (#247) never suspends it. The default may not be unlimited,
+  so that no single change can exempt every workspace at once.

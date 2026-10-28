@@ -45,4 +45,11 @@ of it.
   nobody is building a consumer is no longer true.
 - The API and `billing-admin` hold no Pulsar producer. Their transitions wait for the ingester's
   next poll, so the ingester must be running for any transition to reach the topic.
-- Consumers deduplicate on the message `uuid`.
+- Consumers deduplicate on the message `uuid`, and mark a `uuid` as seen only after acting on it.
+- A consumer logs a `status` it does not recognise as an error and ignores it. Once the consumer
+  is updated, `billing-admin resend-status` repeats the latest transition with its original
+  `uuid`. A re-send is one more at-least-once delivery, not a new transition.
+- D4 expected a future block to consume this topic. The suspension design (#247 in
+  eodhp-sparkgeo-pm) instead has OPAL poll an internal endpoint. That endpoint reads the latest
+  transition per workspace from the same table, so the table, not the topic, is the source of
+  truth for enforcement. The topic is for notifications.
