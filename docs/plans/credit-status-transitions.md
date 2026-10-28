@@ -32,8 +32,10 @@ allowance brings it back, they should hear that too. Nothing is blocked (D4).
 
 - Every workspace has an allowance: an override if a `hub_admin` set one, or else the default
   allowance. The default is 0 at release.
+- An override may be unlimited. The default may not.
 - A workspace is overdrawn when `balance < -allowance`. At exactly `-allowance` it is in credit.
-  A workspace with no recorded transition is in credit.
+  A workspace with an unlimited allowance is always in credit. A workspace with no recorded
+  transition is in credit.
 - The status is worked out again whenever the balance or the allowance changes. If it differs
   from the last recorded status, the service records a transition and publishes it.
 - Members of a workspace can read its effective allowance. Only a `hub_admin` can change an
@@ -54,7 +56,7 @@ them.
 | `workspace` | string | The workspace name |
 | `status` | string | The status the workspace entered: `overdrawn` or `in_credit` |
 | `balance` | string | The balance at the transition, as a decimal string, unrounded, for example `"-1203.000000417"` |
-| `allowance` | string | The allowance in force at the transition, as a non-negative decimal string |
+| `allowance` | string or null | The allowance in force at the transition, as a non-negative decimal string. `null` when the allowance is unlimited |
 | `at` | string | When the service recorded the transition, ISO 8601 in UTC |
 
 Guarantees:
@@ -81,12 +83,12 @@ are proposals. A change to a name is a change to this plan.
 
 | Entry point | Kind | Purpose |
 |---|---|---|
-| `GET /workspaces/{workspace}/accounting/allowance` | HTTP | `{allowance, source}`. `source` is `default` or `override`. Any member |
-| `PUT /workspaces/{workspace}/accounting/allowance` | HTTP | Body `{allowance, reason}`. Sets an override. `hub_admin` |
+| `GET /workspaces/{workspace}/accounting/allowance` | HTTP | `{allowance, source}`. `source` is `default` or `override`. `allowance` is `null` when unlimited. Any member |
+| `PUT /workspaces/{workspace}/accounting/allowance` | HTTP | Body `{allowance, reason}`. Sets an override. `allowance: null` sets it to unlimited. `hub_admin` |
 | `DELETE /workspaces/{workspace}/accounting/allowance` | HTTP | Body `{reason}`. Removes the override. `hub_admin` |
 | `GET /accounting/allowance/default` | HTTP | `{allowance}`. Any valid token |
-| `PUT /accounting/allowance/default` | HTTP | Body `{allowance, reason}`. `hub_admin` |
-| `billing-admin set-allowance WORKSPACE AMOUNT --reason` | CLI | Sets an override. `--default` in place of a workspace sets the default |
+| `PUT /accounting/allowance/default` | HTTP | Body `{allowance, reason}`. `allowance` may not be `null`. `hub_admin` |
+| `billing-admin set-allowance WORKSPACE AMOUNT --reason` | CLI | Sets an override. `AMOUNT` may be `unlimited`. `--default` in place of a workspace sets the default, which may not be `unlimited` |
 | `billing-admin clear-allowance WORKSPACE --reason` | CLI | Removes an override |
 | `billing-admin allowance WORKSPACE` | CLI | Prints the effective allowance and every change, newest first, with actor, time and reason. `--default` for the default |
 | `billing-admin settle` | CLI | Works out every known workspace's status. Prints the transitions it would record. Writes only with `--commit` |
@@ -117,6 +119,10 @@ for other authorisation failures, which is 401 today.
 - **A9.** On a newly migrated database the default allowance is 0.
 - **A10.** `billing-admin allowance` lists every set and removal for the workspace, including
   the ones that a later change replaced, each with its actor, time and reason.
+- **A11.** A `hub_admin` can set an override to unlimited. The workspace then reports `allowance:
+  null` with `source: override`, and a later change to the default does not reach it.
+- **A12.** An unlimited default is a 422 on the HTTP write and an error from the CLI, and nothing
+  is recorded.
 
 ### Status
 
@@ -145,6 +151,9 @@ for other authorisation failures, which is 401 today.
   allowance, record exactly one transition. *PostgreSQL only: an integration test.*
 - **S13.** `billing-admin credit-status` lists every transition recorded for the workspace,
   newest first, with whether and when each one was published.
+- **S14.** A workspace with an unlimited override records no transition to `overdrawn`, whatever
+  its balance. Setting an overdrawn workspace's override to unlimited records a transition to
+  `in_credit` with `allowance: null`.
 
 ### Publication
 
@@ -186,7 +195,7 @@ clean.
    credit-status`. *Criteria: S1–S4, S8–S13.*
 4. **Allowance writes.** The `PUT` and `DELETE` endpoints, `set-allowance` and `clear-allowance`.
    Each settles before commit, and a change to the default settles every workspace without an
-   override. *Criteria: A2–A8, S5–S7, the allowance half of S10.*
+   override. *Criteria: A2–A8, A11, A12, S5–S7, S14, the allowance half of S10.*
 5. **Relay.** `TransitionRelay`, the ingester timer, the producer configuration and the setting.
    *Criteria: P1–P8.*
 6. **Go-live sweep.** `billing-admin settle`. *Criteria: G1–G3.*

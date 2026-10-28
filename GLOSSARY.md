@@ -12,7 +12,8 @@ _Avoid_: Funds, wallet
 
 **Allowance**:
 How far below zero the platform lets a workspace's balance go, in credits. Never negative; zero
-means none.
+means none. An allowance override may instead be unlimited, and a workspace with an unlimited
+allowance is never overdrawn. The default allowance may not be unlimited.
 _Avoid_: Limit, overdraft limit, credit limit, budget
 
 **Default allowance**:
