@@ -1679,15 +1679,14 @@ class CreditBalanceSnapshot(SQLModel, table=True):
 class WorkspaceSummary(NamedTuple):
     """One workspace as the hub-admin list reports it (T23).
 
-    `category` is what the workspace is priced under: its assignment, or the default category
-    of the policy in force when it has none, and `category_assigned` tells the two apart. It is
-    None only when nothing is assigned and no policy is loaded.
+    `category` is resolved by the same rule as charging (`RateCard.multiplier_for`);
+    `assigned_category` is the assignment as stored, so a mistyped one stays visible.
     """
 
     workspace: str
     account: UUID | None
     category: str | None
-    category_assigned: bool
+    assigned_category: str | None
     balance: Decimal
     last_usage: datetime | None
     total_granted: Decimal
@@ -1769,14 +1768,14 @@ def workspace_summaries(session: Session, at: datetime) -> list[WorkspaceSummary
     ).all()
 
     policy = PricingPolicy.resolve(session, at)
-    default_category = policy.default_category if policy else None
+    rate_card = policy.rate_card() if policy else None
 
     return [
         WorkspaceSummary(
             workspace=workspace,
             account=account,
-            category=category if category is not None else default_category,
-            category_assigned=category is not None,
+            category=rate_card.multiplier_for(category)[0] if rate_card else category,
+            assigned_category=category,
             balance=balance,
             last_usage=last_usage,
             total_granted=granted,

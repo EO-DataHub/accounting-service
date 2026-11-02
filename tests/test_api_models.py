@@ -447,7 +447,7 @@ def a_summary(**overrides: Any) -> WorkspaceSummary:  # noqa: ANN401 - each fiel
         "workspace": "my-workspace",
         "account": UUID("4b48ebea-bdb8-4bb9-bce9-a7853ad3965d"),
         "category": "standard",
-        "category_assigned": True,
+        "assigned_category": "standard",
         "balance": Decimal("989.20"),
         "last_usage": datetime(2025, 6, 15, 12, 15, tzinfo=UTC),
         "total_granted": Decimal(1000),
@@ -480,14 +480,14 @@ class TestWorkspaceSummaryAPIResult:
     def test_an_unknown_workspace_has_nulls_not_omissions(self) -> None:
         """Never used, never mapped, no policy loaded: every key is still present."""
         dumped = WorkspaceSummaryAPIResult.of(
-            a_summary(account=None, category=None, category_assigned=False, last_usage=None), self.AS_OF
+            a_summary(account=None, category=None, assigned_category=None, last_usage=None), self.AS_OF
         ).model_dump(mode="json")
 
         assert dumped == {
             "workspace": "my-workspace",
             "account": None,
             "category": None,
-            "category_assigned": False,
+            "assigned_category": None,
             "balance": "989.20",
             "as_of": "2025-06-16T09:00:00Z",
             "last_usage": None,

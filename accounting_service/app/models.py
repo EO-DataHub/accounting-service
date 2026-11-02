@@ -568,16 +568,22 @@ class WorkspaceSummaryAPIResult(BaseModel):
         str | None,
         Field(
             description=(
-                "The pricing category the workspace is charged under. Where none is assigned, "
-                "the default category of the policy in force, with 'category_assigned' false. "
-                "Null only if no category is assigned and no pricing policy is loaded."
+                "The pricing category the workspace is charged under: its assigned category if "
+                "the policy in force has a multiplier for it, otherwise the policy's default "
+                "category. Null only if no category is assigned and no pricing policy is loaded."
             ),
             examples=["standard"],
         ),
     ]
-    category_assigned: Annotated[
-        bool,
-        Field(description="False when 'category' is the policy's default rather than an assignment"),
+    assigned_category: Annotated[
+        str | None,
+        Field(
+            description=(
+                "The category assigned to the workspace, as stored. Null if none is assigned. "
+                "Differs from 'category' when the policy has no multiplier for it."
+            ),
+            examples=["academic"],
+        ),
     ]
     balance: Annotated[
         ExactDecimal,

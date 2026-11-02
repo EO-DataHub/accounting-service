@@ -25,6 +25,7 @@ from accounting_service.models import (
     CreditBalanceSnapshot,
     CreditLedgerTransaction,
     PricingPolicy,
+    PricingPolicyCategoryMultiplier,
     TransactionType,
     WorkspaceAccount,
     WorkspaceCategory,
@@ -38,7 +39,7 @@ ACCOUNT = UUID("4b48ebea-bdb8-4bb9-bce9-a7853ad3965d")
 
 @pytest.fixture
 def policy(db_session: Session) -> PricingPolicy:
-    """Only its default category matters here, so it rates nothing."""
+    """Only its categories matter here, so it rates nothing."""
     stored = PricingPolicy(
         version=1,
         valid_from=JANUARY,
@@ -47,6 +48,10 @@ def policy(db_session: Session) -> PricingPolicy:
         default_category="standard",
         reason="test",
     )
+    stored.category_multipliers = [
+        PricingPolicyCategoryMultiplier(category="standard", multiplier=Decimal(1)),  # pyright: ignore[reportCallIssue]
+        PricingPolicyCategoryMultiplier(category="academic", multiplier=Decimal("0.5")),  # pyright: ignore[reportCallIssue]
+    ]
     db_session.add(stored)
     db_session.flush()
 
@@ -232,10 +237,10 @@ class TestAccountCategoryAndLastUsage:
 
         row = summaries(client)["ws"]
 
-        assert (row["account"], row["category"], row["category_assigned"], row["last_usage"]) == (
+        assert (row["account"], row["category"], row["assigned_category"], row["last_usage"]) == (
             str(ACCOUNT),
             "academic",
-            True,
+            "academic",
             "2025-03-05T12:00:00Z",
         )
 
@@ -247,7 +252,20 @@ class TestAccountCategoryAndLastUsage:
 
         row = summaries(client)["ws"]
 
-        assert (row["account"], row["category"], row["category_assigned"]) == (None, "standard", False)
+        assert (row["account"], row["category"], row["assigned_category"]) == (None, "standard", None)
+
+    def test_a_category_the_policy_does_not_know_reports_the_default(
+        self, client: TestClient, db_session: Session, policy: PricingPolicy
+    ) -> None:
+        """Charging prices an unknown category as the default, so the list must say the same,
+        while still showing the assignment that caused it."""
+        gen_billingitem_data(db_session, [{"workspace": "ws"}])
+        WorkspaceCategory.assign(db_session, "ws", "acadmic")
+        db_session.flush()
+
+        row = summaries(client)["ws"]
+
+        assert (row["category"], row["assigned_category"]) == ("standard", "acadmic")
 
     def test_unassigned_with_no_policy_is_null(self, client: TestClient, db_session: Session) -> None:
         gen_billingitem_data(db_session, [{"workspace": "ws"}])
@@ -255,7 +273,7 @@ class TestAccountCategoryAndLastUsage:
 
         row = summaries(client)["ws"]
 
-        assert (row["category"], row["category_assigned"]) == (None, False)
+        assert (row["category"], row["assigned_category"]) == (None, None)
 
 
 class TestCost:
