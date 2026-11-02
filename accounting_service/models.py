@@ -1701,9 +1701,11 @@ def workspace_summaries(session: Session, at: datetime) -> list[WorkspaceSummary
     plus every row recorded after it.
 
     `total_granted` is grants less the reversals of grants, so a clawback reduces it. A reversal
-    of a debit is a usage correction and is left out.
+    of a debit is a usage correction and is left out. Only one level is followed: a reversal of
+    a reversal of a grant is not counted, which assumes reversals are never chained. Nothing
+    writes reversals yet and the schema does not forbid chains, so revisit this if one does.
 
-    `at` resolves the policy whose default category stands in for an unassigned workspace.
+    `at` resolves the policy that each workspace's category is resolved against.
     """
     known = WorkspaceAccount.known_workspaces_query().subquery()
 
