@@ -287,7 +287,7 @@ Environment variables take priority over `.env`, so this overrides whatever that
      "localhost:8000/workspaces/my-workspace/accounting/usage-data?time-aggregation=day"
    ```
 
-   Each row carries `quantity` in the SKU's own units and `credits` for the same consumption. Drop `time-aggregation` for one row per event rather than daily totals.
+   Each row carries `quantity` in the SKU's own units and `credits` for the same consumption. Drop `time-aggregation` for one row per event rather than daily totals. Rows are paged with `limit` and `after`. An aggregated read's `after` taken from a different range is a 404, as an unknown `after` already is.
 
 7. Make the category matter. Set the workspace to `academic`, which the local configuration halves, and send the same usage again.
 

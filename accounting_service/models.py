@@ -147,13 +147,10 @@ class WorkspaceAccount(SQLModel, table=True):
 
     @classmethod
     def known_workspaces_query(cls, *, unmapped: bool = False, ungranted: bool = False) -> CompoundSelect:
-        """`known_workspaces` as a statement, one `workspace` column, for a query to build on.
-
-        Its CTE names are fixed, so two of these cannot appear in one statement; none do.
-        """
+        """`known_workspaces` as a statement, one `workspace` column, for a query to build on."""
         usage = [
-            _distinct_workspaces(col(BillingEvent.workspace), "event_workspaces"),
-            _distinct_workspaces(col(BillableResourceConsumptionRateSample.workspace), "sample_workspaces"),
+            _distinct_workspaces(col(BillingEvent.workspace)),
+            _distinct_workspaces(col(BillableResourceConsumptionRateSample.workspace)),
         ]
         mapped = select(col(cls.workspace))
 
@@ -176,7 +173,7 @@ class WorkspaceAccount(SQLModel, table=True):
         return known
 
 
-def _distinct_workspaces(column: Mapped[str], name: str) -> Select[tuple[str]]:
+def _distinct_workspaces(column: Mapped[str]) -> Select[tuple[str]]:
     """The distinct values of a usage table's `workspace` column, one index probe per value.
 
     A loose index scan: a recursive CTE that starts at the smallest workspace and steps to the
@@ -185,7 +182,7 @@ def _distinct_workspaces(column: Mapped[str], name: str) -> Select[tuple[str]]:
     `UNION` here would read every row of the table, and the usage tables hold millions.
     """
     first = select(column.label("workspace")).order_by(column).limit(1)
-    steps = first.cte(name, recursive=True)
+    steps = first.cte(recursive=True)
     following = select(column).where(column > steps.c.workspace).order_by(column).limit(1).scalar_subquery()
     steps = steps.union_all(select(following).where(steps.c.workspace.is_not(None)))
     return select(steps.c.workspace).where(steps.c.workspace.is_not(None))
