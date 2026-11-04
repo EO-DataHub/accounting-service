@@ -29,6 +29,7 @@ from accounting_service.models import (
     TransactionType,
     WorkspaceAccount,
     WorkspaceCategory,
+    workspace_summaries,
 )
 from tests.conftest import TOKEN_MEMBER, TOKEN_OWNER
 from tests.integration.test_models import gen_billingitem_data
@@ -128,7 +129,7 @@ class TestWhichWorkspacesAreListed:
 
         row = summaries(client)["idle"]
 
-        assert (row["balance"], row["total_granted"], row["last_usage"]) == ("100", "100", None)
+        assert (row["balance"], row["total_granted"]) == ("100", "100")
 
 
 class TestBalance:
@@ -221,7 +222,7 @@ class TestTotalGranted:
         assert summaries(client)["ws"]["total_granted"] == "0"
 
 
-class TestAccountCategoryAndLastUsage:
+class TestAccountAndCategory:
     def test_assigned_and_mapped(self, client: TestClient, db_session: Session, policy: PricingPolicy) -> None:
         last = datetime(2025, 3, 5, 12, tzinfo=UTC)
         gen_billingitem_data(
@@ -237,12 +238,7 @@ class TestAccountCategoryAndLastUsage:
 
         row = summaries(client)["ws"]
 
-        assert (row["account"], row["category"], row["assigned_category"], row["last_usage"]) == (
-            str(ACCOUNT),
-            "academic",
-            "academic",
-            "2025-03-05T12:00:00Z",
-        )
+        assert (row["account"], row["category"], row["assigned_category"]) == (str(ACCOUNT), "academic", "academic")
 
     def test_unassigned_reports_the_policy_default(
         self, client: TestClient, db_session: Session, policy: PricingPolicy
@@ -323,3 +319,29 @@ class TestAccess:
     def test_a_parameter_is_rejected_rather_than_ignored(self, client: TestClient) -> None:
         """There is no server-side filter, so one that looked like it worked would not have."""
         assert client.get("/accounting/workspaces?balance-below=10").status_code == 422
+
+
+class TestStage1NoLastUsage:
+    """Usage history is no longer read for the list, so nothing reports when it was."""
+
+    def test_stage1_the_response_has_no_last_usage_key(
+        self, client: TestClient, db_session: Session, policy: PricingPolicy
+    ) -> None:
+        gen_billingitem_data(db_session, [{"workspace": "used"}])
+        CreditLedgerTransaction.record_grant(db_session, workspace="idle", credits=Decimal(1), reason="r")
+        db_session.flush()
+
+        rows = summaries(client)
+
+        assert set(rows) == {"idle", "used"}
+        for row in rows.values():
+            assert set(row) == {"account", "category", "assigned_category", "balance", "as_of", "total_granted"}
+
+    def test_stage1_workspace_summaries_rows_have_no_last_usage(self, db_session: Session) -> None:
+        gen_billingitem_data(db_session, [{"workspace": "used"}])
+        db_session.flush()
+
+        (summary,) = workspace_summaries(db_session, JANUARY)
+
+        assert summary.workspace == "used"
+        assert "last_usage" not in summary._asdict()
