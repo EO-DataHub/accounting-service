@@ -4,15 +4,13 @@ Here rather than in tests/ because both questions are PostgreSQL's: what the set
 over five tables return, and which plan the planner picks for them.
 """
 
-import json
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session
 
@@ -25,6 +23,7 @@ from accounting_service.models import (
     WorkspaceAccount,
     WorkspaceCategory,
 )
+from tests.integration.explain import plan_nodes
 
 WHEN = datetime(2025, 6, 1, tzinfo=UTC)
 
@@ -83,44 +82,44 @@ def known(session: Session, *, unmapped: bool = False, ungranted: bool = False) 
     return listed
 
 
-class TestStage1EachSourceOnItsOwn:
-    def test_stage1_usage_only(self, db_session: Session, item: BillingItem) -> None:
+class TestEachSourceOnItsOwn:
+    def test_usage_only(self, db_session: Session, item: BillingItem) -> None:
         add_event(db_session, item, "ws")
         add_event(db_session, item, "ws")
 
         assert known(db_session) == ["ws"]
 
-    def test_stage1_rate_samples_only(self, db_session: Session, item: BillingItem) -> None:
+    def test_rate_samples_only(self, db_session: Session, item: BillingItem) -> None:
         add_sample(db_session, item, "ws")
         add_sample(db_session, item, "ws")
 
         assert known(db_session) == ["ws"]
 
-    def test_stage1_mapping_only(self, db_session: Session) -> None:
+    def test_mapping_only(self, db_session: Session) -> None:
         WorkspaceAccount.record_mapping(db_session, uuid4(), "ws")
 
         assert known(db_session) == ["ws"]
 
-    def test_stage1_ledger_only(self, db_session: Session) -> None:
+    def test_ledger_only(self, db_session: Session) -> None:
         CreditLedgerTransaction.record_grant(db_session, workspace="ws", credits=Decimal(1), reason="r")
         CreditLedgerTransaction.record_grant(db_session, workspace="ws", credits=Decimal(2), reason="r")
 
         assert known(db_session) == ["ws"]
 
-    def test_stage1_category_only(self, db_session: Session) -> None:
+    def test_category_only(self, db_session: Session) -> None:
         WorkspaceCategory.assign(db_session, "ws", "academic")
 
         assert known(db_session) == ["ws"]
 
-    def test_stage1_nothing_is_empty(self, db_session: Session) -> None:
+    def test_nothing_is_empty(self, db_session: Session) -> None:
         assert known(db_session) == []
         assert known(db_session, unmapped=True) == []
         assert known(db_session, ungranted=True) == []
         assert known(db_session, unmapped=True, ungranted=True) == []
 
 
-class TestStage1SeveralSources:
-    def test_stage1_a_workspace_in_every_source_is_listed_once(self, db_session: Session, item: BillingItem) -> None:
+class TestSeveralSources:
+    def test_a_workspace_in_every_source_is_listed_once(self, db_session: Session, item: BillingItem) -> None:
         add_event(db_session, item, "ws")
         add_sample(db_session, item, "ws")
         WorkspaceAccount.record_mapping(db_session, uuid4(), "ws")
@@ -129,9 +128,7 @@ class TestStage1SeveralSources:
 
         assert known(db_session) == ["ws"]
 
-    def test_stage1_many_workspaces_in_the_usage_tables_are_each_found(
-        self, db_session: Session, item: BillingItem
-    ) -> None:
+    def test_many_workspaces_in_the_usage_tables_are_each_found(self, db_session: Session, item: BillingItem) -> None:
         """Interleaved names, several rows each, so a step from one name to the next that skips
         or repeats one shows up."""
         for workspace in ("b", "d", "f", "h"):
@@ -165,8 +162,8 @@ def every_source(db_session: Session, item: BillingItem) -> None:
 
 
 @pytest.mark.usefixtures("every_source")
-class TestStage1Variants:
-    def test_stage1_default_lists_every_source(self, db_session: Session) -> None:
+class TestUnmappedAndUngranted:
+    def test_default_lists_every_source(self, db_session: Session) -> None:
         assert known(db_session) == [
             "categorised-only",
             "event-only",
@@ -178,7 +175,7 @@ class TestStage1Variants:
             "sample-only",
         ]
 
-    def test_stage1_unmapped_is_usage_with_no_account(self, db_session: Session) -> None:
+    def test_unmapped_is_usage_with_no_account(self, db_session: Session) -> None:
         assert known(db_session, unmapped=True) == [
             "event-only",
             "granted-with-usage",
@@ -186,7 +183,7 @@ class TestStage1Variants:
             "sample-only",
         ]
 
-    def test_stage1_ungranted_leaves_out_any_grant_even_a_reversed_one(self, db_session: Session) -> None:
+    def test_ungranted_leaves_out_any_grant_even_a_reversed_one(self, db_session: Session) -> None:
         assert known(db_session, ungranted=True) == [
             "categorised-only",
             "event-only",
@@ -195,8 +192,17 @@ class TestStage1Variants:
             "sample-only",
         ]
 
-    def test_stage1_unmapped_and_ungranted_combine(self, db_session: Session) -> None:
+    def test_unmapped_and_ungranted_combine(self, db_session: Session) -> None:
         assert known(db_session, unmapped=True, ungranted=True) == ["event-only", "sample-only"]
+
+    def test_two_of_the_query_can_be_joined_in_one_statement(self, db_session: Session) -> None:
+        """Workspaces both unmapped and ungranted, found by joining the two variants."""
+        db_session.flush()
+        unmapped = WorkspaceAccount.known_workspaces_query(unmapped=True).subquery()
+        ungranted = WorkspaceAccount.known_workspaces_query(ungranted=True).subquery()
+        both = select(unmapped.c.workspace).join(ungranted, unmapped.c.workspace == ungranted.c.workspace)
+
+        assert sorted(db_session.execute(both).scalars()) == ["event-only", "sample-only"]
 
 
 # Enough rows that reading them all costs far more than one probe per workspace, so the
@@ -237,26 +243,18 @@ def large_usage(db_session: Session, item: BillingItem) -> None:
     connection.execute(text("ANALYZE billing_resource_consumption_rate_sample"))
 
 
-def plan_nodes(plan: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    yield plan
-    for child in plan.get("Plans", []):
-        yield from plan_nodes(child)
-
-
 def explain_analyze(session: Session, statement: Any) -> list[dict[str, Any]]:  # noqa: ANN401 - any statement
     compiled = statement.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
-    (raw,) = session.connection().exec_driver_sql(f"EXPLAIN (ANALYZE, FORMAT JSON) {compiled}").scalar_one()
-    document = raw if isinstance(raw, dict) else json.loads(raw)[0]
-    return list(plan_nodes(document["Plan"]))
+    return plan_nodes(session.connection().exec_driver_sql(f"EXPLAIN (ANALYZE, FORMAT JSON) {compiled}").scalar_one())
 
 
 @pytest.mark.usefixtures("large_usage")
-class TestStage1KnownWorkspacesPlan:
+class TestKnownWorkspacesPlan:
     @pytest.mark.parametrize(
         ("unmapped", "ungranted"),
         [(False, False), (True, False), (False, True), (True, True)],
     )
-    def test_stage1_usage_tables_are_probed_per_workspace_not_read_whole(
+    def test_usage_tables_are_probed_per_workspace_not_read_whole(
         self, db_session: Session, unmapped: bool, ungranted: bool
     ) -> None:
         """No sequential scan of either usage table, an index scan on each, and the rows those

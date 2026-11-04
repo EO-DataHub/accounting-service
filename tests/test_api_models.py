@@ -488,11 +488,7 @@ class TestWorkspaceSummaryAPIResult:
             "total_granted": "1000",
         }
 
-    def test_stage1_last_usage_is_not_a_field(self) -> None:
-        assert "last_usage" not in WorkspaceSummary._fields
-        assert "last_usage" not in WorkspaceSummaryAPIResult.model_fields
-
-    def test_stage1_last_usage_is_not_published(self) -> None:
+    def test_last_usage_is_not_published(self) -> None:
         schema = app.openapi()["components"]["schemas"]["WorkspaceSummaryAPIResult"]
 
         assert "last_usage" not in schema["properties"]

@@ -6,7 +6,6 @@ cursor, and which plan it uses to find them.
 
 import json
 import uuid
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -17,6 +16,7 @@ from sqlmodel import Session
 
 from accounting_service import db
 from accounting_service.models import BillingEvent, TimeAggregation, UsageDimension
+from tests.integration.explain import plan_nodes
 from tests.integration.test_models import gen_billingitem_data
 
 USERS = [
@@ -76,12 +76,10 @@ def paged(client: TestClient, query: str, page_size: int) -> tuple[list[dict[str
 
 
 @pytest.mark.usefixtures("usage")
-class TestStage2AggregatedPaging:
+class TestAggregatedPaging:
     @pytest.mark.parametrize("group_by", GROUP_BYS)
     @pytest.mark.parametrize("period", list(TimeAggregation))
-    def test_stage2_pages_joined_equal_one_read(
-        self, client: TestClient, period: TimeAggregation, group_by: str
-    ) -> None:
+    def test_pages_joined_equal_one_read(self, client: TestClient, period: TimeAggregation, group_by: str) -> None:
         query = f"time-aggregation={period.value}&group-by={group_by}{RANGE}"
         whole = read(client, f"{query}&limit=10000")
         page_size = max(1, len(whole) // 4)
@@ -94,9 +92,9 @@ class TestStage2AggregatedPaging:
 
 
 @pytest.mark.usefixtures("usage")
-class TestStage2AfterOutsideTheRange:
+class TestAfterOutsideTheRange:
     @pytest.mark.parametrize("period", list(TimeAggregation))
-    def test_stage2_an_after_from_another_range_is_a_404(self, client: TestClient, period: TimeAggregation) -> None:
+    def test_an_after_from_another_range_is_a_404(self, client: TestClient, period: TimeAggregation) -> None:
         query = f"time-aggregation={period.value}&group-by=workspace"
         (cursor, *_) = read(client, f"{query}{RANGE}&limit=1")
 
@@ -104,7 +102,7 @@ class TestStage2AfterOutsideTheRange:
 
         assert response.status_code == 404, response.text
 
-    def test_stage2_an_after_from_another_range_is_a_404_per_workspace(self, client: TestClient) -> None:
+    def test_an_after_from_another_range_is_a_404_per_workspace(self, client: TestClient) -> None:
         query = "time-aggregation=month"
         (cursor, *_) = read(client, f"{query}{RANGE}&limit=1")
 
@@ -116,8 +114,8 @@ class TestStage2AfterOutsideTheRange:
 
 
 @pytest.mark.usefixtures("usage")
-class TestStage2RawPagingUnchanged:
-    def test_stage2_raw_pages_joined_equal_one_read(self, client: TestClient) -> None:
+class TestRawPaging:
+    def test_raw_pages_joined_equal_one_read(self, client: TestClient) -> None:
         whole = read(client, f"limit=10000{RANGE}")
 
         rows, pages = paged(client, RANGE.lstrip("&"), max(1, len(whole) // 4))
@@ -125,7 +123,7 @@ class TestStage2RawPagingUnchanged:
         assert pages >= 2
         assert rows == whole
 
-    def test_stage2_raw_after_from_an_earlier_range_still_pages(self, client: TestClient) -> None:
+    def test_raw_after_from_an_earlier_range_still_pages(self, client: TestClient) -> None:
         """A raw read finds its cursor by primary key wherever it lies, as it always has."""
         (cursor, *_) = read(client, f"limit=1{EARLIER_RANGE}")
         whole = read(client, f"limit=10000{RANGE}")
@@ -136,16 +134,10 @@ class TestStage2RawPagingUnchanged:
         assert response.json() == whole
 
 
-def plan_nodes(plan: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    yield plan
-    for child in plan.get("Plans", []):
-        yield from plan_nodes(child)
-
-
 @pytest.mark.usefixtures("usage")
-class TestStage2AfterLookupPlan:
+class TestAfterLookupPlan:
     @pytest.mark.parametrize("period", list(TimeAggregation))
-    def test_stage2_the_after_lookup_uses_the_aggregate_index_with_the_range_bounds(
+    def test_the_after_lookup_uses_the_aggregate_index_with_the_range_bounds(
         self, db_session: Session, period: TimeAggregation
     ) -> None:
         """The lookup is the first statement a read with `after` issues. A table this small
@@ -186,13 +178,12 @@ class TestStage2AfterLookupPlan:
         connection = db_session.connection()
         connection.execute(text("SET LOCAL enable_seqscan = off"))
         raw = connection.exec_driver_sql(f"EXPLAIN (FORMAT JSON) {lookup}", parameters).scalar_one()
-        document = raw[0] if isinstance(raw, list) else json.loads(raw)[0]
-        nodes = list(plan_nodes(document["Plan"]))
+        nodes = plan_nodes(raw)
 
         index_name = f"billingevent_{period.value}_aggregate_index"
         on_index = [node for node in nodes if node.get("Index Name") == index_name]
 
-        assert on_index, f"{index_name} is not used: {json.dumps(document['Plan'])}"
+        assert on_index, f"{index_name} is not used: {json.dumps(nodes[0])}"
         conditions = " ".join(node.get("Index Cond", "") for node in on_index)
         assert "date_trunc" in conditions, f"no range bound on the index: {conditions!r}"
         assert "2024-05-20" in conditions, f"the upper bound is not an index condition: {conditions!r}"
