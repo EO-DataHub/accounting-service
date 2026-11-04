@@ -547,11 +547,11 @@ class CreditBalanceAPIResult(BaseModel):
 
 
 class WorkspaceSummaryAPIResult(BaseModel):
-    """One workspace in the hub-admin list: who it is billed to, what it is priced under, what
-    it holds, and when it last used anything (T23).
+    """One workspace in the hub-admin list: who it is billed to, what it is priced under, and
+    what it holds (T23).
 
     Every workspace this service knows of is listed, including one that has never used
-    anything, which reports a balance of whatever it was granted and a null `last_usage`.
+    anything, which reports a balance of whatever it was granted.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -598,13 +598,6 @@ class WorkspaceSummaryAPIResult(BaseModel):
     as_of: Annotated[
         UtcTimestamp,
         Field(description="When the balance was computed, the same for every row", examples=["2026-09-09T13:34:22Z"]),
-    ]
-    last_usage: Annotated[
-        UtcTimestamp | None,
-        Field(
-            description="The end of the latest usage recorded. Null if the workspace has never used anything",
-            examples=["2026-09-09T12:00:00Z"],
-        ),
     ]
     total_granted: Annotated[
         ExactDecimal,
