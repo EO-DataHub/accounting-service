@@ -164,6 +164,8 @@ GET /workspaces/my-workspace/accounting/ledger/{transaction}
 
 The ledger lists every movement as recorded, including reversals. The usage endpoints below net a reversal against the charge it corrects and show neither.
 
+`GET /workspaces/my-workspace/accounting/usage-data` is paged with `limit` and `after`. An aggregated read's `after` taken from a different range is a 404, as an unknown `after` already is.
+
 A hub admin can read every workspace at once:
 
 ```commandline
@@ -287,7 +289,7 @@ Environment variables take priority over `.env`, so this overrides whatever that
      "localhost:8000/workspaces/my-workspace/accounting/usage-data?time-aggregation=day"
    ```
 
-   Each row carries `quantity` in the SKU's own units and `credits` for the same consumption. Drop `time-aggregation` for one row per event rather than daily totals. Rows are paged with `limit` and `after`. An aggregated read's `after` taken from a different range is a 404, as an unknown `after` already is.
+   Each row carries `quantity` in the SKU's own units and `credits` for the same consumption. Drop `time-aggregation` for one row per event rather than daily totals.
 
 7. Make the category matter. Set the workspace to `academic`, which the local configuration halves, and send the same usage again.
 
