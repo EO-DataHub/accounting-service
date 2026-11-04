@@ -147,7 +147,10 @@ class WorkspaceAccount(SQLModel, table=True):
 
     @classmethod
     def known_workspaces_query(cls, *, unmapped: bool = False, ungranted: bool = False) -> CompoundSelect:
-        """`known_workspaces` as a statement, one `workspace` column, for a query to build on."""
+        """`known_workspaces` as a statement, one `workspace` column, for a query to build on.
+
+        Its CTE names are fixed, so two of these cannot appear in one statement; none do.
+        """
         usage = [
             _distinct_workspaces(col(BillingEvent.workspace), "event_workspaces"),
             _distinct_workspaces(col(BillableResourceConsumptionRateSample.workspace), "sample_workspaces"),
@@ -948,20 +951,33 @@ class BillingEvent(SQLModel, table=True):
         query = all_billing_events.order_by(*(element.column for element in order_key)).limit(limit)
 
         # Overlap with [start, end), for an event and a period alike.
+        range_filters: list[Any] = []
+
         if lower is not None:
-            query = query.where(event_end_col > lower)
+            range_filters.append(event_end_col > lower)
 
         if upper is not None:
-            query = query.where(event_start_col < upper)
+            range_filters.append(event_start_col < upper)
 
         # Redundant with the overlap test, and there for the index: the end of a period is only
         # the second column of its aggregate index, and this bounds the first.
         if period_first is not None:
-            query = query.where(event_start_col >= period_first)
+            range_filters.append(event_start_col >= period_first)
+
+        query = query.where(*range_filters)
 
         if after is not None:
             # Equivalent to session.get(cls, after), but works when billingevent_src is an alias.
-            after_be = session.execute(select(billingevent_src).where(event_uuid == after)).scalar_one_or_none()
+            lookup = select(billingevent_src).where(event_uuid == after)
+
+            # An aggregated lookup without the range would total every period in the table to
+            # find one row. With it, the bounds reach the aggregate index as they do for the
+            # page, and a cursor from a read of another range is not found. A raw lookup is a
+            # primary key probe either way, so it is left as it was.
+            if time_aggregation is not None:
+                lookup = lookup.where(*range_filters)
+
+            after_be = session.execute(lookup).scalar_one_or_none()
 
             if after_be is None:
                 raise AfterBillingEventNotFound(f"No records matching after={after} found")
