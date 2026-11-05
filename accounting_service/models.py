@@ -21,6 +21,7 @@ from sqlalchemy import (
     CursorResult,
     Index,
     MetaData,
+    Select,
     String,
     Text,
     UniqueConstraint,
@@ -148,8 +149,8 @@ class WorkspaceAccount(SQLModel, table=True):
     def known_workspaces_query(cls, *, unmapped: bool = False, ungranted: bool = False) -> CompoundSelect:
         """`known_workspaces` as a statement, one `workspace` column, for a query to build on."""
         usage = [
-            select(col(BillingEvent.workspace)),
-            select(col(BillableResourceConsumptionRateSample.workspace)),
+            _distinct_workspaces(col(BillingEvent.workspace)),
+            _distinct_workspaces(col(BillableResourceConsumptionRateSample.workspace)),
         ]
         mapped = select(col(cls.workspace))
 
@@ -170,6 +171,21 @@ class WorkspaceAccount(SQLModel, table=True):
             known = except_(known.subquery().select(), granted)
 
         return known
+
+
+def _distinct_workspaces(column: Mapped[str]) -> Select[tuple[str]]:
+    """The distinct values of a usage table's `workspace` column, one index probe per value.
+
+    A loose index scan: a recursive CTE that starts at the smallest workspace and steps to the
+    next with `workspace > previous ORDER BY workspace LIMIT 1`, each step answered from the
+    table's `(workspace, ...)` index. PostgreSQL has no skip scan, so a plain `DISTINCT` or
+    `UNION` here would read every row of the table, and the usage tables hold millions.
+    """
+    first = select(column.label("workspace")).order_by(column).limit(1)
+    steps = first.cte(recursive=True)
+    following = select(column).where(column > steps.c.workspace).order_by(column).limit(1).scalar_subquery()
+    steps = steps.union_all(select(following).where(steps.c.workspace.is_not(None)))
+    return select(steps.c.workspace).where(steps.c.workspace.is_not(None))
 
 
 class WorkspaceCategory(SQLModel, table=True):
@@ -932,20 +948,33 @@ class BillingEvent(SQLModel, table=True):
         query = all_billing_events.order_by(*(element.column for element in order_key)).limit(limit)
 
         # Overlap with [start, end), for an event and a period alike.
+        range_filters: list[Any] = []
+
         if lower is not None:
-            query = query.where(event_end_col > lower)
+            range_filters.append(event_end_col > lower)
 
         if upper is not None:
-            query = query.where(event_start_col < upper)
+            range_filters.append(event_start_col < upper)
 
         # Redundant with the overlap test, and there for the index: the end of a period is only
         # the second column of its aggregate index, and this bounds the first.
         if period_first is not None:
-            query = query.where(event_start_col >= period_first)
+            range_filters.append(event_start_col >= period_first)
+
+        query = query.where(*range_filters)
 
         if after is not None:
             # Equivalent to session.get(cls, after), but works when billingevent_src is an alias.
-            after_be = session.execute(select(billingevent_src).where(event_uuid == after)).scalar_one_or_none()
+            lookup = select(billingevent_src).where(event_uuid == after)
+
+            # An aggregated lookup without the range would total every period in the table to
+            # find one row. With it, the bounds reach the aggregate index as they do for the
+            # page, and a cursor from a read of another range is not found. A raw lookup is a
+            # primary key probe either way, so it is left as it was.
+            if time_aggregation is not None:
+                lookup = lookup.where(*range_filters)
+
+            after_be = session.execute(lookup).scalar_one_or_none()
 
             if after_be is None:
                 raise AfterBillingEventNotFound(f"No records matching after={after} found")
@@ -1688,13 +1717,11 @@ class WorkspaceSummary(NamedTuple):
     category: str | None
     assigned_category: str | None
     balance: Decimal
-    last_usage: datetime | None
     total_granted: Decimal
 
 
 def workspace_summaries(session: Session, at: datetime) -> list[WorkspaceSummary]:
-    """Every known workspace with its account, category, balance, last usage and net grants,
-    sorted by name.
+    """Every known workspace with its account, category, balance and net grants, sorted by name.
 
     One statement for the lot rather than `CreditLedgerTransaction.balance` per workspace, which
     costs two queries each. The balance follows the same rule: the latest whole-pool snapshot,
@@ -1742,22 +1769,12 @@ def workspace_summaries(session: Session, at: datetime) -> list[WorkspaceSummary
         .subquery()
     )
 
-    usage = (
-        select(
-            col(BillingEvent.workspace).label("workspace"),
-            func.max(col(BillingEvent.event_end)).label("last_usage"),
-        )
-        .group_by(col(BillingEvent.workspace))
-        .subquery()
-    )
-
     rows = session.execute(
         select(
             known.c.workspace,
             col(WorkspaceAccount.account),
             col(WorkspaceCategory.category),
             func.coalesce(snapshot.c.balance, 0) + func.coalesce(movements.c.delta, 0),
-            usage.c.last_usage,
             func.coalesce(movements.c.granted, 0),
         )
         .select_from(known)
@@ -1765,7 +1782,6 @@ def workspace_summaries(session: Session, at: datetime) -> list[WorkspaceSummary
         .outerjoin(WorkspaceCategory, col(WorkspaceCategory.workspace) == known.c.workspace)
         .outerjoin(snapshot, snapshot.c.workspace == known.c.workspace)
         .outerjoin(movements, movements.c.workspace == known.c.workspace)
-        .outerjoin(usage, usage.c.workspace == known.c.workspace)
         .order_by(known.c.workspace)
     ).all()
 
@@ -1779,8 +1795,7 @@ def workspace_summaries(session: Session, at: datetime) -> list[WorkspaceSummary
             category=rate_card.multiplier_for(category)[0] if rate_card else category,
             assigned_category=category,
             balance=balance,
-            last_usage=last_usage,
             total_granted=granted,
         )
-        for workspace, account, category, balance, last_usage, granted in rows
+        for workspace, account, category, balance, granted in rows
     ]

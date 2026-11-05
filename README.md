@@ -164,13 +164,15 @@ GET /workspaces/my-workspace/accounting/ledger/{transaction}
 
 The ledger lists every movement as recorded, including reversals. The usage endpoints below net a reversal against the charge it corrects and show neither.
 
+`GET /workspaces/my-workspace/accounting/usage-data` is paged with `limit` and `after`. An aggregated read's `after` taken from a different range is a 404, as an unknown `after` already is.
+
 A hub admin can read every workspace at once:
 
 ```commandline
 GET /accounting/workspaces
 ```
 
-One row per workspace, sorted by name: its balance, billing account, pricing category, the end of its latest usage, and the credits granted to it less any grant reversed. `category` is the category the workspace is charged under. A workspace with no category assigned, or with one the policy in force has no multiplier for, reports the policy's default category. `assigned_category` gives the assignment as stored, so a mistyped one is visible. The list is whole and takes no parameters; filtering by balance is left to the caller.
+One row per workspace, sorted by name: its balance, billing account, pricing category, and the credits granted to it less any grant reversed. `category` is the category the workspace is charged under. A workspace with no category assigned, or with one the policy in force has no multiplier for, reports the policy's default category. `assigned_category` gives the assignment as stored, so a mistyped one is visible. The list is whole and takes no parameters; filtering by balance is left to the caller.
 
 ### List workspaces
 

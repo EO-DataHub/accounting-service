@@ -449,7 +449,6 @@ def a_summary(**overrides: Any) -> WorkspaceSummary:  # noqa: ANN401 - each fiel
         "category": "standard",
         "assigned_category": "standard",
         "balance": Decimal("989.20"),
-        "last_usage": datetime(2025, 6, 15, 12, 15, tzinfo=UTC),
         "total_granted": Decimal(1000),
     }
     return WorkspaceSummary(**(fields | overrides))
@@ -469,18 +468,14 @@ class TestWorkspaceSummaryAPIResult:
     def test_timestamps_are_utc(self) -> None:
         """PostgreSQL hands back the connection's timezone, which need not be UTC: converted, not relabelled."""
         plus_two = timezone(timedelta(hours=2))
-        dumped = WorkspaceSummaryAPIResult.of(
-            a_summary(last_usage=datetime(2025, 6, 15, 14, 15, tzinfo=plus_two)),
-            self.AS_OF.astimezone(plus_two),
-        ).model_dump(mode="json")
+        dumped = WorkspaceSummaryAPIResult.of(a_summary(), self.AS_OF.astimezone(plus_two)).model_dump(mode="json")
 
-        assert dumped["last_usage"] == "2025-06-15T12:15:00Z"
         assert dumped["as_of"] == "2025-06-16T09:00:00Z"
 
     def test_an_unknown_workspace_has_nulls_not_omissions(self) -> None:
         """Never used, never mapped, no policy loaded: every key is still present."""
         dumped = WorkspaceSummaryAPIResult.of(
-            a_summary(account=None, category=None, assigned_category=None, last_usage=None), self.AS_OF
+            a_summary(account=None, category=None, assigned_category=None), self.AS_OF
         ).model_dump(mode="json")
 
         assert dumped == {
@@ -490,9 +485,14 @@ class TestWorkspaceSummaryAPIResult:
             "assigned_category": None,
             "balance": "989.20",
             "as_of": "2025-06-16T09:00:00Z",
-            "last_usage": None,
             "total_granted": "1000",
         }
+
+    def test_last_usage_is_not_published(self) -> None:
+        schema = app.openapi()["components"]["schemas"]["WorkspaceSummaryAPIResult"]
+
+        assert "last_usage" not in schema["properties"]
+        assert "last_usage" not in schema.get("required", [])
 
 
 def published_group_by_schema() -> dict[str, Any]:

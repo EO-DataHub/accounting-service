@@ -128,7 +128,7 @@ class TestWhichWorkspacesAreListed:
 
         row = summaries(client)["idle"]
 
-        assert (row["balance"], row["total_granted"], row["last_usage"]) == ("100", "100", None)
+        assert (row["balance"], row["total_granted"]) == ("100", "100")
 
 
 class TestBalance:
@@ -221,28 +221,16 @@ class TestTotalGranted:
         assert summaries(client)["ws"]["total_granted"] == "0"
 
 
-class TestAccountCategoryAndLastUsage:
+class TestAccountAndCategory:
     def test_assigned_and_mapped(self, client: TestClient, db_session: Session, policy: PricingPolicy) -> None:
-        last = datetime(2025, 3, 5, 12, tzinfo=UTC)
-        gen_billingitem_data(
-            db_session,
-            [
-                {"workspace": "ws", "event_start": last - timedelta(days=2), "event_end": last - timedelta(days=1)},
-                {"workspace": "ws", "event_start": last - timedelta(hours=1), "event_end": last},
-            ],
-        )
+        gen_billingitem_data(db_session, [{"workspace": "ws"}])
         WorkspaceAccount.record_mapping(db_session, ACCOUNT, "ws")
         WorkspaceCategory.assign(db_session, "ws", "academic")
         db_session.flush()
 
         row = summaries(client)["ws"]
 
-        assert (row["account"], row["category"], row["assigned_category"], row["last_usage"]) == (
-            str(ACCOUNT),
-            "academic",
-            "academic",
-            "2025-03-05T12:00:00Z",
-        )
+        assert (row["account"], row["category"], row["assigned_category"]) == (str(ACCOUNT), "academic", "academic")
 
     def test_unassigned_reports_the_policy_default(
         self, client: TestClient, db_session: Session, policy: PricingPolicy

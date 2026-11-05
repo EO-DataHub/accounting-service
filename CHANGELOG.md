@@ -35,6 +35,12 @@ balance.
   recent transactions and its balance. All three are privileged writes with no HTTP endpoint
   yet, reachable by anyone who can reach the database - the same footing as the rest of that
   tool.
+- **`last_usage` is removed from `GET /accounting/workspaces`.** Breaking for a client that
+  reads it. The rest of each row is unchanged. The list is also faster: it no longer reads
+  every usage row to find the workspaces.
+- **An aggregated usage read with `after` is bounded by the requested range.** An `after`
+  taken from a read of a different range is now a 404, as an unknown `after` already was.
+  Raw reads are unchanged.
 
 ### Earlier in this release
 
