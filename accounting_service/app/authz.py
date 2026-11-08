@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+from datetime import timedelta
 from enum import IntEnum
 from functools import lru_cache
 from typing import Annotated, Any
@@ -6,7 +8,7 @@ from uuid import UUID
 import jwt
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jwt import PyJWKClient, PyJWTError
+from jwt import PyJWKClient, PyJWKClientConnectionError, PyJWTError
 
 from accounting_service.settings import get_settings
 
@@ -17,19 +19,39 @@ bearer_scheme = HTTPBearer()
 # duplicated across the platform's services, so change them together.
 JWT_AUDIENCE = ["eodh", "eodh-workspaces"]
 
+# Tolerance on exp, nbf and iat for clock skew between these pods and Keycloak's.
+JWT_LEEWAY = timedelta(seconds=10)
+
+
+# How long a request waits on Keycloak for the JWKS document. PyJWKClient's default is 30
+# seconds, which holds a worker thread for that long on every request while Keycloak is down.
+JWKS_TIMEOUT_SECONDS = 5
+
+
+@dataclass(frozen=True)
+class Verifier:
+    issuer: str
+    jwks: PyJWKClient
+
 
 @lru_cache
-def _jwks_client() -> PyJWKClient:
-    """One client per process, so the JWKS document is cached rather than re-fetched from
-    Keycloak on every request. PyJWKClient does this caching internally, but only across
-    calls on the same instance.
+def verifier() -> Verifier:
+    """The realm's issuer and a JWKS client for it, built once per process.
+
+    The API's lifespan calls this, so a missing setting stops the process rather than
+    turning every request into a 500 (T24). One client means the JWKS document is cached
+    across requests rather than re-fetched from Keycloak on each. Building it does not
+    contact Keycloak, so a Keycloak outage does not stop the API starting.
     """
-    settings = get_settings()
-    if not settings.keycloak_certs_url:
-        msg = "KEYCLOAK_BASE_URL must be set to verify JWTs"
+    issuer = get_settings().keycloak_issuer
+    if issuer is None:
+        msg = "KEYCLOAK_BASE_URL must be set to verify JWTs. For a local run without Keycloak, use dev/local_api.py"
         raise RuntimeError(msg)
 
-    return PyJWKClient(settings.keycloak_certs_url)
+    return Verifier(
+        issuer=issuer,
+        jwks=PyJWKClient(f"{issuer}/protocol/openid-connect/certs", timeout=JWKS_TIMEOUT_SECONDS),
+    )
 
 
 class MinTier(IntEnum):
@@ -116,16 +138,28 @@ def decode_jwt_token(credentials: Annotated[HTTPAuthorizationCredentials, Depend
     # As this is used in dependency injection, FastAPI handles most of the failure modes.
     #
     # The signature is verified against Keycloak's own published key (fetched from
-    # KEYCLOAK_CERTS_URL), rather than trusting an upstream gateway to have checked it: a
+    # the realm's JWKS endpoint), rather than trusting an upstream gateway to have checked it: a
     # gateway sitting in front of the public path does not cover traffic that reaches this
     # service directly from elsewhere on the cluster network.
+    #
+    # exp is required, not just checked when present, and iss must be this realm's (T24).
+    #
+    # Failing to reach Keycloak is a 503, not a 401: a 401 tells the client its token is
+    # bad, and a client that refreshes or logs out in response turns an outage into an
+    # auth fault.
+    config = verifier()
     try:
-        signing_key = _jwks_client().get_signing_key_from_jwt(credentials.credentials)
+        signing_key = config.jwks.get_signing_key_from_jwt(credentials.credentials)
         return jwt.decode(
             credentials.credentials,
             signing_key.key,
             audience=JWT_AUDIENCE,
+            issuer=config.issuer,
             algorithms=["RS256"],
+            leeway=JWT_LEEWAY,
+            options={"require": ["exp", "iss"]},
         )
+    except PyJWKClientConnectionError as e:
+        raise HTTPException(status_code=503, detail="Cannot reach the identity provider to verify the token") from e
     except PyJWTError as e:
         raise HTTPException(status_code=401, detail="Invalid JWT token") from e

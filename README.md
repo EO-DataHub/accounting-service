@@ -44,6 +44,21 @@ For instance, to use `.testing.env` execute:
 APP_ENV=testing uv run ...
 ```
 
+### Tokens
+
+Every endpoint needs a bearer token. The deployed API verifies it against the Keycloak realm at `KEYCLOAK_BASE_URL`, and it does not start when that setting is unset.
+
+`make run` and `docker compose up` run `dev/local_api.py` instead. It takes the claims from the token without checking them, so you can call the API as anyone. Mint a token with `dev/local_token.py`:
+
+```commandline
+export TOKEN=$(uv run python -m dev.local_token --hub-admin)
+uv run python -m dev.local_token --member workspace1 --owner workspace2
+```
+
+`--hub-admin` passes every check. Use `--member`, `--admin` and `--owner` (each repeatable) and `--billing-account` to test the narrower tiers. These tokens are unsigned, so the real API refuses them.
+
+To verify tokens locally, set `KEYCLOAK_BASE_URL` to a deployed platform (for example `https://test.eodatahub.org.uk`), run `make run-verified`, and use a real token from that platform.
+
 ## Database migrations
 
 This service manages its schema with [Alembic](https://alembic.sqlalchemy.org/). Migrations live in `alembic/versions/`.
@@ -149,6 +164,16 @@ GET /workspaces/my-workspace/accounting/ledger/{transaction}
 
 The ledger lists every movement as recorded, including reversals. The usage endpoints below net a reversal against the charge it corrects and show neither.
 
+`GET /workspaces/my-workspace/accounting/usage-data` is paged with `limit` and `after`. An aggregated read's `after` taken from a different range is a 404, as an unknown `after` already is.
+
+A hub admin can read every workspace at once:
+
+```commandline
+GET /accounting/workspaces
+```
+
+One row per workspace, sorted by name: its balance, billing account, pricing category, and the credits granted to it less any grant reversed. `category` is the category the workspace is charged under. A workspace with no category assigned, or with one the policy in force has no multiplier for, reports the policy's default category. `assigned_category` gives the assignment as stored, so a mistyped one is visible. The list is whole and takes no parameters; filtering by balance is left to the caller.
+
 ### List workspaces
 
 ```commandline
@@ -157,7 +182,7 @@ uv run billing-admin workspaces --unmapped
 uv run billing-admin workspaces --ungranted
 ```
 
-The first lists every workspace that has sent usage or has an account mapping, one name per line and nothing else, so it can drive a loop:
+The first lists every workspace that has sent usage, has an account mapping, has been granted credits or has been assigned a category, one name per line and nothing else, so it can drive a loop:
 
 ```commandline
 for workspace in $(uv run billing-admin workspaces); do
@@ -232,10 +257,10 @@ Environment variables take priority over `.env`, so this overrides whatever that
    uv run billing-admin ledger my-workspace
    ```
 
-4. Ask why the charge was what it was. Take the transaction ID from the table above. The endpoint needs a token; `http-client.env.json` holds an unsigned one for a hub admin, which passes every tier check.
+4. Ask why the charge was what it was. Take the transaction ID from the table above. The endpoint needs a token. A hub admin passes every tier check (see [Tokens](#tokens)).
 
    ```commandline
-   export TOKEN=$(python3 -c "import json;print(json.load(open('http-client.env.json'))['dev']['jwt'])")
+   export TOKEN=$(uv run python -m dev.local_token --hub-admin)
    curl -H "Authorization: Bearer $TOKEN" \
      localhost:8000/workspaces/my-workspace/accounting/ledger/$TRANSACTION
    ```
