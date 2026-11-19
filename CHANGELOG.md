@@ -41,6 +41,8 @@ balance.
 - **An aggregated usage read with `after` is bounded by the requested range.** An `after`
   taken from a read of a different range is now a 404, as an unknown `after` already was.
   Raw reads are unchanged.
+- **New: `GET /accounting/health`.** Unauthenticated liveness check for probes; touches
+  nothing.
 
 ### Earlier in this release
 
